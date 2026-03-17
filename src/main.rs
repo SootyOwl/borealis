@@ -1,7 +1,3 @@
-// Config struct fields are defined now but many are only consumed by later phases.
-#[allow(dead_code)]
-mod config;
-
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -14,7 +10,7 @@ fn main() -> anyhow::Result<()> {
         .with_target(true)
         .init();
 
-    let settings = config::Settings::load().inspect_err(|e| {
+    let settings = borealis::config::Settings::load().inspect_err(|e| {
         eprintln!("error: {e}");
     })?;
 

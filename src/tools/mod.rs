@@ -1,0 +1,206 @@
+mod memory_tools;
+
+pub use memory_tools::register_memory_tools;
+
+use std::collections::HashMap;
+
+/// Describes a tool that the LLM can call.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// A tool call from the LLM.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Result of executing a tool.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub content: serde_json::Value,
+    pub is_error: bool,
+}
+
+/// Context passed to tool handlers for authorization and routing.
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    pub author_id: String,
+    pub conversation_id: String,
+    pub channel_source: String,
+}
+
+/// Trait for tool handlers. Rust 2024 edition — native async fn in traits.
+pub trait ToolHandler: Send + Sync {
+    fn name(&self) -> &str;
+    fn definition(&self) -> ToolDef;
+    fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> impl std::future::Future<Output = ToolResult> + Send;
+}
+
+/// Registry that maps tool names to handler instances.
+pub struct ToolRegistry {
+    handlers: HashMap<String, Box<dyn ErasedToolHandler>>,
+}
+
+/// Object-safe wrapper around ToolHandler to allow dynamic dispatch.
+trait ErasedToolHandler: Send + Sync {
+    fn definition(&self) -> ToolDef;
+    fn execute_boxed<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>>;
+}
+
+impl<T: ToolHandler> ErasedToolHandler for T {
+    fn definition(&self) -> ToolDef {
+        ToolHandler::definition(self)
+    }
+
+    fn execute_boxed<'a>(
+        &'a self,
+        args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+        Box::pin(ToolHandler::execute(self, args, ctx))
+    }
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self {
+            handlers: HashMap::new(),
+        }
+    }
+
+    pub fn register<T: ToolHandler + 'static>(&mut self, handler: T) {
+        self.handlers
+            .insert(handler.name().to_string(), Box::new(handler));
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDef> {
+        self.handlers.values().map(|h| h.definition()).collect()
+    }
+
+    pub async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {
+        match self.handlers.get(&call.name) {
+            Some(handler) => handler.execute_boxed(call.arguments.clone(), ctx).await,
+            None => ToolResult {
+                call_id: call.id.clone(),
+                content: serde_json::json!({
+                    "error": format!("unknown tool: {}", call.name)
+                }),
+                is_error: true,
+            },
+        }
+    }
+
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.handlers.contains_key(name)
+    }
+
+    pub fn tool_count(&self) -> usize {
+        self.handlers.len()
+    }
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EchoTool;
+
+    impl ToolHandler for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn definition(&self) -> ToolDef {
+            ToolDef {
+                name: "echo".to_string(),
+                description: "Echoes input".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string" }
+                    }
+                }),
+            }
+        }
+
+        async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult {
+                call_id: "test".to_string(),
+                content: args,
+                is_error: false,
+            }
+        }
+    }
+
+    #[test]
+    fn registry_register_and_lookup() {
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        assert!(registry.has_tool("echo"));
+        assert!(!registry.has_tool("nonexistent"));
+        assert_eq!(registry.tool_count(), 1);
+        assert_eq!(registry.definitions().len(), 1);
+        assert_eq!(registry.definitions()[0].name, "echo");
+    }
+
+    #[tokio::test]
+    async fn registry_execute_known_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "echo".to_string(),
+            arguments: serde_json::json!({"text": "hello"}),
+        };
+        let ctx = ToolContext {
+            author_id: "user1".to_string(),
+            conversation_id: "conv1".to_string(),
+            channel_source: "cli".to_string(),
+        };
+
+        let result = registry.execute(&call, &ctx).await;
+        assert!(!result.is_error);
+        assert_eq!(result.content, serde_json::json!({"text": "hello"}));
+    }
+
+    #[tokio::test]
+    async fn registry_execute_unknown_tool() {
+        let registry = ToolRegistry::new();
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "nonexistent".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let ctx = ToolContext {
+            author_id: "user1".to_string(),
+            conversation_id: "conv1".to_string(),
+            channel_source: "cli".to_string(),
+        };
+
+        let result = registry.execute(&call, &ctx).await;
+        assert!(result.is_error);
+    }
+}

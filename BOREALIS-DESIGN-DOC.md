@@ -1,5 +1,10 @@
 # Borealis Design Spec
 
+> **Rust edition:** 2024 (stable since 1.85) — native `async fn` in traits, no `async_trait` dependency.
+> **Discord:** `poise` 0.6.1 (built on `serenity` 0.12.4) for simplified event handling and future slash command support.
+> **Config:** `config` crate 0.15.x for layered TOML + environment variable config with `try_deserialize()`.
+> **Deployment:** Linux targets — Docker container (`debian:slim` runtime) or bare VPS. Relative paths by default, logs to stdout/stderr.
+
 ## Context
 
 Borealis is a custom multi-channel bot harness/runtime written in Rust, built to power **Aurora** — a digital person, and chill friend, not an AI assistant. She has her own personality, interests, and evolving memory. Aurora interacts with multiple users on a small-medium Discord server and will expand to other platforms (Bluesky planned). The architecture should support future self-extension (Aurora adding her own capabilities).
@@ -88,7 +93,32 @@ For each incoming event:
 
 - Stored in SQLite (`conversations` and `messages` tables), not in markdown
 - Per-conversation, keyed by `ConversationId` (same enum used in concurrency model)
-- Each message stored with: role, content, timestamp, token count estimate
+- Each message stored with: role, content, timestamp, token count estimate, `turn_id` (groups messages in the same turn for atomic eviction)
+
+**Schema:**
+```sql
+CREATE TABLE conversations (
+    id              TEXT PRIMARY KEY,    -- ConversationId serialized
+    mode            TEXT NOT NULL,       -- "shared" or "pairing"
+    created_at      TEXT NOT NULL,
+    last_active_at  TEXT NOT NULL
+);
+
+CREATE TABLE messages (
+    id              TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    turn_id         TEXT NOT NULL,       -- groups messages in the same turn
+    role            TEXT NOT NULL,       -- "user", "assistant", "tool"
+    content         TEXT NOT NULL,
+    tool_call_id    TEXT,               -- for tool result messages
+    tool_calls      TEXT,               -- JSON array of tool calls (for assistant messages)
+    token_estimate  INTEGER NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX idx_messages_conv_turn ON messages(conversation_id, turn_id, created_at);
+```
+
+**Turn ID assignment**: new `turn_id` per user message; assistant response + tool calls/results in the same loop share the `turn_id`. Enables atomic eviction via `DELETE WHERE turn_id = ?`.
 - **Token counting:** use a simple heuristic (chars / 4) for context budget estimation. Not exact, but fast and good enough for sliding window decisions. Each provider's `LlmResponse` returns actual `TokenUsage` from the API for logging/tracking.
 - **SQLite access:** `rusqlite::Connection` is `Send` but not `Sync`, and its operations are blocking I/O that would starve the tokio executor. All DB operations go through `tokio::task::spawn_blocking`. Single `Arc<Mutex<rusqlite::Connection>>` shared across the application — no connection pool needed for MVP (LLM calls are the bottleneck, not DB ops). WAL mode enabled at initialization. Busy timeout set to 5s. Upgrade path: swap to `deadpool-sqlite` if concurrent read contention ever becomes measurable.
 
@@ -96,9 +126,64 @@ For each incoming event:
 
 - Budget system: total context = model max tokens − reserve for response
 - Priority allocation: (1) system prompt + core memory (fixed), (2) tool definitions (fixed), (3) conversation history (sliding window, most recent first), (4) retrieved memories (ranked by relevance, fill remaining space)
-- If history exceeds budget, oldest messages are dropped first — but **tool-call-aware**: a `tool_calls` message and its corresponding `tool_results` are treated as an atomic unit. Never drop one without the other, as this breaks the provider's required message schema.
+- If history exceeds budget, oldest **turns** are evicted first. A turn is the atomic eviction unit:
+  - **User turn:** the user message
+  - **Assistant turn:** the assistant response + all `tool_calls` it made + their `tool_results` + any follow-up assistant responses within the same tool loop
+  - **System turn:** system/injected messages (never evicted)
+  This guarantees the message sequence always satisfies provider API schema requirements — no orphaned `tool_calls` or `tool_results`, no need for special-case pairing logic.
 - **400 recovery:** if the provider returns a 400 (context too large despite budget estimation), drop the oldest non-fixed messages and retry once. If it fails again, reset to system prompt + core persona + current message only.
 - Configurable `max_history_messages` and `max_history_tokens` per-channel in config
+
+### Context Compaction (LLM-Driven Summarization)
+
+When conversation history exceeds a configurable threshold (default 75% of the history token budget), a background LLM call summarizes the oldest messages into a compact summary. This preserves conversational continuity — Aurora remembers what was discussed rather than silently losing it.
+
+**Trigger:** During prompt assembly, if history tokens exceed `compaction_threshold × history_budget`, a `tokio::spawn`ed compaction task runs. The current request falls back to simple eviction; subsequent requests use the summary.
+
+**Summarization scope:** Messages from conversation start (or last compaction point) up to the midpoint of current history. The summarization prompt includes the previous summary (if any) + selected messages → produces a single updated summary.
+
+**Storage:** `conversation_summaries` table in SQLite:
+```sql
+CREATE TABLE conversation_summaries (
+    conversation_id TEXT PRIMARY KEY,
+    summary_text    TEXT NOT NULL,
+    compacted_up_to TEXT NOT NULL,      -- message ID of last summarized message
+    token_estimate  INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+```
+
+**Prompt assembly with summary:** Summary is injected as a labeled block between tool definitions and recent messages:
+```
+[System prompt + core persona] → [Tools] → [Summary of earlier conversation] → [Recent messages] → [Memories]
+```
+
+**Accumulation:** Each compaction replaces the previous summary — there is always at most one active summary per conversation. The second compaction's input is: previous summary + messages since last compaction → single new summary.
+
+**Config:**
+```toml
+[bot.compaction]
+enabled = true
+threshold = 0.75
+compaction_model = "default"                         # or e.g. "local" for cheaper/faster
+summary_prompt_path = "config/compaction_prompt.md"
+```
+
+**Default compaction prompt** (`config/compaction_prompt.md`):
+```
+Summarize the following conversation, preserving:
+- Key facts and information shared by participants
+- Decisions made and commitments given
+- Emotional context and relationship dynamics
+- Any unresolved questions or ongoing topics
+- Names and who said what when it matters
+
+Be concise but do not lose important details. Write in third person narrative form.
+If a previous summary is provided, integrate it with the new messages into a single cohesive summary.
+```
+
+**Error handling:** If the compaction LLM call fails, log and continue with simple eviction. Retry on next threshold crossing. No user-visible impact.
 
 ### Retention
 
@@ -204,7 +289,7 @@ Planned enhancements once the bot is working end-to-end:
 ### Channel Trait
 
 ```rust
-#[async_trait]
+// Rust 2024 edition — native async fn in traits, no #[async_trait] needed
 pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
 
@@ -255,7 +340,7 @@ pub enum Directive {
 
 Unsupported directives are gracefully skipped with a log.
 
-**Directive parsing:** Regex-based extraction of `<actions>...</actions>` blocks. Content inside markdown code blocks (`` ``` ``) is excluded from parsing to prevent false positives. Malformed XML within action blocks logs a warning and is skipped.
+**Directive parsing:** Two-phase approach: (1) strip fenced code blocks (`` ``` ... ``` ``) from the response text, (2) regex-scan the remaining text for `<actions>...</actions>` blocks. Malformed XML within action blocks logs a warning and is skipped.
 
 ### Response Length Control
 
@@ -264,11 +349,27 @@ Response length is controlled via `max_tokens` in the LLM request, configured pe
 ### MVP Adapters
 
 - **CLI** — simple stdin/stdout line-based chat for dev/testing. Reads a line, sends as `InEvent`, prints the response. No special terminal handling needed — `tracing` output goes to stderr, chat goes to stdout.
-- **Discord** — `serenity`. Requires MESSAGE_CONTENT privileged gateway intent (configured in Discord Developer Portal) to read message content in guilds. Per-group config with response modes:
+- **Discord** — `poise` 0.6.1 (wraps `serenity` 0.12.4). Requires MESSAGE_CONTENT privileged gateway intent (configured in Discord Developer Portal) to read message content in guilds. Per-group config with pluggable response modes (adapter-independent, see Response Modes below):
   - **`digest`** — collects messages into a buffer and processes them as a batch. Fires when: (a) `digest_interval_min` elapses since last digest, OR (b) `digest_debounce_min` elapses since last message with no new messages arriving. Whichever triggers first. @mentions of Aurora bypass the buffer and trigger immediate processing. On restart, the buffer starts empty (unprocessed messages from before restart are lost — acceptable for MVP). The digest prompt includes all buffered messages with timestamps and authors.
   - **`mention-only`** — Aurora only responds when directly mentioned (@Aurora)
   - **`always`** — Aurora participates in all messages (for small/personal channels)
   - Default mode configurable via `"*"` wildcard group
+
+### Pluggable Response Modes
+
+Response modes are adapter-independent components defined in `src/channels/modes.rs`. Each mode implements a `ResponseMode` trait controlling when messages are dispatched to the core pipeline:
+
+- **`AlwaysMode`** — dispatches immediately
+- **`MentionOnlyMode`** — dispatches only if Aurora is mentioned, drops otherwise
+- **`DigestMode`** — buffers messages, dispatches on interval/debounce timer; @mentions bypass buffer
+
+A `ModeRouter` per adapter maps group IDs to mode instances. Adapters forward all messages to the router, keeping adapter logic thin and modes reusable across any future adapter.
+
+### Token Counting
+
+Token estimation is a method on the `Provider` trait: `fn estimate_tokens(&self, text: &str) -> usize`. Strategy per provider:
+- **OpenAI-compatible:** `tiktoken-rs` with cl100k_base encoding (accurate)
+- **Anthropic:** `chars / 4` heuristic (no public tokenizer; ~20% accuracy, sufficient with compaction + 400 recovery as safety nets)
 
 ---
 
@@ -277,7 +378,7 @@ Response length is controlled via `max_tokens` in the LLM request, configured pe
 ### Provider Trait
 
 ```rust
-#[async_trait]
+// Rust 2024 edition — native async fn in traits, no #[async_trait] needed
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
 
@@ -342,7 +443,7 @@ pub struct ToolContext {
 }
 
 /// Registry that maps tool names to handler functions.
-#[async_trait]
+// Rust 2024 edition — native async fn in traits, no #[async_trait] needed
 pub trait ToolHandler: Send + Sync {
     fn name(&self) -> &str;
     fn definition(&self) -> ToolDef;
@@ -372,7 +473,7 @@ Token budget validation at startup: if system prompt + core persona exceeds 50% 
 
 ### Error Handling for Providers
 
-- Retry with exponential backoff on 429 (rate limit) and 5xx errors (max 3 retries)
+- Retry with exponential backoff on 429 (rate limit) and 5xx errors (max 3 retries, 1s base delay, 2x multiplier, 30s max delay, +/- 25% jitter)
 - Timeout per request (configurable, default 60s)
 - On persistent failure: return a user-friendly error message to the channel ("I'm having trouble thinking right now, try again in a moment")
 - Token usage tracked per-request and logged via `tracing`
@@ -508,7 +609,8 @@ borealis/
 ├── Cargo.toml
 ├── config/
 │   ├── default.toml
-│   └── system_prompt.md          # Human-authored system prompt (Aurora can't modify)
+│   ├── system_prompt.md          # Human-authored system prompt (Aurora can't modify)
+│   └── compaction_prompt.md      # Default summarization prompt for context compaction
 ├── src/
 │   ├── main.rs                   # Entry, config, component wiring, shutdown
 │   ├── core/
@@ -518,6 +620,7 @@ borealis/
 │   │   └── pipeline.rs           # Message processing pipeline
 │   ├── channels/
 │   │   ├── mod.rs                # Channel trait
+│   │   ├── modes.rs              # ResponseMode trait + digest/mention-only/always
 │   │   ├── discord.rs
 │   │   └── cli.rs
 │   ├── providers/
@@ -533,14 +636,26 @@ borealis/
 │   ├── tools/
 │   │   ├── mod.rs                # Tool registry
 │   │   └── memory_tools.rs       # memory_create, memory_search, etc.
-│   ├── history.rs                # Conversation history storage + context window mgmt
+│   ├── history/
+│   │   ├── mod.rs                # Conversation history storage + context window mgmt
+│   │   └── compaction.rs         # LLM-driven summarization of old messages
 │   └── config.rs                 # Config types + TOML deserialization + validation
 ├── memory/                       # Runtime data (Aurora's brain)
 │   └── core.md
 └── tests/                        # Integration tests
+    └── common/
+        └── mod.rs                # Shared test utilities: mock providers, test DB, fixtures
 ```
 
 ## Configuration
+
+Config loaded via the `config` crate with layered sources (lowest to highest priority):
+1. `config/default.toml` — base config (committed)
+2. `config/{RUN_MODE}.toml` — environment-specific overrides (e.g., `config/production.toml`)
+3. `config/local.toml` — developer overrides (gitignored)
+4. Environment variables prefixed `BOREALIS__` (e.g., `BOREALIS__PROVIDERS__ANTHROPIC__MODEL`)
+
+API keys use the `_env` indirection pattern: config specifies the env var name (e.g., `api_key_env = "ANTHROPIC_API_KEY"`), startup validation resolves and checks the actual env var.
 
 ```toml
 [bot]
@@ -608,18 +723,25 @@ enabled = true
 8. **Raw reqwest for providers** — no official Anthropic Rust SDK; both providers are HTTP clients
 9. **MVP memory uses SQLite LIKE queries** — no FTS5 or embeddings yet; simple but correct. FTS5 is a trivial upgrade (same DB, just add a virtual table).
 10. **Per-event task spawning with conversation locking** — concurrent processing without races
+11. **Turn-based eviction** — eviction operates on turns (user message or assistant response + tool loop), not individual messages. Makes provider API schema compliance the default rather than a special case.
+12. **Pluggable response modes** — digest/mention-only/always are adapter-independent components implementing a `ResponseMode` trait, not baked into adapters. Any adapter can use any mode; new modes don't require adapter changes.
+13. **Provider-aware token counting** — `tiktoken-rs` for OpenAI, `chars/4` heuristic for Anthropic. Exact counting isn't critical with compaction + 400 recovery as safety nets.
 
 ## Key Crates (MVP)
 
 - `tokio` — async runtime + signals + sync primitives
 - `tokio-util` — CancellationToken for graceful shutdown
-- `serde` + `toml` — config
+- `config` 0.15.x — layered TOML + env config with `try_deserialize()`
+- `serde` + `serde_json` — serialization for config, tool args, provider wire formats
 - `reqwest` — HTTP/LLM API calls
-- `rusqlite` — SQLite (conversation history)
-- `serenity` — Discord
-- `tracing` + `tracing-subscriber` — structured logging
+- `rusqlite` 0.38.x — SQLite with `bundled` feature (WAL mode)
+- `poise` 0.6.1 — Discord bot framework (wraps serenity 0.12.4)
+- `tracing` + `tracing-subscriber` — structured logging (JSON prod, pretty dev)
 - `anyhow` + `thiserror` — error handling
-- `dashmap` — concurrent conversation worker dispatch
+- `dashmap` 6.x — concurrent conversation worker dispatch
+- `regex` — directive XML parsing from LLM responses
+- `tiktoken-rs` — accurate token counting for OpenAI-compatible providers
+- `croner` — cron expression parsing for scheduler events
 
 ### Post-MVP Crates
 
@@ -628,12 +750,14 @@ enabled = true
 
 ## MVP Build Order
 
-Stages can contain parallel work items. Critical path: 6 stages.
+6 stages grouped into 3 implementation phases. Each phase builds on the last.
 
 ```
+Phase 1: Foundation (Stages 1-2)
+──────────────────────────────────
 Stage 1: Scaffolding
-├── Cargo project, git init, CI (cargo test + clippy + fmt)
-├── Config types + TOML loading + validation
+├── Cargo project (Rust 2024 edition), git init, CI (cargo test + clippy + fmt)
+├── Config types + `config` crate builder + validation
 ├── Event types (InEvent, OutEvent, Directive enum)
 ├── Core loop skeleton with cancellation token
 └── tracing setup
@@ -642,11 +766,14 @@ Stage 2: Providers (parallel)
 ├── OpenAI-compatible provider (reqwest, works with Ollama)
 └── Anthropic provider (reqwest, native Claude API)
     → validates Provider trait against both API shapes early
+    → Phase 1 gate: providers make real API calls and return typed responses
 
+Phase 2: Core Experience (Stages 3-4)
+──────────────────────────────────────
 Stage 3: CLI + Storage (parallel tracks)
 ├── Track A: CLI adapter (stdin/stdout, immediate dev feedback)
 ├── Track B: SQLite schema (notes + tags + links + conversations + messages tables)
-├── Track C: core.md loading + conversation history + context window budget
+├── Track C: core.md loading + conversation history + context window budget + compaction
 ├── Track D: Tool execution loop skeleton (dispatch, max rounds, timeout) — no tools registered yet
     → first end-to-end: type in CLI → LLM responds (text-only, tool loop exists but has no handlers)
 
@@ -654,9 +781,12 @@ Stage 4: Memory Tools + Directives (parallel)
 ├── Memory tools (memory_create, memory_search, memory_read, etc.)
 ├── Directive enum + XML parser + per-channel dispatch
 └── Register memory tools in ToolRegistry
+    → Phase 2 gate: CLI chat with working memory tools and directive parsing
 
+Phase 3: Platform & Autonomy (Stages 5-6)
+──────────────────────────────────────────
 Stage 5: Discord Adapter
-├── Discord channel adapter (serenity)
+├── Discord channel adapter (poise 0.6.1)
 ├── Directive handling (reactions, etc.)
 ├── Rate limiting (per-user + global)
 └── Authorization (allowlists, memory-write restrictions)
@@ -667,6 +797,7 @@ Stage 6: Scheduler + Migration (parallel)
 ├── Heartbeat + daily reflection events
 ├── Jitter, active hours, overlap prevention
 └── Letta migration script (one-time, separate from main binary)
+    → Phase 3 gate: full MVP deployed on Discord with autonomous scheduled behavior
 ```
 
 ## Post-MVP Enhancements
@@ -696,9 +827,19 @@ Enhancement E: Voice Support
 └── TTS for Voice directive
 ```
 
+## Deployment
+
+Target: Linux (Docker container or bare VPS).
+
+- **Paths:** relative by default (`database_path = "memory/borealis.db"`), absolute paths also accepted
+- **Logging:** stdout/stderr (compatible with Docker log drivers and systemd journal), `RUST_LOG` for tracing filter
+- **Docker:** multi-stage build, `debian:slim` runtime base (glibc for rusqlite's bundled SQLite)
+- **VPS:** direct binary execution, systemd service file for process management
+- **No musl/static linking required** — `debian:slim` provides glibc
+
 ## Testing Strategy
 
-- **Unit tests:** memory module (CRUD, search, link integrity, soft delete), config validation, directive parsing, context window budget calculation
+- **Unit tests:** memory module (CRUD, search, link integrity, soft delete), config validation, directive parsing, context window budget calculation, compaction trigger/accumulation logic
 - **Integration tests:** mock provider (returns canned responses) → core loop → verify event flow, tool execution, directive routing
 - **CI:** `cargo test` + `cargo clippy` + `cargo fmt --check` on every commit
 
@@ -718,12 +859,14 @@ Each stage has a verification gate that must pass before moving to the next.
 - Both handle 429/5xx with retry + backoff (mock or real)
 - Timeout triggers graceful error, not panic
 
-**Stage 3: CLI + Storage + History + Tool Loop Skeleton**
+**Stage 3: CLI + Storage + History + Compaction + Tool Loop Skeleton**
 - Type a message in CLI → LLM responds with text (tool loop exists but no tools registered)
-- SQLite schema creates all tables (notes, tags, links, conversations, messages)
+- SQLite schema creates all tables (notes, tags, links, conversations, messages, conversation_summaries)
 - `core.md` loads and appears in system prompt
 - Conversation history persists across messages in SQLite
-- Context window budget drops oldest messages when exceeded, core persona always present
+- Context window budget evicts oldest turns when exceeded; an assistant turn with tool calls is never partially evicted; core persona always present
+- Compaction: when history exceeds 75% of budget, background LLM call produces summary; subsequent requests use it
+- Compaction fallback: if compaction is in-progress, simple eviction is used (no blocking)
 - Tool execution loop: dispatch, max rounds (10), timeout (120s) — verified with a dummy/echo tool in tests
 - Sending many messages doesn't crash or OOM
 

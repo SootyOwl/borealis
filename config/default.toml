@@ -1,0 +1,82 @@
+# Borealis — default configuration
+# Override per-environment via config/{run_mode}.toml or config/local.toml.
+# Any value can be overridden with BOREALIS__SECTION__KEY env vars.
+
+[bot]
+name = "Aurora"
+system_prompt_path = "config/system_prompt.md"
+core_persona_path = "memory/core.md"
+
+[bot.compaction]
+enabled = true
+threshold = 0.75
+compaction_model = "default"
+summary_prompt_path = "config/compaction_prompt.md"
+
+# ---------------------------------------------------------------------------
+# LLM Providers
+# ---------------------------------------------------------------------------
+# At least one provider should be configured. API keys use env var indirection:
+# api_key_env names the env var that holds the actual secret.
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-4-20250514"
+api_key_env = "ANTHROPIC_API_KEY"
+timeout_secs = 60
+max_retries = 3
+max_history_tokens = 8192
+
+[providers.openai]
+base_url = "http://localhost:11434/v1"
+model = "llama3"
+# api_key_env is optional for local Ollama
+timeout_secs = 60
+max_retries = 3
+max_history_tokens = 4096
+
+# ---------------------------------------------------------------------------
+# Channel adapters
+# ---------------------------------------------------------------------------
+
+[channels.cli]
+enabled = true
+
+# Discord is disabled by default — enable in config/local.toml or env override.
+# [channels.discord]
+# enabled = true
+# token_env = "DISCORD_BOT_TOKEN"
+# [[channels.discord.groups]]
+# guild_id = "123456789"
+# response_mode = "mention-only"
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+[database]
+path = "memory/borealis.db"
+
+# ---------------------------------------------------------------------------
+# Event bus
+# ---------------------------------------------------------------------------
+
+[event_bus]
+channel_capacity = 256
+max_concurrency = 4
+idle_timeout_secs = 1800
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+[rate_limit.per_user]
+capacity = 10
+refill_secs = 6
+
+[rate_limit.global]
+capacity = 30
+refill_secs = 2
+
+# allowed_users = []
+# allowed_guilds = []

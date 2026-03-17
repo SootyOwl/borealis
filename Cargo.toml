@@ -1,0 +1,18 @@
+[package]
+name = "borealis"
+version = "0.1.0"
+edition = "2024"
+description = "Aurora's modular, multi-channel bot runtime"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.102"
+config = "0.15.21"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tempfile = "3"

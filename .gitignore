@@ -30,3 +30,9 @@
 #   .claude/settings.json         — Claude Code project settings
 #   .claude/settings.local.json is per-developer, ignore separately if needed
 # === End crosslink managed ===
+
+# Rust
+target/
+
+# Local config overrides (developer-specific)
+config/local.toml

@@ -389,6 +389,194 @@ impl HistoryStore {
 }
 
 // ---------------------------------------------------------------------------
+// CompactionSummary
+// ---------------------------------------------------------------------------
+
+/// A stored compaction summary for a conversation.
+#[derive(Debug, Clone)]
+pub struct CompactionSummary {
+    pub conversation_id: String,
+    pub summary_text: String,
+    /// All messages with seq <= this value have been compacted into the summary.
+    pub compacted_up_to: i64,
+    pub token_estimate: usize,
+    pub created_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// Compaction operations on HistoryStore
+// ---------------------------------------------------------------------------
+
+impl HistoryStore {
+    /// Save or replace the compaction summary for a conversation.
+    ///
+    /// There is at most one active summary per conversation — successive
+    /// compactions replace the previous summary (accumulation).
+    pub fn save_summary(
+        &self,
+        conversation_id: &ConversationId,
+        summary_text: &str,
+        compacted_up_to: i64,
+        token_estimate: usize,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO conversation_summaries
+                 (conversation_id, summary_text, compacted_up_to, token_estimate, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 summary_text    = excluded.summary_text,
+                 compacted_up_to = excluded.compacted_up_to,
+                 token_estimate  = excluded.token_estimate,
+                 created_at      = excluded.created_at",
+            params![
+                conversation_id.to_string(),
+                summary_text,
+                compacted_up_to,
+                token_estimate as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load the compaction summary for a conversation, if one exists.
+    pub fn load_summary(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<CompactionSummary>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, summary_text, compacted_up_to, token_estimate, created_at
+             FROM conversation_summaries
+             WHERE conversation_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![conversation_id.to_string()])?;
+        match rows.next()? {
+            None => Ok(None),
+            Some(row) => {
+                let token_est: i64 = row.get(3)?;
+                Ok(Some(CompactionSummary {
+                    conversation_id: row.get(0)?,
+                    summary_text: row.get(1)?,
+                    compacted_up_to: row.get(2)?,
+                    token_estimate: token_est as usize,
+                    created_at: row.get(4)?,
+                }))
+            }
+        }
+    }
+
+    /// Delete all messages with seq <= `up_to_seq` for a conversation.
+    ///
+    /// Used after compaction to remove messages that are now represented
+    /// by the summary. Returns the number of deleted rows.
+    pub fn delete_messages_up_to(
+        &self,
+        conversation_id: &ConversationId,
+        up_to_seq: i64,
+    ) -> Result<usize, StoreError> {
+        let conn = self.lock_conn()?;
+        let deleted = conn.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1 AND seq <= ?2",
+            params![conversation_id.to_string(), up_to_seq],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Load messages with seq > `after_seq` for a conversation, ordered ASC.
+    ///
+    /// Used to load only messages after the compaction point.
+    pub fn load_messages_after(
+        &self,
+        conversation_id: &ConversationId,
+        after_seq: i64,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, turn_id, seq, role, content,
+                    tool_call_id, tool_calls, token_estimate, created_at
+             FROM messages
+             WHERE conversation_id = ?1 AND seq > ?2
+             ORDER BY seq ASC",
+        )?;
+
+        let rows = stmt.query_map(params![conversation_id.to_string(), after_seq], |row| {
+            let seq: i64 = row.get(3)?;
+            let role_str: String = row.get(4)?;
+            let tool_calls_json: Option<String> = row.get(7)?;
+            let token_estimate_i64: i64 = row.get(8)?;
+
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                seq,
+                role_str,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                tool_calls_json,
+                token_estimate_i64,
+                row.get::<_, String>(9)?,
+            ))
+        })?;
+
+        let mut messages = Vec::new();
+        for row_result in rows {
+            let (
+                id,
+                conv_id,
+                turn_id,
+                seq,
+                role_str,
+                content,
+                tool_call_id,
+                tool_calls_json,
+                token_i64,
+                created_at,
+            ) = row_result?;
+
+            let role = Role::from_str(&role_str)?;
+
+            let tool_calls: Option<Vec<ToolCall>> = match tool_calls_json {
+                None => None,
+                Some(json) => Some(
+                    serde_json::from_str(&json)
+                        .map_err(|e| StoreError::InvalidData(e.to_string()))?,
+                ),
+            };
+
+            messages.push(StoredMessage {
+                id,
+                conversation_id: conv_id,
+                turn_id,
+                seq,
+                role,
+                content,
+                tool_call_id,
+                tool_calls,
+                token_estimate: token_i64 as usize,
+                created_at,
+            });
+        }
+
+        Ok(messages)
+    }
+
+    /// Return the maximum seq number for a conversation, or None if empty.
+    pub fn max_seq(&self, conversation_id: &ConversationId) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock_conn()?;
+        let max: Option<i64> = conn.query_row(
+            "SELECT MAX(seq) FROM messages WHERE conversation_id = ?1",
+            params![conversation_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(max)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

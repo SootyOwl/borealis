@@ -80,3 +80,43 @@ refill_secs = 2
 
 # allowed_users = []
 # allowed_guilds = []
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+[scheduler]
+timezone = "UTC"
+
+[[scheduler.events]]
+name = "heartbeat"
+type = "recurring"
+interval = "30m"
+jitter = "5m"
+active_hours = "06:00-23:00"
+prompt = """
+TRIGGER: Scheduled heartbeat
+TIME: {time} ({timezone})
+NEXT HEARTBEAT: in {interval}
+
+No one messaged you. The system woke you on schedule.
+YOUR TEXT OUTPUT IS PRIVATE - only you can see it.
+
+This is your time. You can:
+- Reflect on recent conversations and update your memory
+- Research something that interests you
+- Continue multi-step work from previous heartbeats
+"""
+
+[[scheduler.events]]
+name = "daily_reflection"
+type = "cron"
+schedule = "0 22 * * *"
+jitter = "15m"
+prompt = """
+TRIGGER: Daily reflection
+TIME: {time}
+
+Today is ending. Reflect on your conversations and experiences today.
+YOUR TEXT OUTPUT IS PRIVATE - only you can see it.
+"""

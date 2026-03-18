@@ -42,6 +42,8 @@ pub struct Settings {
     pub event_bus: EventBusConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +313,53 @@ fn default_global_bucket_capacity() -> u32 {
 
 fn default_global_refill_secs() -> u64 {
     2
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct SchedulerConfig {
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    #[serde(default)]
+    pub events: Vec<SchedulerEventConfig>,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            timezone: default_timezone(),
+            events: Vec::new(),
+        }
+    }
+}
+
+fn default_timezone() -> String {
+    "UTC".into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SchedulerEventConfig {
+    pub name: String,
+    /// "recurring" or "cron"
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// For recurring events: interval like "30m", "1h", "90s"
+    #[serde(default)]
+    pub interval: Option<String>,
+    /// For cron events: cron expression like "0 22 * * *"
+    #[serde(default)]
+    pub schedule: Option<String>,
+    /// Jitter range like "5m", "30s"
+    #[serde(default)]
+    pub jitter: Option<String>,
+    /// Active hours range like "06:00-23:00" (interpreted in configured timezone)
+    #[serde(default)]
+    pub active_hours: Option<String>,
+    /// Prompt template with {time}, {timezone}, {interval} placeholders
+    pub prompt: String,
 }
 
 // ---------------------------------------------------------------------------

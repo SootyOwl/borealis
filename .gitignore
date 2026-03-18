@@ -36,3 +36,4 @@ target/
 
 # Local config overrides (developer-specific)
 config/local.toml
+.worktrees/

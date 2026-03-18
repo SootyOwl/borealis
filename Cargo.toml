@@ -8,7 +8,9 @@ description = "Aurora's modular, multi-channel bot runtime"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 config = "0.15"
+croner = "3"
 dashmap = "6"
 poise = "0.6.1"
 rand = "0.8"

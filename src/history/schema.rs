@@ -36,6 +36,14 @@ pub fn initialize(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_messages_conv_turn
             ON messages(conversation_id, turn_id, seq);
+
+        CREATE TABLE IF NOT EXISTS conversation_summaries (
+            conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+            summary_text    TEXT NOT NULL,
+            compacted_up_to INTEGER NOT NULL,
+            token_estimate  INTEGER NOT NULL,
+            created_at      TEXT NOT NULL
+        );
         ",
     )
 }

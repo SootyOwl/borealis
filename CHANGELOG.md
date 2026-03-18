@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Add core pipeline and wire up CLI adapter for end-to-end chat (#34)
+- Add README with setup and manual testing instructions (#32)
 - REQ-7: Directive system — XML `<actions>` blocks parsed from LLM responses with variants: `NoReply`, `React`, `Voice`, `SendFile`, `Send`. Parsing strategy: strip fenced code blocks (`` ``` ... ``` ``) from the response text first, then regex-scan for `<actions>` blocks in the remaining text. Malformed XML within action blocks logs a warning and is skipped. Unsupported directives gracefully skipped with log. (#14)
 - REQ-13: LLM-driven context window compaction. When conversation history exceeds a configurable threshold (default 75% of token budget), a background LLM call summarizes the oldest messages into a compact summary block. The summary replaces the summarized messages in prompt assembly, preserving conversational continuity without losing context. Summaries are stored in SQLite per-conversation and accumulate (a new compaction summarizes the previous summary + messages since). Compaction runs asynchronously — it does not block the current request; the current request uses simple eviction as a fallback until the summary is ready. Configurable per-channel: `compaction_threshold` (0.0-1.0, default 0.75), `compaction_model` (can use a cheaper/faster model than the main conversation model). (#13)
 - REQ-6: Conversation history stored in SQLite with token-budget-aware context window management. Priority: system prompt + core persona (fixed) > tool definitions (fixed) > conversation history (sliding window) > retrieved memories. Eviction operates on **turns**, not individual messages. A turn is the atomic eviction unit: a user turn is the user message; an assistant turn is the assistant response plus all tool_calls it made, their tool_results, and any follow-up assistant responses within the same tool loop. This guarantees the message sequence always satisfies provider API schema requirements (no orphaned tool_calls or tool_results). Oldest turns are evicted first. (#12)
@@ -22,5 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Draft Borealis MVP design document with 3-phase implementation plan (#1)
 
 ### Fixed
+- Fix process not exiting cleanly on Ctrl+C (#35)
+- Fix provider config so missing API keys don't block startup (#33)
 
 ### Changed

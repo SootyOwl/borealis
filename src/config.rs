@@ -69,7 +69,7 @@ fn default_core_persona_path() -> PathBuf {
     PathBuf::from("memory/core.md")
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CompactionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -319,7 +319,7 @@ fn default_global_refill_secs() -> u64 {
 // Scheduler
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SchedulerConfig {
     #[serde(default = "default_timezone")]
     pub timezone: String,

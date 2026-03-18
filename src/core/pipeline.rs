@@ -1,13 +1,24 @@
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::future::Future;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::config::CompactionConfig;
 use crate::core::directive::parse_directives;
 use crate::core::event::{InEvent, OutEvent};
-use crate::providers::{ChatMessage, LlmResponse, Provider, RequestConfig, Role};
+use crate::history::budget::{ContextBudget, Turn};
+use crate::history::compaction::{CompactionService, CompactionState};
+use crate::history::store::HistoryStore;
+use crate::memory::MemoryStore;
+use crate::providers::{Provider, RequestConfig, ToolDef as ProviderToolDef};
+use crate::tools::{ToolContext, ToolRegistry};
+use crate::types::{self, estimate_tokens};
+
+/// Maximum number of tool-call → LLM round-trips before we stop looping.
+const MAX_TOOL_ITERATIONS: usize = 10;
 
 /// Object-safe trait for processing inbound events.
 /// This wraps the generic `Pipeline<P>` so we can use `dyn PipelineRunner` in main.
@@ -18,42 +29,97 @@ pub trait PipelineRunner: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<OutEvent>> + Send + 'a>>;
 }
 
+/// Configuration for the pipeline's context window budget.
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    /// Maximum tokens the model supports.
+    pub model_max_tokens: usize,
+    /// Tokens reserved for the model's response.
+    pub response_reserve: usize,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            model_max_tokens: 8192,
+            response_reserve: 1024,
+        }
+    }
+}
+
 /// The message processing pipeline.
 ///
-/// Takes an inbound event, builds a prompt, calls the LLM provider,
-/// parses directives from the response, and returns an outbound event.
-pub struct Pipeline<P: Provider> {
-    provider: P,
+/// Takes an inbound event, loads conversation history, builds a prompt with
+/// budget-aware turn selection, calls the LLM provider, executes any tool
+/// calls in a loop, persists history, and returns an outbound event.
+pub struct Pipeline<P: Provider + 'static> {
+    provider: Arc<P>,
     system_prompt: String,
     core_persona: String,
+    history_store: Arc<HistoryStore>,
+    tool_registry: Arc<ToolRegistry>,
+    memory_store: MemoryStore,
+    compaction_service: CompactionService<P>,
+    pipeline_config: PipelineConfig,
 }
 
 impl<P: Provider + 'static> Pipeline<P> {
-    /// Create a new pipeline, loading the system prompt and core persona from disk.
+    /// Create a new pipeline with all dependencies.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        provider: P,
+        provider: Arc<P>,
         system_prompt_path: &Path,
         core_persona_path: &Path,
+        history_store: Arc<HistoryStore>,
+        tool_registry: Arc<ToolRegistry>,
+        memory_store: MemoryStore,
+        compaction_config: CompactionConfig,
+        compaction_state: Arc<CompactionState>,
+        pipeline_config: PipelineConfig,
     ) -> Result<Self> {
         let system_prompt = if system_prompt_path.exists() {
-            std::fs::read_to_string(system_prompt_path)
-                .with_context(|| format!("failed to read system prompt: {}", system_prompt_path.display()))?
+            std::fs::read_to_string(system_prompt_path).with_context(|| {
+                format!(
+                    "failed to read system prompt: {}",
+                    system_prompt_path.display()
+                )
+            })?
         } else {
             debug!(path = %system_prompt_path.display(), "system prompt file not found, using default");
             default_system_prompt()
         };
 
         let core_persona = if core_persona_path.exists() {
-            std::fs::read_to_string(core_persona_path)
-                .with_context(|| format!("failed to read core persona: {}", core_persona_path.display()))?
+            std::fs::read_to_string(core_persona_path).with_context(|| {
+                format!(
+                    "failed to read core persona: {}",
+                    core_persona_path.display()
+                )
+            })?
         } else {
             debug!(path = %core_persona_path.display(), "core persona file not found, using empty");
             String::new()
         };
 
+        let compaction_prompt = if compaction_config.summary_prompt_path.exists() {
+            std::fs::read_to_string(&compaction_config.summary_prompt_path)
+                .unwrap_or_else(|_| default_compaction_prompt())
+        } else {
+            default_compaction_prompt()
+        };
+
+        let compaction_service = CompactionService::new(
+            Arc::clone(&history_store),
+            Arc::clone(&provider),
+            compaction_config,
+            compaction_state,
+            compaction_prompt,
+        );
+
         info!(
             system_prompt_len = system_prompt.len(),
             core_persona_len = core_persona.len(),
+            tool_count = tool_registry.tool_count(),
             provider = provider.name(),
             "pipeline initialized"
         );
@@ -62,17 +128,85 @@ impl<P: Provider + 'static> Pipeline<P> {
             provider,
             system_prompt,
             core_persona,
+            history_store,
+            tool_registry,
+            memory_store,
+            compaction_service,
+            pipeline_config,
         })
     }
 
     async fn process_impl(&self, event: &InEvent) -> Result<OutEvent> {
-        let messages = self.build_messages(event);
+        let conv_id = event_conv_id_to_types(&event.context.conversation_id);
 
-        debug!(
-            message_count = messages.len(),
-            user_text = %event.message.text,
-            "calling LLM provider"
+        // Ensure conversation exists in the store.
+        self.history_store
+            .ensure_conversation(&conv_id, types::ConversationMode::Shared)
+            .context("failed to ensure conversation")?;
+
+        // Build the user message and persist it.
+        let user_text = format!(
+            "{}: {}",
+            event.message.author.display_name, event.message.text
         );
+        let user_msg = types::ChatMessage::user(&user_text);
+        let turn_id = self
+            .history_store
+            .append_message(&conv_id, &user_msg, None)
+            .context("failed to append user message")?;
+
+        // Load conversation history (with compaction summary support).
+        let (turns, summary_token_overhead) = self.load_history_turns(&conv_id)?;
+
+        // Retrieve relevant memories based on user message.
+        let retrieved_memories = self.retrieve_memories(&event.message.text);
+
+        // Build the context budget.
+        let system_tokens = estimate_tokens(&self.system_prompt);
+        let persona_tokens = estimate_tokens(&self.core_persona);
+        let tool_defs = self.tool_registry.definitions();
+        let tool_defs_json = serde_json::to_string(&tool_defs).unwrap_or_default();
+        let tool_def_tokens = estimate_tokens(&tool_defs_json) + summary_token_overhead;
+
+        let budget = ContextBudget::new(
+            self.pipeline_config.model_max_tokens,
+            self.pipeline_config.response_reserve,
+            system_tokens,
+            persona_tokens,
+            tool_def_tokens,
+        );
+
+        let selection = budget.select_turns(&turns);
+        if !selection.evicted.is_empty() {
+            debug!(
+                evicted = selection.evicted.len(),
+                "evicted oldest turns from context window"
+            );
+        }
+
+        // Assemble the full message array.
+        let included_turns: Vec<Turn> = selection.included.iter().map(|t| (*t).clone()).collect();
+        let assembled = budget.assemble(
+            &self.system_prompt,
+            &self.core_persona,
+            &included_turns,
+            &retrieved_memories,
+        );
+
+        // Add channel context to system prompt.
+        let channel_context = format!(
+            "\nYou are responding in: {:?} (conversation: {:?})",
+            event.source, event.context.conversation_id
+        );
+
+        // Convert assembled messages to provider format and inject channel context.
+        let mut provider_messages = types_to_provider_messages(&assembled);
+        if let Some(first) = provider_messages.first_mut() {
+            first.content.push_str(&channel_context);
+        }
+
+        // Convert tool definitions to provider format.
+        let provider_tools = tool_defs_to_provider(&tool_defs);
 
         let config = RequestConfig {
             temperature: Some(0.7),
@@ -80,54 +214,202 @@ impl<P: Provider + 'static> Pipeline<P> {
             ..Default::default()
         };
 
-        let response = self.provider.chat(messages, &[], &config).await?;
+        // Tool execution loop.
+        let mut iterations = 0;
+        let response = loop {
+            debug!(
+                message_count = provider_messages.len(),
+                iteration = iterations,
+                "calling LLM provider"
+            );
 
-        debug!(
-            usage.input = response.usage.input_tokens,
-            usage.output = response.usage.output_tokens,
-            has_text = response.text.is_some(),
-            tool_calls = response.tool_calls.len(),
-            "LLM response received"
-        );
+            let response = self
+                .provider
+                .chat(provider_messages.clone(), &provider_tools, &config)
+                .await?;
+
+            debug!(
+                usage.input = response.usage.input_tokens,
+                usage.output = response.usage.output_tokens,
+                has_text = response.text.is_some(),
+                tool_calls = response.tool_calls.len(),
+                "LLM response received"
+            );
+
+            if response.tool_calls.is_empty() || iterations >= MAX_TOOL_ITERATIONS {
+                if iterations >= MAX_TOOL_ITERATIONS && !response.tool_calls.is_empty() {
+                    warn!(
+                        "tool execution loop hit max iterations ({MAX_TOOL_ITERATIONS}), stopping"
+                    );
+                }
+                break response;
+            }
+
+            // Append assistant message with tool calls to history and provider messages.
+            let assistant_text = response.text.clone().unwrap_or_default();
+            let tool_calls_for_history: Vec<types::ToolCall> = response
+                .tool_calls
+                .iter()
+                .map(|tc| types::ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                })
+                .collect();
+
+            let assistant_msg = types::ChatMessage::assistant_with_tool_calls(
+                &assistant_text,
+                tool_calls_for_history,
+            );
+            self.history_store
+                .append_message(&conv_id, &assistant_msg, Some(&turn_id))
+                .context("failed to append assistant tool-call message")?;
+
+            // Add assistant message to provider messages.
+            provider_messages.push(crate::providers::ChatMessage {
+                role: crate::providers::Role::Assistant,
+                content: assistant_text,
+                tool_call_id: None,
+                tool_calls: response.tool_calls.clone(),
+            });
+
+            // Execute each tool call and collect results.
+            let tool_ctx = ToolContext {
+                author_id: event.message.author.id.clone(),
+                conversation_id: conv_id.to_string(),
+                channel_source: event.source.to_string(),
+            };
+
+            for tc in &response.tool_calls {
+                let tools_call = crate::tools::ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                };
+                let result = self.tool_registry.execute(&tools_call, &tool_ctx).await;
+
+                let result_content = serde_json::to_string(&result.content).unwrap_or_default();
+
+                // Persist tool result to history.
+                let tool_msg = types::ChatMessage::tool_result(&tc.id, &result_content);
+                self.history_store
+                    .append_message(&conv_id, &tool_msg, Some(&turn_id))
+                    .context("failed to append tool result")?;
+
+                // Add to provider messages.
+                provider_messages.push(crate::providers::ChatMessage {
+                    role: crate::providers::Role::Tool,
+                    content: result_content,
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_calls: vec![],
+                });
+            }
+
+            iterations += 1;
+        };
+
+        // Persist the final assistant response to history.
+        let response_text = response.text.clone().unwrap_or_default();
+        if !response_text.is_empty() {
+            let final_msg = types::ChatMessage::assistant(&response_text);
+            self.history_store
+                .append_message(&conv_id, &final_msg, Some(&turn_id))
+                .context("failed to append final assistant message")?;
+        }
+
+        // Check if compaction should be triggered.
+        let history_tokens = self
+            .history_store
+            .total_history_tokens(&conv_id)
+            .unwrap_or(0);
+        let history_budget = budget.available_for_history();
+        self.compaction_service
+            .maybe_trigger(&conv_id, history_tokens, history_budget);
 
         self.build_out_event(event, response)
     }
 
-    fn build_messages(&self, event: &InEvent) -> Vec<ChatMessage> {
-        let mut system_parts = vec![self.system_prompt.clone()];
+    /// Load conversation history as turns, incorporating any compaction summary.
+    fn load_history_turns(&self, conv_id: &types::ConversationId) -> Result<(Vec<Turn>, usize)> {
+        let summary = self.history_store.load_summary(conv_id)?;
 
-        if !self.core_persona.is_empty() {
-            system_parts.push(format!(
-                "\n---\n## Core Persona\n{}\n---",
-                self.core_persona
-            ));
+        let messages = match &summary {
+            Some(s) => self
+                .history_store
+                .load_messages_after(conv_id, s.compacted_up_to)?,
+            None => self.history_store.load_messages(conv_id)?,
+        };
+
+        // Build turns from stored messages (group by turn_id).
+        let mut turns: Vec<Turn> = Vec::new();
+        let mut summary_overhead = 0usize;
+
+        // If we have a summary, create a synthetic turn for it.
+        if let Some(ref s) = summary {
+            turns.push(Turn {
+                turn_id: "__summary__".to_string(),
+                messages: vec![types::ChatMessage::system(format!(
+                    "## Conversation Summary\n\n{}",
+                    s.summary_text
+                ))],
+                total_tokens: s.token_estimate,
+            });
+            summary_overhead = s.token_estimate;
         }
 
-        // Add channel context.
-        system_parts.push(format!(
-            "\nYou are responding in: {:?} (conversation: {:?})",
-            event.source, event.context.conversation_id
-        ));
+        // Group messages by turn_id.
+        let mut current_turn_id: Option<String> = None;
+        let mut current_messages: Vec<types::ChatMessage> = Vec::new();
+        let mut current_tokens: usize = 0;
 
-        let system_content = system_parts.join("\n");
+        for stored in &messages {
+            if current_turn_id.as_deref() != Some(&stored.turn_id) {
+                // Flush previous turn.
+                if let Some(tid) = current_turn_id.take() {
+                    turns.push(Turn {
+                        turn_id: tid,
+                        messages: std::mem::take(&mut current_messages),
+                        total_tokens: current_tokens,
+                    });
+                    current_tokens = 0;
+                }
+                current_turn_id = Some(stored.turn_id.clone());
+            }
+            current_messages.push(stored.to_chat_message());
+            current_tokens += stored.token_estimate;
+        }
 
-        vec![
-            ChatMessage {
-                role: Role::System,
-                content: system_content,
-                tool_call_id: None,
-                tool_calls: vec![],
-            },
-            ChatMessage {
-                role: Role::User,
-                content: format!("{}: {}", event.message.author.display_name, event.message.text),
-                tool_call_id: None,
-                tool_calls: vec![],
-            },
-        ]
+        // Flush last turn.
+        if let Some(tid) = current_turn_id {
+            turns.push(Turn {
+                turn_id: tid,
+                messages: current_messages,
+                total_tokens: current_tokens,
+            });
+        }
+
+        Ok((turns, summary_overhead))
     }
 
-    fn build_out_event(&self, event: &InEvent, response: LlmResponse) -> Result<OutEvent> {
+    /// Search memory for notes relevant to the user's message.
+    fn retrieve_memories(&self, query: &str) -> Vec<String> {
+        match self.memory_store.search_notes(query, 5) {
+            Ok(notes) => notes
+                .into_iter()
+                .map(|n| format!("**{}**: {}", n.title, n.content))
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "memory retrieval failed, continuing without memories");
+                vec![]
+            }
+        }
+    }
+
+    fn build_out_event(
+        &self,
+        event: &InEvent,
+        response: crate::providers::LlmResponse,
+    ) -> Result<OutEvent> {
         let text = response.text.clone();
 
         // Parse directives from the response text.
@@ -166,4 +448,87 @@ fn default_system_prompt() -> String {
      You are warm, curious, and genuine. \
      Respond naturally as yourself, not as a helper bot."
         .to_string()
+}
+
+fn default_compaction_prompt() -> String {
+    "Summarize the following conversation, preserving key facts, decisions, \
+     emotional context, and any commitments made. Be concise but thorough."
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Type conversion helpers
+// ---------------------------------------------------------------------------
+
+/// Convert event-system ConversationId to the types-system ConversationId
+/// used by the history store.
+fn event_conv_id_to_types(event_id: &crate::core::event::ConversationId) -> types::ConversationId {
+    match event_id {
+        crate::core::event::ConversationId::Dm {
+            channel_type,
+            user_id,
+        } => types::ConversationId::DM {
+            channel_type: channel_type.to_string(),
+            user_id: user_id.clone(),
+        },
+        crate::core::event::ConversationId::Group {
+            channel_type,
+            group_id,
+        } => types::ConversationId::Group {
+            channel_type: channel_type.to_string(),
+            group_id: group_id.clone(),
+        },
+        crate::core::event::ConversationId::System { event_name } => {
+            types::ConversationId::System {
+                event_name: event_name.clone(),
+            }
+        }
+    }
+}
+
+/// Convert `types::ChatMessage` list to `providers::ChatMessage` list.
+fn types_to_provider_messages(
+    messages: &[types::ChatMessage],
+) -> Vec<crate::providers::ChatMessage> {
+    messages
+        .iter()
+        .map(|m| crate::providers::ChatMessage {
+            role: types_role_to_provider(&m.role),
+            content: m.content.clone(),
+            tool_call_id: m.tool_call_id.clone(),
+            tool_calls: m
+                .tool_calls
+                .as_ref()
+                .map(|tcs| {
+                    tcs.iter()
+                        .map(|tc| crate::providers::ToolCall {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn types_role_to_provider(role: &types::Role) -> crate::providers::Role {
+    match role {
+        types::Role::User => crate::providers::Role::User,
+        types::Role::Assistant => crate::providers::Role::Assistant,
+        types::Role::Tool => crate::providers::Role::Tool,
+        types::Role::System => crate::providers::Role::System,
+    }
+}
+
+/// Convert internal `tools::ToolDef` to `providers::ToolDef`.
+fn tool_defs_to_provider(defs: &[crate::tools::ToolDef]) -> Vec<ProviderToolDef> {
+    defs.iter()
+        .map(|d| ProviderToolDef {
+            name: d.name.clone(),
+            description: d.description.clone(),
+            parameters: d.parameters.clone(),
+        })
+        .collect()
 }

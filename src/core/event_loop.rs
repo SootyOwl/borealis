@@ -367,9 +367,7 @@ mod tests {
         };
         let (bus, mut _out_rx) = EventBus::new(config, echo_handler(), cancel.clone());
 
-        bus.dispatch(make_event("conv1", "hello"))
-            .await
-            .unwrap();
+        bus.dispatch(make_event("conv1", "hello")).await.unwrap();
 
         // Worker should exist now
         tokio::time::sleep(Duration::from_millis(20)).await;

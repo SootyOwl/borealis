@@ -53,6 +53,34 @@ async fn main() -> anyhow::Result<()> {
     }
     info!(path = %settings.database.path.display(), "database opened with WAL mode");
 
+    // Initialize the history schema.
+    {
+        let conn = db_conn.lock().expect("mutex not poisoned");
+        borealis::history::schema::initialize(&conn)?;
+    }
+    info!("history schema initialized");
+
+    // Create the history store.
+    let history_store = Arc::new(borealis::history::store::HistoryStore::new(Arc::clone(
+        &db_conn,
+    )));
+
+    // Create the memory store.
+    let memory_store = borealis::memory::MemoryStore::new(
+        Arc::clone(&db_conn),
+        settings.bot.core_persona_path.clone(),
+    )?;
+    info!("memory store initialized");
+
+    // Create the tool registry with memory tools.
+    let mut tool_registry = borealis::tools::ToolRegistry::new();
+    borealis::tools::register_memory_tools(&mut tool_registry, memory_store.clone());
+    let tool_registry = Arc::new(tool_registry);
+    info!(
+        tool_count = tool_registry.tool_count(),
+        "tool registry initialized"
+    );
+
     // Create the cancellation token — the single shutdown coordination primitive.
     let cancel = CancellationToken::new();
 
@@ -63,14 +91,55 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Build the LLM provider and pipeline from config.
-    let pipeline: Arc<dyn PipelineRunner> = build_pipeline(&settings)?;
+    let pipeline: Arc<dyn PipelineRunner> = build_pipeline(
+        &settings,
+        Arc::clone(&history_store),
+        Arc::clone(&tool_registry),
+        memory_store,
+    )?;
+
+    // Spawn the scheduler if events are configured.
+    if !settings.scheduler.events.is_empty() {
+        let (sched_tx, mut sched_rx) = tokio::sync::mpsc::channel(256);
+        let mut scheduler = borealis::scheduler::Scheduler::new(
+            settings.scheduler.clone(),
+            sched_tx,
+            cancel.clone(),
+        )?;
+        scheduler.start();
+
+        // Spawn a task that feeds scheduler events into the pipeline.
+        let pipeline_sched = pipeline.clone();
+        let cancel_sched = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(event) = sched_rx.recv() => {
+                        match pipeline_sched.process(&event).await {
+                            Ok(_out_event) => {
+                                tracing::debug!("scheduler event processed");
+                            }
+                            Err(e) => {
+                                tracing::error!("scheduler pipeline error: {e}");
+                            }
+                        }
+                    }
+                    _ = cancel_sched.cancelled() => {
+                        tracing::debug!("scheduler processing loop cancelled");
+                        break;
+                    }
+                }
+            }
+        });
+
+        info!(
+            events = settings.scheduler.events.len(),
+            "scheduler spawned"
+        );
+    }
 
     // Wire up the CLI adapter if enabled.
-    let cli_enabled = settings
-        .channels
-        .cli
-        .as_ref()
-        .is_some_and(|c| c.enabled);
+    let cli_enabled = settings.channels.cli.as_ref().is_some_and(|c| c.enabled);
 
     if cli_enabled {
         let (in_tx, mut in_rx) = tokio::sync::mpsc::channel(256);
@@ -148,7 +217,10 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        info!("CLI adapter running — type a message to chat with {}", settings.bot.name);
+        info!(
+            "CLI adapter running — type a message to chat with {}",
+            settings.bot.name
+        );
     } else {
         info!("no channel adapters enabled — waiting for shutdown signal");
     }
@@ -167,9 +239,14 @@ async fn main() -> anyhow::Result<()> {
 
 fn build_pipeline(
     settings: &borealis::config::Settings,
+    history_store: Arc<borealis::history::store::HistoryStore>,
+    tool_registry: Arc<borealis::tools::ToolRegistry>,
+    memory_store: borealis::memory::MemoryStore,
 ) -> anyhow::Result<Arc<dyn PipelineRunner>> {
     let sys_path = &settings.bot.system_prompt_path;
     let persona_path = &settings.bot.core_persona_path;
+    let compaction_config = settings.bot.compaction.clone();
+    let compaction_state = Arc::new(borealis::history::compaction::CompactionState::new());
 
     // Prefer Anthropic if configured, otherwise fall back to OpenAI-compatible.
     if let Some(ref anthropic) = settings.providers.anthropic {
@@ -187,9 +264,27 @@ fn build_pipeline(
             max_retries: anthropic.max_retries,
         };
 
-        let provider = borealis::providers::anthropic::AnthropicProvider::new(config)?;
+        let provider = Arc::new(borealis::providers::anthropic::AnthropicProvider::new(
+            config,
+        )?);
         info!(model = %anthropic.model, "using Anthropic provider");
-        let pipeline = borealis::core::pipeline::Pipeline::new(provider, sys_path, persona_path)?;
+
+        let pipeline_config = borealis::core::pipeline::PipelineConfig {
+            model_max_tokens: anthropic.max_history_tokens,
+            response_reserve: 1024,
+        };
+
+        let pipeline = borealis::core::pipeline::Pipeline::new(
+            provider,
+            sys_path,
+            persona_path,
+            history_store,
+            tool_registry,
+            memory_store,
+            compaction_config,
+            compaction_state,
+            pipeline_config,
+        )?;
         return Ok(Arc::new(pipeline));
     }
 
@@ -208,13 +303,31 @@ fn build_pipeline(
             max_retries: openai.max_retries,
         };
 
-        let provider = borealis::providers::openai::OpenAiProvider::new(config)?;
+        let provider = Arc::new(borealis::providers::openai::OpenAiProvider::new(config)?);
         info!(model = %openai.model, "using OpenAI-compatible provider");
-        let pipeline = borealis::core::pipeline::Pipeline::new(provider, sys_path, persona_path)?;
+
+        let pipeline_config = borealis::core::pipeline::PipelineConfig {
+            model_max_tokens: openai.max_history_tokens,
+            response_reserve: 1024,
+        };
+
+        let pipeline = borealis::core::pipeline::Pipeline::new(
+            provider,
+            sys_path,
+            persona_path,
+            history_store,
+            tool_registry,
+            memory_store,
+            compaction_config,
+            compaction_state,
+            pipeline_config,
+        )?;
         return Ok(Arc::new(pipeline));
     }
 
-    anyhow::bail!("no LLM provider configured — add [providers.openai] or [providers.anthropic] to config")
+    anyhow::bail!(
+        "no LLM provider configured — add [providers.openai] or [providers.anthropic] to config"
+    )
 }
 
 fn run_migrate_letta(args: &[String]) -> anyhow::Result<()> {

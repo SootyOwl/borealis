@@ -64,10 +64,7 @@ fn env_vars_override_toml_values() {
     // Use the config crate's mock env source — no process-level mutation.
     let mut mock_env = HashMap::new();
     mock_env.insert("BOREALIS__BOT__NAME".into(), "TestBot".into());
-    mock_env.insert(
-        "BOREALIS__PROVIDERS__OPENAI__MODEL".into(),
-        "gpt-4o".into(),
-    );
+    mock_env.insert("BOREALIS__PROVIDERS__OPENAI__MODEL".into(), "gpt-4o".into());
 
     let config = Config::builder()
         .add_source(File::from_str(default_toml, FileFormat::Toml))

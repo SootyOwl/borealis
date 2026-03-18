@@ -48,12 +48,13 @@ fn default_toml_deserializes_to_settings() {
         .expect("failed to deserialize default.toml into TestSettings");
 
     assert_eq!(settings.bot.name, "Aurora");
-    assert!(settings.providers.anthropic.is_some());
+    // Anthropic is commented out in default.toml (requires API key).
+    assert!(settings.providers.anthropic.is_none());
     assert!(settings.providers.openai.is_some());
 
-    let anthropic = settings.providers.anthropic.unwrap();
-    assert_eq!(anthropic.base_url, "https://api.anthropic.com");
-    assert_eq!(anthropic.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    let openai = settings.providers.openai.unwrap();
+    assert_eq!(openai.base_url, "http://localhost:11434/v1");
+    assert_eq!(openai.model, "llama3");
 }
 
 #[test]
@@ -64,8 +65,8 @@ fn env_vars_override_toml_values() {
     let mut mock_env = HashMap::new();
     mock_env.insert("BOREALIS__BOT__NAME".into(), "TestBot".into());
     mock_env.insert(
-        "BOREALIS__PROVIDERS__ANTHROPIC__MODEL".into(),
-        "claude-opus-4-20250514".into(),
+        "BOREALIS__PROVIDERS__OPENAI__MODEL".into(),
+        "gpt-4o".into(),
     );
 
     let config = Config::builder()
@@ -83,8 +84,8 @@ fn env_vars_override_toml_values() {
         .expect("failed to deserialize with env overrides");
 
     assert_eq!(settings.bot.name, "TestBot");
-    let anthropic = settings.providers.anthropic.unwrap();
-    assert_eq!(anthropic.model, "claude-opus-4-20250514");
+    let openai = settings.providers.openai.unwrap();
+    assert_eq!(openai.model, "gpt-4o");
 }
 
 #[test]
@@ -110,8 +111,6 @@ model = "gpt-4o"
         .expect("failed to deserialize with overlay");
 
     assert_eq!(settings.bot.name, "OverlayBot");
-    // Anthropic should still be present from default
-    assert!(settings.providers.anthropic.is_some());
     // OpenAI model should be overridden
     let openai = settings.providers.openai.unwrap();
     assert_eq!(openai.model, "gpt-4o");
@@ -240,8 +239,8 @@ name = "LocalAurora"
                 .expect("failed to deserialize with local overlay");
 
             assert_eq!(settings.bot.name, "LocalAurora");
-            // Providers still present from default
-            assert!(settings.providers.anthropic.is_some());
+            // OpenAI still present from default
+            assert!(settings.providers.openai.is_some());
         },
     );
 }

@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use borealis::core::pipeline::PipelineRunner;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing (respects RUST_LOG env var).
@@ -60,19 +62,159 @@ async fn main() -> anyhow::Result<()> {
         borealis::shutdown::wait_for_signal(signal_cancel).await;
     });
 
-    // Future phases wire up channel adapters and the event bus here.
-    // For now, wait for shutdown signal.
+    // Build the LLM provider and pipeline from config.
+    let pipeline: Arc<dyn PipelineRunner> = build_pipeline(&settings)?;
+
+    // Wire up the CLI adapter if enabled.
+    let cli_enabled = settings
+        .channels
+        .cli
+        .as_ref()
+        .is_some_and(|c| c.enabled);
+
+    if cli_enabled {
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::channel(256);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(256);
+
+        let cli = Arc::new(borealis::channels::cli::CliAdapter::new(
+            settings.bot.name.clone(),
+        ));
+
+        // Spawn CLI inbound (stdin reader).
+        let cli_in = cli.clone();
+        let cancel_in = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                result = borealis::channels::Channel::run_inbound(cli_in, in_tx) => {
+                    if let Err(e) = result {
+                        tracing::error!("CLI inbound error: {e}");
+                    }
+                }
+                _ = cancel_in.cancelled() => {
+                    tracing::debug!("CLI inbound cancelled");
+                }
+            }
+        });
+
+        // Spawn CLI outbound (stdout writer).
+        let cli_out = cli.clone();
+        let cancel_out = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                result = borealis::channels::Channel::run_outbound(cli_out, out_rx) => {
+                    if let Err(e) = result {
+                        tracing::error!("CLI outbound error: {e}");
+                    }
+                }
+                _ = cancel_out.cancelled() => {
+                    tracing::debug!("CLI outbound cancelled");
+                }
+            }
+        });
+
+        // Spawn the message processing loop.
+        let pipeline_clone = pipeline.clone();
+        let cancel_loop = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(event) = in_rx.recv() => {
+                        match pipeline_clone.process(&event).await {
+                            Ok(out_event) => {
+                                if out_tx.send(out_event).await.is_err() {
+                                    tracing::debug!("outbound channel closed");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("pipeline error: {e}");
+                                // Send an error message back to the user.
+                                let err_event = borealis::core::event::OutEvent {
+                                    target: event.source.clone(),
+                                    channel_id: event.context.channel_id.clone(),
+                                    text: Some("I'm having trouble thinking right now, try again in a moment.".into()),
+                                    directives: vec![],
+                                    reply_to: Some(event.message.id.clone()),
+                                };
+                                let _ = out_tx.send(err_event).await;
+                            }
+                        }
+                    }
+                    _ = cancel_loop.cancelled() => {
+                        tracing::debug!("processing loop cancelled");
+                        break;
+                    }
+                }
+            }
+        });
+
+        info!("CLI adapter running — type a message to chat with {}", settings.bot.name);
+    } else {
+        info!("no channel adapters enabled — waiting for shutdown signal");
+    }
+
+    // Wait for shutdown signal.
     cancel.cancelled().await;
 
     // Run the graceful shutdown sequence with 5s timeout.
-    let drain = async {
-        // Future phases: shut down event bus, channel adapters, etc.
-        // e.g., event_bus.shutdown().await;
-    };
-
+    let drain = async {};
     borealis::shutdown::run_shutdown(drain, Some(db_conn)).await;
 
-    Ok(())
+    // Force exit — the tokio stdin reader holds the process alive because
+    // its blocking read doesn't respect cancellation.
+    std::process::exit(0);
+}
+
+fn build_pipeline(
+    settings: &borealis::config::Settings,
+) -> anyhow::Result<Arc<dyn PipelineRunner>> {
+    let sys_path = &settings.bot.system_prompt_path;
+    let persona_path = &settings.bot.core_persona_path;
+
+    // Prefer Anthropic if configured, otherwise fall back to OpenAI-compatible.
+    if let Some(ref anthropic) = settings.providers.anthropic {
+        let api_key = anthropic
+            .api_key_env
+            .as_ref()
+            .and_then(|env| std::env::var(env).ok())
+            .unwrap_or_default();
+
+        let config = borealis::providers::ProviderConfig {
+            api_key,
+            base_url: anthropic.base_url.clone(),
+            model: anthropic.model.clone(),
+            timeout_secs: anthropic.timeout_secs,
+            max_retries: anthropic.max_retries,
+        };
+
+        let provider = borealis::providers::anthropic::AnthropicProvider::new(config)?;
+        info!(model = %anthropic.model, "using Anthropic provider");
+        let pipeline = borealis::core::pipeline::Pipeline::new(provider, sys_path, persona_path)?;
+        return Ok(Arc::new(pipeline));
+    }
+
+    if let Some(ref openai) = settings.providers.openai {
+        let api_key = openai
+            .api_key_env
+            .as_ref()
+            .and_then(|env| std::env::var(env).ok())
+            .unwrap_or_default();
+
+        let config = borealis::providers::ProviderConfig {
+            api_key,
+            base_url: openai.base_url.clone(),
+            model: openai.model.clone(),
+            timeout_secs: openai.timeout_secs,
+            max_retries: openai.max_retries,
+        };
+
+        let provider = borealis::providers::openai::OpenAiProvider::new(config)?;
+        info!(model = %openai.model, "using OpenAI-compatible provider");
+        let pipeline = borealis::core::pipeline::Pipeline::new(provider, sys_path, persona_path)?;
+        return Ok(Arc::new(pipeline));
+    }
+
+    anyhow::bail!("no LLM provider configured — add [providers.openai] or [providers.anthropic] to config")
 }
 
 fn run_migrate_letta(args: &[String]) -> anyhow::Result<()> {

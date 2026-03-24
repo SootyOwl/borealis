@@ -63,5 +63,6 @@
   "kickoff_verification": "local",
   "reminder_drift_threshold": 3,
   "signing_enforcement": "audit",
-  "tracking_mode": "normal"
+  "tracking_mode": "normal",
+  "tracker_remote": "origin"
 }

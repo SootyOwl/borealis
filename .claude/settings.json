@@ -1,7 +1,4 @@
 {
-  "permissions": {
-    "defaultMode": "bypassPermissions"
-  },
   "allowedTools": [
     "Bash(tmux *)",
     "Bash(git worktree *)"
@@ -74,5 +71,8 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions"
   }
 }

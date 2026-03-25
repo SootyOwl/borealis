@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Draft Borealis MVP design document with 3-phase implementation plan (#1)
 
 ### Fixed
+- Add link visibility to memory_read output and add memory_links tool (#38)
 - Fix process not exiting cleanly on Ctrl+C (#35)
 - Fix provider config so missing API keys don't block startup (#33)
 

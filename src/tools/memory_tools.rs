@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::memory::Memory;
-use crate::tools::{ToolContext, ToolDef, ToolHandler, ToolRegistry, ToolResult};
+use crate::tools::{Tool, ToolContext, ToolDef, ToolRegistry, ToolResult};
 
 /// Register all 9 memory tools into the given registry.
 pub fn register_memory_tools(registry: &mut ToolRegistry, store: Arc<dyn Memory>) {
@@ -51,7 +51,7 @@ fn get_string_array(args: &serde_json::Value, field: &str) -> Vec<String> {
 
 struct MemoryCreate(Arc<dyn Memory>);
 
-impl ToolHandler for MemoryCreate {
+impl Tool for MemoryCreate {
     fn name(&self) -> &str {
         "memory_create"
     }
@@ -112,7 +112,7 @@ impl ToolHandler for MemoryCreate {
 
 struct MemorySearch(Arc<dyn Memory>);
 
-impl ToolHandler for MemorySearch {
+impl Tool for MemorySearch {
     fn name(&self) -> &str {
         "memory_search"
     }
@@ -159,7 +159,7 @@ impl ToolHandler for MemorySearch {
 
 struct MemoryRead(Arc<dyn Memory>);
 
-impl ToolHandler for MemoryRead {
+impl Tool for MemoryRead {
     fn name(&self) -> &str {
         "memory_read"
     }
@@ -202,7 +202,7 @@ impl ToolHandler for MemoryRead {
 
 struct MemoryUpdate(Arc<dyn Memory>);
 
-impl ToolHandler for MemoryUpdate {
+impl Tool for MemoryUpdate {
     fn name(&self) -> &str {
         "memory_update"
     }
@@ -254,7 +254,7 @@ impl ToolHandler for MemoryUpdate {
 
 struct MemoryLink(Arc<dyn Memory>);
 
-impl ToolHandler for MemoryLink {
+impl Tool for MemoryLink {
     fn name(&self) -> &str {
         "memory_link"
     }
@@ -312,7 +312,7 @@ impl ToolHandler for MemoryLink {
 
 struct MemoryTag(Arc<dyn Memory>);
 
-impl ToolHandler for MemoryTag {
+impl Tool for MemoryTag {
     fn name(&self) -> &str {
         "memory_tag"
     }
@@ -363,7 +363,7 @@ impl ToolHandler for MemoryTag {
 
 struct MemoryForget(Arc<dyn Memory>);
 
-impl ToolHandler for MemoryForget {
+impl Tool for MemoryForget {
     fn name(&self) -> &str {
         "memory_forget"
     }
@@ -410,7 +410,7 @@ impl ToolHandler for MemoryForget {
 
 struct MemoryLinks(Arc<dyn Memory>);
 
-impl ToolHandler for MemoryLinks {
+impl Tool for MemoryLinks {
     fn name(&self) -> &str {
         "memory_links"
     }
@@ -452,7 +452,7 @@ impl ToolHandler for MemoryLinks {
 
 struct MemoryList(Arc<dyn Memory>);
 
-impl ToolHandler for MemoryList {
+impl Tool for MemoryList {
     fn name(&self) -> &str {
         "memory_list"
     }

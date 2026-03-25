@@ -28,7 +28,7 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-/// Context passed to tool handlers for authorization and routing.
+/// Context passed to tools for authorization and routing.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub author_id: String,
@@ -36,8 +36,8 @@ pub struct ToolContext {
     pub channel_source: String,
 }
 
-/// Trait for tool handlers. Rust 2024 edition — native async fn in traits.
-pub trait ToolHandler: Send + Sync {
+/// Trait for tools. Rust 2024 edition — native async fn in traits.
+pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn definition(&self) -> ToolDef;
     fn execute(
@@ -47,13 +47,13 @@ pub trait ToolHandler: Send + Sync {
     ) -> impl std::future::Future<Output = ToolResult> + Send;
 }
 
-/// Registry that maps tool names to handler instances.
+/// Registry that maps tool names to instances.
 pub struct ToolRegistry {
-    handlers: HashMap<String, Box<dyn ErasedToolHandler>>,
+    handlers: HashMap<String, Box<dyn ErasedTool>>,
 }
 
-/// Object-safe wrapper around ToolHandler to allow dynamic dispatch.
-trait ErasedToolHandler: Send + Sync {
+/// Object-safe wrapper around Tool to allow dynamic dispatch.
+trait ErasedTool: Send + Sync {
     fn definition(&self) -> ToolDef;
     fn execute_boxed<'a>(
         &'a self,
@@ -62,9 +62,9 @@ trait ErasedToolHandler: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>>;
 }
 
-impl<T: ToolHandler> ErasedToolHandler for T {
+impl<T: Tool> ErasedTool for T {
     fn definition(&self) -> ToolDef {
-        ToolHandler::definition(self)
+        Tool::definition(self)
     }
 
     fn execute_boxed<'a>(
@@ -72,7 +72,7 @@ impl<T: ToolHandler> ErasedToolHandler for T {
         args: serde_json::Value,
         ctx: &'a ToolContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
-        Box::pin(ToolHandler::execute(self, args, ctx))
+        Box::pin(Tool::execute(self, args, ctx))
     }
 }
 
@@ -83,7 +83,7 @@ impl ToolRegistry {
         }
     }
 
-    pub fn register<T: ToolHandler + 'static>(&mut self, handler: T) {
+    pub fn register<T: Tool + 'static>(&mut self, handler: T) {
         self.handlers
             .insert(handler.name().to_string(), Box::new(handler));
     }
@@ -126,7 +126,7 @@ mod tests {
 
     struct EchoTool;
 
-    impl ToolHandler for EchoTool {
+    impl Tool for EchoTool {
         fn name(&self) -> &str {
             "echo"
         }

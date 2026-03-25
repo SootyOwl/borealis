@@ -154,64 +154,12 @@ impl RateLimiter {
 }
 
 // ---------------------------------------------------------------------------
-// Path Traversal Prevention
-// ---------------------------------------------------------------------------
-
-/// Validates that a file path is safe for the `SendFile` directive.
-///
-/// A path is considered safe if:
-/// - It does not contain `..` components (path traversal)
-/// - It is not absolute (must be relative to the working directory)
-///
-/// Returns `Ok(())` if safe, `Err(reason)` otherwise.
-pub fn validate_sendfile_path(path: &std::path::Path) -> Result<(), String> {
-    // Reject absolute paths
-    if path.is_absolute() {
-        return Err(format!(
-            "absolute paths are not allowed in SendFile: {}",
-            path.display()
-        ));
-    }
-
-    // Reject path traversal components
-    for component in path.components() {
-        if let std::path::Component::ParentDir = component {
-            return Err(format!(
-                "path traversal ('..') is not allowed in SendFile: {}",
-                path.display()
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Memory Tool Authorization
-// ---------------------------------------------------------------------------
-
-/// The set of memory tool names that require write authorization.
-const MEMORY_WRITE_TOOLS: &[&str] = &[
-    "memory_create",
-    "memory_update",
-    "memory_link",
-    "memory_tag",
-    "memory_forget",
-];
-
-/// Returns `true` if `tool_name` is a memory-write tool that requires authorization.
-pub fn is_memory_write_tool(tool_name: &str) -> bool {
-    MEMORY_WRITE_TOOLS.contains(&tool_name)
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::thread;
 
     fn test_config() -> RateLimitConfig {
@@ -407,64 +355,4 @@ mod tests {
         assert!(!limiter.is_user_allowed("random"));
     }
 
-    // --- Path Traversal ---
-
-    #[test]
-    fn safe_relative_path_allowed() {
-        assert!(validate_sendfile_path(Path::new("images/cat.png")).is_ok());
-    }
-
-    #[test]
-    fn nested_relative_path_allowed() {
-        assert!(validate_sendfile_path(Path::new("assets/images/photo.jpg")).is_ok());
-    }
-
-    #[test]
-    fn absolute_path_rejected() {
-        let result = validate_sendfile_path(Path::new("/etc/passwd"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("absolute"));
-    }
-
-    #[test]
-    fn path_traversal_rejected() {
-        let result = validate_sendfile_path(Path::new("images/../../etc/passwd"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("traversal"));
-    }
-
-    #[test]
-    fn simple_dotdot_rejected() {
-        let result = validate_sendfile_path(Path::new("../secret.txt"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn current_dir_path_allowed() {
-        assert!(validate_sendfile_path(Path::new("./images/cat.png")).is_ok());
-    }
-
-    // --- Memory Write Tool Check ---
-
-    #[test]
-    fn memory_write_tools_identified() {
-        assert!(is_memory_write_tool("memory_create"));
-        assert!(is_memory_write_tool("memory_update"));
-        assert!(is_memory_write_tool("memory_link"));
-        assert!(is_memory_write_tool("memory_tag"));
-        assert!(is_memory_write_tool("memory_forget"));
-    }
-
-    #[test]
-    fn memory_read_tools_not_write() {
-        assert!(!is_memory_write_tool("memory_read"));
-        assert!(!is_memory_write_tool("memory_search"));
-        assert!(!is_memory_write_tool("memory_list"));
-    }
-
-    #[test]
-    fn unknown_tool_not_write() {
-        assert!(!is_memory_write_tool("echo"));
-        assert!(!is_memory_write_tool(""));
-    }
 }

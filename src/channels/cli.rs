@@ -4,13 +4,32 @@ use anyhow::Result;
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::channels::Channel;
+use crate::channels::{Channel, ChannelRegistry};
+use crate::config::Settings;
 use crate::core::event::{
     Author, ChannelSource, ConversationId, Directive, DirectiveKind, FileKind, InEvent, Message,
     MessageContext, MessageId, OutEvent,
 };
+use crate::core::pipeline::PipelineRunner;
+
+/// Register the CLI adapter with the channel registry if enabled in config.
+pub fn register(
+    registry: &mut ChannelRegistry,
+    settings: &Settings,
+    pipeline: Arc<dyn PipelineRunner>,
+    cancel: CancellationToken,
+) {
+    let enabled = settings.channels.cli.as_ref().is_some_and(|c| c.enabled);
+    if !enabled {
+        return;
+    }
+
+    let cli = Arc::new(CliAdapter::new(settings.bot.name.clone()));
+    registry.register(cli, pipeline, cancel);
+}
 
 /// CLI adapter for development — reads lines from stdin, prints responses to stdout.
 ///

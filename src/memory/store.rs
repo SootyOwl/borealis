@@ -187,7 +187,11 @@ impl MemoryStore {
 
         let tags = self.get_tags_for_note_locked(&conn, &note.id)?;
         let links = self.get_links_for_note_locked(&conn, &note.id)?;
-        Ok(Note { tags, links, ..note })
+        Ok(Note {
+            tags,
+            links,
+            ..note
+        })
     }
 
     fn read_core(&self) -> MemoryResult<Note> {

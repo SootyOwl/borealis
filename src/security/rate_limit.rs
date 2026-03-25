@@ -354,5 +354,4 @@ mod tests {
         assert!(limiter.is_user_allowed("admin"));
         assert!(!limiter.is_user_allowed("random"));
     }
-
 }

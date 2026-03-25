@@ -1,5 +1,8 @@
 # Feature: Borealis MVP — Aurora's Bot Runtime
 
+> **Status: Substantially Complete** (2026-03-25)
+> 22/27 ACs checked, 2 carried forward as standalone tasks (AC-6 stress test, AC-11 400 recovery, AC-26 dual-provider compaction), 4 superseded by `.design/modular-runtime-and-new-tools.md`. Aurora is live and functional on CLI with memory, tools, scheduler, and compaction. This document is now a historical record. Active development continues under the modular runtime design doc.
+
 ## Summary
 
 Borealis is a modular, multi-channel bot runtime written in Rust that powers Aurora — a digital person with her own personality, interests, and evolving memory. It replaces the existing LettaBot + self-hosted Letta server with a fully owned stack using a hybrid traits + message bus architecture. The MVP delivers end-to-end functionality: config loading, LLM providers (Anthropic + OpenAI-compatible), CLI and Discord adapters, a SQLite-backed memory system with tool integration, directive parsing, LLM-driven context window compaction, a config-driven scheduler, and Letta data migration.
@@ -27,19 +30,19 @@ Borealis is a modular, multi-channel bot runtime written in Rust that powers Aur
 - [x] AC-3: OpenAI-compatible provider sends a chat request to a local Ollama instance and returns a valid `LlmResponse` with `text`, `tool_calls`, and `usage` fields. (REQ-2) — *manually verified with Ollama + minimax-m2.5*
 - [x] AC-4: Anthropic provider sends a chat request to the Anthropic API and returns a valid `LlmResponse`; a simulated 429 response triggers retry with backoff and eventually returns an error message (not a panic). (REQ-2) — *9 provider tests including retry logic with mock HTTP*
 - [x] AC-5: Typing a message in the CLI adapter produces an LLM response printed to stdout; `tracing` output goes to stderr. (REQ-3, REQ-4) — *manually verified*
-- [ ] AC-6: Sending 20 rapid messages from 4 simulated conversations processes them without deadlock or OOM; per-conversation ordering is preserved (verified by sequence numbers in test). (REQ-4) — *event_loop tests exist but not at this scale*
+- [ ] AC-6: Sending 20 rapid messages from 4 simulated conversations processes them without deadlock or OOM; per-conversation ordering is preserved (verified by sequence numbers in test). (REQ-4) — *event_loop tests exist but not at this scale* — **carried forward as standalone task**
 - [x] AC-7: `memory_create` inserts a row in SQLite; `memory_read` retrieves it; `memory_update` changes content; `memory_search` finds it by tag, title, and content substring; `memory_forget` sets `deleted_at` and excludes from subsequent searches. (REQ-5) — *unit tests + Aurora manually verified via tool calls*
 - [x] AC-8: `memory_link` creates a bidirectional relationship; `memory_list` with tag filter returns only matching notes. (REQ-5) — *unit tests + Aurora manually tested edge cases*
 - [x] AC-9: Core persona from `memory/core.md` appears in every LLM request's system prompt section. Modifying it via `memory_update(id: "core", ...)` persists changes to disk. (REQ-5, REQ-6) — *integration test passes*
 - [x] AC-10: With `max_history_tokens` set to a low value, oldest turns are evicted first. An assistant turn containing tool_calls + tool_results + follow-up response is always evicted as a complete unit — the resulting message array always satisfies Anthropic and OpenAI API schema validation (no orphaned tool_calls or tool_results). (REQ-6) — *budget tests verify turn-atomic eviction*
-- [ ] AC-11: A 400 "context too long" provider response triggers one retry with reduced history; a second 400 resets to system prompt + core persona + current message only. (REQ-6) — *not yet implemented in pipeline*
-- [x] AC-12: `<actions><react emoji="thumbsup"/></actions>` in an LLM response parses into a `Directive::React`; the same text inside a markdown code block is ignored. (REQ-7) — *comprehensive directive parser tests*
-- [ ] AC-13: (Manual verification) Discord bot connects, receives a message in a `mention-only` channel when @mentioned, responds in the correct channel, and stays under 2000 chars (truncated with `...` if needed). Automated tests use mock adapters + in-process event flow. (REQ-3, REQ-11) — *Discord adapter code exists but not wired in main.rs*
-- [ ] AC-14: Discord digest mode batches messages and fires after `digest_interval_min` OR `digest_debounce_min` of silence (whichever first); an @mention bypasses the buffer for immediate processing. (REQ-3) — *mode tests pass, not yet wired to Discord*
-- [x] AC-15: A non-allowed user's attempt to call `memory_create` via tool use returns an authorization error to the LLM (not to the user channel). (REQ-11) — *rate_limit tests verify auth checks*
+- [ ] AC-11: A 400 "context too long" provider response triggers one retry with reduced history; a second 400 resets to system prompt + core persona + current message only. (REQ-6) — *not yet implemented in pipeline* — **carried forward as standalone task**
+- [x] AC-12: `<actions><react emoji="thumbsup"/></actions>` in an LLM response parses into a `Directive::React`; the same text inside a markdown code block is ignored. (REQ-7) — *comprehensive directive parser tests* — **SUPERSEDED: directives replaced by channel tools in modular-runtime-and-new-tools.md REQ-11**
+- [ ] AC-13: (Manual verification) Discord bot connects, receives a message in a `mention-only` channel when @mentioned, responds in the correct channel, and stays under 2000 chars (truncated with `...` if needed). Automated tests use mock adapters + in-process event flow. (REQ-3, REQ-11) — **SUPERSEDED: channel registry in modular-runtime-and-new-tools.md REQ-1/REQ-6**
+- [ ] AC-14: Discord digest mode batches messages and fires after `digest_interval_min` OR `digest_debounce_min` of silence (whichever first); an @mention bypasses the buffer for immediate processing. (REQ-3) — **SUPERSEDED: channel registry in modular-runtime-and-new-tools.md REQ-1/REQ-6**
+- [x] AC-15: A non-allowed user's attempt to call `memory_create` via tool use returns an authorization error to the LLM (not to the user channel). (REQ-11) — *rate_limit tests verified auth checks (now deleted dead code)* — **SUPERSEDED: security module in modular-runtime-and-new-tools.md REQ-8**
 - [x] AC-16: Per-user rate limiter rejects the 11th message in 60 seconds with a log entry; the global limiter triggers at 31 messages across all users. (REQ-11) — *dedicated AC-16 tests pass*
 - [x] AC-17: A heartbeat scheduler event fires within `interval +/- jitter`; an event configured outside `active_hours` is skipped entirely (not queued). (REQ-8) — *manually verified: scheduler started with 2 events*
-- [ ] AC-18: Silent mode scheduler event: LLM text output is not sent to any channel; a `<actions><send channel="discord" chat="general">hello</send></actions>` directive routes to the Discord adapter. (REQ-8) — *requires Discord adapter wiring*
+- [ ] AC-18: Silent mode scheduler event: LLM text output is not sent to any channel; a `<actions><send channel="discord" chat="general">hello</send></actions>` directive routes to the Discord adapter. (REQ-8) — **SUPERSEDED: per-event channel config in modular-runtime-and-new-tools.md REQ-10/REQ-11**
 - [x] AC-19: If a heartbeat is still processing when the next one triggers, the duplicate is skipped with a log entry. (REQ-8) — *overlap prevention in scheduler module*
 - [x] AC-20: SIGTERM during active processing triggers graceful shutdown: in-flight LLM calls complete or timeout within 5s, SQLite WAL is checkpointed, process exits cleanly. (REQ-10) — *manually verified (Ctrl+C exits cleanly)*
 - [x] AC-21: A panicked Discord adapter task is automatically restarted by the `JoinSet` supervisor; after 5 restarts in 60s, retries stop and a critical error is logged. (REQ-9) — *9 supervisor tests including circuit breaker*
@@ -47,7 +50,7 @@ Borealis is a modular, multi-channel bot runtime written in Rust that powers Aur
 - [x] AC-23: When conversation history exceeds 75% of the token budget, a background compaction task is spawned; subsequent requests for the same conversation include the resulting summary in place of the summarized messages. (REQ-13) — *manually verified: compaction triggered and stored summary*
 - [x] AC-24: A compaction summary stored in SQLite survives process restart — on reload, the conversation's prompt assembly uses the stored summary plus messages after the compaction point. (REQ-13) — *compaction tests verify persistence*
 - [x] AC-25: If compaction is still in progress when a new message arrives, the pipeline falls back to simple oldest-first eviction for that request (no blocking). (REQ-13) — *CompactionState::try_start tested*
-- [ ] AC-26: Compaction can be configured to use a different (cheaper) provider/model than the main conversation model; a test with `compaction_model = "local"` uses the local Ollama provider for summarization while the conversation uses Anthropic. (REQ-13) — *config exists but not tested with dual providers*
+- [ ] AC-26: Compaction can be configured to use a different (cheaper) provider/model than the main conversation model; a test with `compaction_model = "local"` uses the local Ollama provider for summarization while the conversation uses Anthropic. (REQ-13) — *config exists but not tested with dual providers* — **carried forward as standalone task**
 - [x] AC-27: Successive compactions accumulate — the second compaction's input includes the first compaction's summary plus messages since, producing a single updated summary (not a chain of summaries). (REQ-13) — *compaction accumulation test passes*
 
 ## Architecture
@@ -300,8 +303,8 @@ The migration script expects JSON files exported from Letta's REST API before sh
 
 ## Known Issues
 
-### Links not visible through memory API (#38)
-Aurora discovered via self-testing that `memory_link` stores links in the DB but they are never surfaced. `memory_read` doesn't include linked notes, and there's no tool to query what links exist from/to a note. Fix: (1) include links array in `memory_read` response, (2) add a `memory_links(id)` tool that returns all links from/to a given note with their relation types.
+### ~~Links not visible through memory API (#38)~~ — FIXED
+Fixed in commit `e552e17`. `memory_read` now includes links, `memory_links` tool added, links are directional (outgoing/incoming).
 
 ## Out of Scope
 

@@ -299,14 +299,16 @@ async fn ac8_link_bidirectional() {
         .await;
     assert!(!result.is_error);
 
-    // Verify bidirectional via store directly
+    // Verify directional links via store directly
     let links_a = store.get_links_for_note(&id_a).unwrap();
     assert_eq!(links_a.len(), 1);
     assert_eq!(links_a[0].to_id, id_b);
+    assert_eq!(links_a[0].direction, Some("outgoing".to_string()));
 
     let links_b = store.get_links_for_note(&id_b).unwrap();
     assert_eq!(links_b.len(), 1);
-    assert_eq!(links_b[0].to_id, id_a);
+    assert_eq!(links_b[0].from_id, id_a);
+    assert_eq!(links_b[0].direction, Some("incoming".to_string()));
 }
 
 /// AC-8: memory_list with tag filter returns only matching notes
@@ -427,13 +429,14 @@ async fn ac9_core_persona() {
 async fn all_tools_registered() {
     let (_store, registry) = setup();
 
-    assert_eq!(registry.tool_count(), 8);
+    assert_eq!(registry.tool_count(), 9);
     for name in [
         "memory_create",
         "memory_search",
         "memory_read",
         "memory_update",
         "memory_link",
+        "memory_links",
         "memory_tag",
         "memory_forget",
         "memory_list",
@@ -442,7 +445,7 @@ async fn all_tools_registered() {
     }
 
     let defs = registry.definitions();
-    assert_eq!(defs.len(), 8);
+    assert_eq!(defs.len(), 9);
     for def in &defs {
         assert!(!def.description.is_empty());
         assert!(def.parameters.is_object());

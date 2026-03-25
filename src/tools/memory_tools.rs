@@ -10,6 +10,7 @@ pub fn register_memory_tools(registry: &mut ToolRegistry, store: MemoryStore) {
     registry.register(MemoryLink(store.clone()));
     registry.register(MemoryTag(store.clone()));
     registry.register(MemoryForget(store.clone()));
+    registry.register(MemoryLinks(store.clone()));
     registry.register(MemoryList(store));
 }
 
@@ -397,6 +398,48 @@ impl ToolHandler for MemoryForget {
                 call_id,
                 serde_json::json!({ "status": "forgotten", "id": id }),
             ),
+            Ok(Err(e)) => error_result(call_id, &e.to_string()),
+            Err(e) => error_result(call_id, &format!("task join error: {e}")),
+        }
+    }
+}
+
+// --- memory_links ---
+
+struct MemoryLinks(MemoryStore);
+
+impl ToolHandler for MemoryLinks {
+    fn name(&self) -> &str {
+        "memory_links"
+    }
+
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "memory_links".to_string(),
+            description: "List all links from/to a given note.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Note ID to query links for"
+                    }
+                },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let call_id = &ctx.conversation_id;
+        let id = match get_str(&args, "id") {
+            Some(i) => i.to_string(),
+            None => return error_result(call_id, "missing required field: id"),
+        };
+
+        let store = self.0.clone();
+        match tokio::task::spawn_blocking(move || store.get_links_for_note(&id)).await {
+            Ok(Ok(links)) => ok_result(call_id, serde_json::to_value(links).unwrap()),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }

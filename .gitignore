@@ -37,3 +37,7 @@ target/
 # Local config overrides (developer-specific)
 config/local.toml
 .worktrees/
+memory/borealis.db
+memory/borealis.db-shm
+memory/borealis.db-wal
+

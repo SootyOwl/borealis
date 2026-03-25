@@ -23,6 +23,8 @@ pub struct Note {
     pub title: String,
     pub content: String,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<Link>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -32,6 +34,8 @@ pub struct Link {
     pub from_id: String,
     pub to_id: String,
     pub relation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
 /// SQLite-backed memory store for notes, tags, and links.
@@ -148,6 +152,7 @@ impl MemoryStore {
             title: title.to_string(),
             content: content.to_string(),
             tags: tags.to_vec(),
+            links: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         })
@@ -169,6 +174,7 @@ impl MemoryStore {
                         title: row.get(1)?,
                         content: row.get(2)?,
                         tags: Vec::new(),
+                        links: Vec::new(),
                         created_at: row.get(3)?,
                         updated_at: row.get(4)?,
                     })
@@ -180,7 +186,8 @@ impl MemoryStore {
             })?;
 
         let tags = self.get_tags_for_note_locked(&conn, &note.id)?;
-        Ok(Note { tags, ..note })
+        let links = self.get_links_for_note_locked(&conn, &note.id)?;
+        Ok(Note { tags, links, ..note })
     }
 
     fn read_core(&self) -> MemoryResult<Note> {
@@ -191,6 +198,7 @@ impl MemoryStore {
             title: "Core Persona".to_string(),
             content,
             tags: vec!["persona".to_string()],
+            links: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         })
@@ -263,6 +271,7 @@ impl MemoryStore {
                     title: row.get(1)?,
                     content: row.get(2)?,
                     tags: Vec::new(),
+                    links: Vec::new(),
                     created_at: row.get(3)?,
                     updated_at: row.get(4)?,
                 })
@@ -296,6 +305,7 @@ impl MemoryStore {
                     title: row.get(1)?,
                     content: row.get(2)?,
                     tags: Vec::new(),
+                    links: Vec::new(),
                     created_at: row.get(3)?,
                     updated_at: row.get(4)?,
                 })
@@ -314,6 +324,7 @@ impl MemoryStore {
                     title: row.get(1)?,
                     content: row.get(2)?,
                     tags: Vec::new(),
+                    links: Vec::new(),
                     created_at: row.get(3)?,
                     updated_at: row.get(4)?,
                 })
@@ -341,20 +352,17 @@ impl MemoryStore {
         self.assert_note_exists_locked(&conn, from_id)?;
         self.assert_note_exists_locked(&conn, to_id)?;
 
-        // Insert bidirectional link
+        // Insert forward link only (directional)
         conn.execute(
             "INSERT OR REPLACE INTO links (from_id, to_id, relation) VALUES (?1, ?2, ?3)",
             params![from_id, to_id, relation],
-        )?;
-        conn.execute(
-            "INSERT OR REPLACE INTO links (from_id, to_id, relation) VALUES (?1, ?2, ?3)",
-            params![to_id, from_id, relation],
         )?;
 
         Ok(Link {
             from_id: from_id.to_string(),
             to_id: to_id.to_string(),
             relation: relation.to_string(),
+            direction: None,
         })
     }
 
@@ -387,14 +395,18 @@ impl MemoryStore {
 
     pub fn get_links_for_note(&self, id: &str) -> MemoryResult<Vec<Link>> {
         let conn = self.conn.lock().expect("mutex poisoned");
-        let mut stmt =
-            conn.prepare("SELECT from_id, to_id, relation FROM links WHERE from_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT from_id, to_id, relation, 'outgoing' AS direction FROM links WHERE from_id = ?1
+             UNION ALL
+             SELECT from_id, to_id, relation, 'incoming' AS direction FROM links WHERE to_id = ?1",
+        )?;
         let links = stmt
             .query_map(params![id], |row| {
                 Ok(Link {
                     from_id: row.get(0)?,
                     to_id: row.get(1)?,
                     relation: row.get(2)?,
+                    direction: row.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -415,6 +427,29 @@ impl MemoryStore {
             .query_map(params![note_id], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(tags)
+    }
+
+    fn get_links_for_note_locked(
+        &self,
+        conn: &Connection,
+        note_id: &str,
+    ) -> MemoryResult<Vec<Link>> {
+        let mut stmt = conn.prepare(
+            "SELECT from_id, to_id, relation, 'outgoing' AS direction FROM links WHERE from_id = ?1
+             UNION ALL
+             SELECT from_id, to_id, relation, 'incoming' AS direction FROM links WHERE to_id = ?1",
+        )?;
+        let links = stmt
+            .query_map(params![note_id], |row| {
+                Ok(Link {
+                    from_id: row.get(0)?,
+                    to_id: row.get(1)?,
+                    relation: row.get(2)?,
+                    direction: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(links)
     }
 
     fn assert_note_exists_locked(&self, conn: &Connection, id: &str) -> MemoryResult<()> {
@@ -535,21 +570,27 @@ mod tests {
     }
 
     #[test]
-    fn link_notes_bidirectional() {
+    fn link_notes_directional() {
         let store = test_store();
         let a = store.create_note("Note A", "Content A", &[]).unwrap();
         let b = store.create_note("Note B", "Content B", &[]).unwrap();
 
         store.link_notes(&a.id, &b.id, "related_to").unwrap();
 
+        // A sees an outgoing link to B
         let links_a = store.get_links_for_note(&a.id).unwrap();
         assert_eq!(links_a.len(), 1);
+        assert_eq!(links_a[0].from_id, a.id);
         assert_eq!(links_a[0].to_id, b.id);
         assert_eq!(links_a[0].relation, "related_to");
+        assert_eq!(links_a[0].direction, Some("outgoing".to_string()));
 
+        // B sees an incoming link from A
         let links_b = store.get_links_for_note(&b.id).unwrap();
         assert_eq!(links_b.len(), 1);
-        assert_eq!(links_b[0].to_id, a.id);
+        assert_eq!(links_b[0].from_id, a.id);
+        assert_eq!(links_b[0].to_id, b.id);
+        assert_eq!(links_b[0].direction, Some("incoming".to_string()));
     }
 
     #[test]
@@ -603,6 +644,33 @@ mod tests {
         // Cannot forget core
         let err = store.forget_note("core").unwrap_err();
         assert!(matches!(err, MemoryError::ReservedId));
+    }
+
+    #[test]
+    fn read_note_includes_links() {
+        let store = test_store();
+        let a = store.create_note("Note A", "Content A", &[]).unwrap();
+        let b = store.create_note("Note B", "Content B", &[]).unwrap();
+
+        store.link_notes(&a.id, &b.id, "related_to").unwrap();
+
+        // A has an outgoing link to B
+        let read = store.read_note(&a.id).unwrap();
+        assert_eq!(read.links.len(), 1);
+        assert_eq!(read.links[0].to_id, b.id);
+        assert_eq!(read.links[0].relation, "related_to");
+        assert_eq!(read.links[0].direction, Some("outgoing".to_string()));
+
+        // B has an incoming link from A
+        let read_b = store.read_note(&b.id).unwrap();
+        assert_eq!(read_b.links.len(), 1);
+        assert_eq!(read_b.links[0].from_id, a.id);
+        assert_eq!(read_b.links[0].direction, Some("incoming".to_string()));
+
+        // Verify notes without links have empty vec
+        let c = store.create_note("Note C", "Content C", &[]).unwrap();
+        let read_c = store.read_note(&c.id).unwrap();
+        assert!(read_c.links.is_empty());
     }
 
     #[test]

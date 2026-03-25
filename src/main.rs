@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Build the LLM provider and pipeline from config.
-    let pipeline: Arc<dyn PipelineRunner> = build_pipeline(
+    let pipeline: Arc<dyn PipelineRunner> = borealis::providers::registry::build_pipeline(
         &settings,
         Arc::clone(&history_store),
         Arc::clone(&tool_registry),
@@ -236,99 +236,6 @@ async fn main() -> anyhow::Result<()> {
     // Force exit — the tokio stdin reader holds the process alive because
     // its blocking read doesn't respect cancellation.
     std::process::exit(0);
-}
-
-fn build_pipeline(
-    settings: &borealis::config::Settings,
-    history_store: Arc<borealis::history::store::HistoryStore>,
-    tool_registry: Arc<borealis::tools::ToolRegistry>,
-    memory_store: Arc<dyn borealis::memory::Memory>,
-) -> anyhow::Result<Arc<dyn PipelineRunner>> {
-    let sys_path = &settings.bot.system_prompt_path;
-    let persona_path = &settings.bot.core_persona_path;
-    let compaction_config = settings.bot.compaction.clone();
-    let compaction_state = Arc::new(borealis::history::compaction::CompactionState::new());
-
-    // Prefer Anthropic if configured, otherwise fall back to OpenAI-compatible.
-    if let Some(ref anthropic) = settings.providers.anthropic {
-        let api_key = anthropic
-            .api_key_env
-            .as_ref()
-            .and_then(|env| std::env::var(env).ok())
-            .unwrap_or_default();
-
-        let config = borealis::providers::ProviderConfig {
-            api_key,
-            base_url: anthropic.base_url.clone(),
-            model: anthropic.model.clone(),
-            timeout_secs: anthropic.timeout_secs,
-            max_retries: anthropic.max_retries,
-        };
-
-        let provider = Arc::new(borealis::providers::anthropic::AnthropicProvider::new(
-            config,
-        )?);
-        info!(model = %anthropic.model, "using Anthropic provider");
-
-        let pipeline_config = borealis::core::pipeline::PipelineConfig {
-            model_max_tokens: anthropic.max_history_tokens,
-            response_reserve: 1024,
-        };
-
-        let pipeline = borealis::core::pipeline::Pipeline::new(
-            provider,
-            sys_path,
-            persona_path,
-            history_store,
-            tool_registry,
-            memory_store,
-            compaction_config,
-            compaction_state,
-            pipeline_config,
-        )?;
-        return Ok(Arc::new(pipeline));
-    }
-
-    if let Some(ref openai) = settings.providers.openai {
-        let api_key = openai
-            .api_key_env
-            .as_ref()
-            .and_then(|env| std::env::var(env).ok())
-            .unwrap_or_default();
-
-        let config = borealis::providers::ProviderConfig {
-            api_key,
-            base_url: openai.base_url.clone(),
-            model: openai.model.clone(),
-            timeout_secs: openai.timeout_secs,
-            max_retries: openai.max_retries,
-        };
-
-        let provider = Arc::new(borealis::providers::openai::OpenAiProvider::new(config)?);
-        info!(model = %openai.model, "using OpenAI-compatible provider");
-
-        let pipeline_config = borealis::core::pipeline::PipelineConfig {
-            model_max_tokens: openai.max_history_tokens,
-            response_reserve: 1024,
-        };
-
-        let pipeline = borealis::core::pipeline::Pipeline::new(
-            provider,
-            sys_path,
-            persona_path,
-            history_store,
-            tool_registry,
-            memory_store,
-            compaction_config,
-            compaction_state,
-            pipeline_config,
-        )?;
-        return Ok(Arc::new(pipeline));
-    }
-
-    anyhow::bail!(
-        "no LLM provider configured — add [providers.openai] or [providers.anthropic] to config"
-    )
 }
 
 fn run_migrate_letta(args: &[String]) -> anyhow::Result<()> {

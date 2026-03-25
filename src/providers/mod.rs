@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod openai;
+pub mod registry;
 mod retry;
 
 use anyhow::Result;

@@ -38,18 +38,36 @@ pub struct Link {
     pub direction: Option<String>,
 }
 
+/// Object-safe trait for memory storage backends.
+///
+/// All methods are synchronous — callers are responsible for wrapping in
+/// `tokio::task::spawn_blocking` when used in async contexts. Requires
+/// `Send + Sync` so implementations can be shared via `Arc<dyn Memory>`.
+pub trait Memory: Send + Sync {
+    fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note>;
+    fn read_note(&self, id: &str) -> MemoryResult<Note>;
+    fn update_note(&self, id: &str, content: &str) -> MemoryResult<Note>;
+    fn forget_note(&self, id: &str) -> MemoryResult<()>;
+    fn search_notes(&self, query: &str, limit: usize) -> MemoryResult<Vec<Note>>;
+    fn list_notes(&self, tag_filter: Option<&str>) -> MemoryResult<Vec<Note>>;
+    fn link_notes(&self, from_id: &str, to_id: &str, relation: &str) -> MemoryResult<Link>;
+    fn get_links_for_note(&self, id: &str) -> MemoryResult<Vec<Link>>;
+    fn tag_note(&self, id: &str, tags: &[String]) -> MemoryResult<Note>;
+    fn load_core_persona(&self) -> MemoryResult<String>;
+}
+
 /// SQLite-backed memory store for notes, tags, and links.
 ///
 /// Receives an `Arc<Mutex<Connection>>` — it does not create or manage
 /// the connection. All operations are synchronous (caller is responsible
 /// for wrapping in `spawn_blocking`).
 #[derive(Clone)]
-pub struct MemoryStore {
+pub struct SqliteMemory {
     conn: Arc<Mutex<Connection>>,
     core_md_path: std::path::PathBuf,
 }
 
-impl MemoryStore {
+impl SqliteMemory {
     pub fn new(
         conn: Arc<Mutex<Connection>>,
         core_md_path: std::path::PathBuf,
@@ -130,7 +148,75 @@ impl MemoryStore {
         )
     }
 
-    pub fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
+    fn read_core(&self) -> MemoryResult<Note> {
+        let content = std::fs::read_to_string(&self.core_md_path)?;
+        let now = Self::now_iso();
+        Ok(Note {
+            id: "core".to_string(),
+            title: "Core Persona".to_string(),
+            content,
+            tags: vec!["persona".to_string()],
+            links: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    fn update_core(&self, content: &str) -> MemoryResult<Note> {
+        std::fs::write(&self.core_md_path, content)?;
+        self.read_core()
+    }
+
+    fn get_tags_for_note_locked(
+        &self,
+        conn: &Connection,
+        note_id: &str,
+    ) -> MemoryResult<Vec<String>> {
+        let mut stmt = conn.prepare("SELECT tag FROM tags WHERE note_id = ?1 ORDER BY tag")?;
+        let tags = stmt
+            .query_map(params![note_id], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(tags)
+    }
+
+    fn get_links_for_note_locked(
+        &self,
+        conn: &Connection,
+        note_id: &str,
+    ) -> MemoryResult<Vec<Link>> {
+        let mut stmt = conn.prepare(
+            "SELECT from_id, to_id, relation, 'outgoing' AS direction FROM links WHERE from_id = ?1
+             UNION ALL
+             SELECT from_id, to_id, relation, 'incoming' AS direction FROM links WHERE to_id = ?1",
+        )?;
+        let links = stmt
+            .query_map(params![note_id], |row| {
+                Ok(Link {
+                    from_id: row.get(0)?,
+                    to_id: row.get(1)?,
+                    relation: row.get(2)?,
+                    direction: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(links)
+    }
+
+    fn assert_note_exists_locked(&self, conn: &Connection, id: &str) -> MemoryResult<()> {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM notes WHERE id = ?1 AND deleted_at IS NULL)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(MemoryError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+}
+
+impl Memory for SqliteMemory {
+    fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
         let id = self.generate_id()?;
         let now = Self::now_iso();
         let conn = self.conn.lock().expect("mutex poisoned");
@@ -158,7 +244,7 @@ impl MemoryStore {
         })
     }
 
-    pub fn read_note(&self, id: &str) -> MemoryResult<Note> {
+    fn read_note(&self, id: &str) -> MemoryResult<Note> {
         if id == "core" {
             return self.read_core();
         }
@@ -187,24 +273,14 @@ impl MemoryStore {
 
         let tags = self.get_tags_for_note_locked(&conn, &note.id)?;
         let links = self.get_links_for_note_locked(&conn, &note.id)?;
-        Ok(Note { tags, links, ..note })
-    }
-
-    fn read_core(&self) -> MemoryResult<Note> {
-        let content = std::fs::read_to_string(&self.core_md_path)?;
-        let now = Self::now_iso();
         Ok(Note {
-            id: "core".to_string(),
-            title: "Core Persona".to_string(),
-            content,
-            tags: vec!["persona".to_string()],
-            links: Vec::new(),
-            created_at: now.clone(),
-            updated_at: now,
+            tags,
+            links,
+            ..note
         })
     }
 
-    pub fn update_note(&self, id: &str, content: &str) -> MemoryResult<Note> {
+    fn update_note(&self, id: &str, content: &str) -> MemoryResult<Note> {
         if id == "core" {
             return self.update_core(content);
         }
@@ -225,12 +301,7 @@ impl MemoryStore {
         self.read_note(id)
     }
 
-    fn update_core(&self, content: &str) -> MemoryResult<Note> {
-        std::fs::write(&self.core_md_path, content)?;
-        self.read_core()
-    }
-
-    pub fn forget_note(&self, id: &str) -> MemoryResult<()> {
+    fn forget_note(&self, id: &str) -> MemoryResult<()> {
         if id == "core" {
             return Err(MemoryError::ReservedId);
         }
@@ -250,7 +321,7 @@ impl MemoryStore {
         Ok(())
     }
 
-    pub fn search_notes(&self, query: &str, limit: usize) -> MemoryResult<Vec<Note>> {
+    fn search_notes(&self, query: &str, limit: usize) -> MemoryResult<Vec<Note>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         let pattern = format!("%{}%", query);
 
@@ -288,7 +359,7 @@ impl MemoryStore {
         Ok(result)
     }
 
-    pub fn list_notes(&self, tag_filter: Option<&str>) -> MemoryResult<Vec<Note>> {
+    fn list_notes(&self, tag_filter: Option<&str>) -> MemoryResult<Vec<Note>> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
         let notes = if let Some(tag) = tag_filter {
@@ -341,7 +412,7 @@ impl MemoryStore {
         Ok(result)
     }
 
-    pub fn link_notes(&self, from_id: &str, to_id: &str, relation: &str) -> MemoryResult<Link> {
+    fn link_notes(&self, from_id: &str, to_id: &str, relation: &str) -> MemoryResult<Link> {
         if from_id == "core" || to_id == "core" {
             return Err(MemoryError::ReservedId);
         }
@@ -366,7 +437,27 @@ impl MemoryStore {
         })
     }
 
-    pub fn tag_note(&self, id: &str, tags: &[String]) -> MemoryResult<Note> {
+    fn get_links_for_note(&self, id: &str) -> MemoryResult<Vec<Link>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT from_id, to_id, relation, 'outgoing' AS direction FROM links WHERE from_id = ?1
+             UNION ALL
+             SELECT from_id, to_id, relation, 'incoming' AS direction FROM links WHERE to_id = ?1",
+        )?;
+        let links = stmt
+            .query_map(params![id], |row| {
+                Ok(Link {
+                    from_id: row.get(0)?,
+                    to_id: row.get(1)?,
+                    relation: row.get(2)?,
+                    direction: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(links)
+    }
+
+    fn tag_note(&self, id: &str, tags: &[String]) -> MemoryResult<Note> {
         if id == "core" {
             return Err(MemoryError::ReservedId);
         }
@@ -393,75 +484,8 @@ impl MemoryStore {
         self.read_note(id)
     }
 
-    pub fn get_links_for_note(&self, id: &str) -> MemoryResult<Vec<Link>> {
-        let conn = self.conn.lock().expect("mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT from_id, to_id, relation, 'outgoing' AS direction FROM links WHERE from_id = ?1
-             UNION ALL
-             SELECT from_id, to_id, relation, 'incoming' AS direction FROM links WHERE to_id = ?1",
-        )?;
-        let links = stmt
-            .query_map(params![id], |row| {
-                Ok(Link {
-                    from_id: row.get(0)?,
-                    to_id: row.get(1)?,
-                    relation: row.get(2)?,
-                    direction: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(links)
-    }
-
-    pub fn load_core_persona(&self) -> MemoryResult<String> {
+    fn load_core_persona(&self) -> MemoryResult<String> {
         std::fs::read_to_string(&self.core_md_path).map_err(MemoryError::Io)
-    }
-
-    fn get_tags_for_note_locked(
-        &self,
-        conn: &Connection,
-        note_id: &str,
-    ) -> MemoryResult<Vec<String>> {
-        let mut stmt = conn.prepare("SELECT tag FROM tags WHERE note_id = ?1 ORDER BY tag")?;
-        let tags = stmt
-            .query_map(params![note_id], |row| row.get(0))?
-            .collect::<Result<Vec<String>, _>>()?;
-        Ok(tags)
-    }
-
-    fn get_links_for_note_locked(
-        &self,
-        conn: &Connection,
-        note_id: &str,
-    ) -> MemoryResult<Vec<Link>> {
-        let mut stmt = conn.prepare(
-            "SELECT from_id, to_id, relation, 'outgoing' AS direction FROM links WHERE from_id = ?1
-             UNION ALL
-             SELECT from_id, to_id, relation, 'incoming' AS direction FROM links WHERE to_id = ?1",
-        )?;
-        let links = stmt
-            .query_map(params![note_id], |row| {
-                Ok(Link {
-                    from_id: row.get(0)?,
-                    to_id: row.get(1)?,
-                    relation: row.get(2)?,
-                    direction: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(links)
-    }
-
-    fn assert_note_exists_locked(&self, conn: &Connection, id: &str) -> MemoryResult<()> {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM notes WHERE id = ?1 AND deleted_at IS NULL)",
-            params![id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(MemoryError::NotFound(id.to_string()));
-        }
-        Ok(())
     }
 }
 
@@ -485,12 +509,12 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 mod tests {
     use super::*;
 
-    fn test_store() -> MemoryStore {
+    fn test_store() -> SqliteMemory {
         let conn = Connection::open_in_memory().unwrap();
         let conn = Arc::new(Mutex::new(conn));
         let tmp = std::env::temp_dir().join("test_core.md");
         std::fs::write(&tmp, "# Test Core\nI am a test persona.").unwrap();
-        MemoryStore::new(conn, tmp).unwrap()
+        SqliteMemory::new(conn, tmp).unwrap()
     }
 
     #[test]

@@ -15,7 +15,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::history::{schema as history_schema, store::HistoryStore};
-use crate::memory::MemoryStore;
+use crate::memory::{Memory, SqliteMemory};
 use crate::types::{ChatMessage, ConversationId, ConversationMode, ToolCall};
 
 // ---------------------------------------------------------------------------
@@ -169,7 +169,7 @@ pub fn run_migration(
         .with_context(|| format!("failed to open database at {}", db_path.display()))?;
     let conn = Arc::new(Mutex::new(conn));
 
-    let memory_store = MemoryStore::new(Arc::clone(&conn), core_md_path.to_path_buf())
+    let memory_store = SqliteMemory::new(Arc::clone(&conn), core_md_path.to_path_buf())
         .context("failed to initialize memory store")?;
 
     // Initialize history schema (creates tables if needed).
@@ -228,7 +228,7 @@ pub fn run_migration(
 // ---------------------------------------------------------------------------
 
 fn import_core_memory(
-    store: &MemoryStore,
+    store: &SqliteMemory,
     memory: &LettaMemory,
     stats: &mut MigrationStats,
 ) -> Result<()> {
@@ -267,7 +267,7 @@ fn import_core_memory(
 // ---------------------------------------------------------------------------
 
 fn import_archival_memory(
-    store: &MemoryStore,
+    store: &SqliteMemory,
     passages: &[LettaPassage],
     stats: &mut MigrationStats,
 ) -> Result<()> {
@@ -538,7 +538,7 @@ mod tests {
         // Human block should be a note row
         let conn = Connection::open(&db_path).unwrap();
         let conn = Arc::new(Mutex::new(conn));
-        let store = MemoryStore::new(conn, core_md).unwrap();
+        let store = SqliteMemory::new(conn, core_md).unwrap();
         let notes = store.list_notes(Some("human")).unwrap();
         assert_eq!(notes.len(), 1);
         assert!(notes[0].content.contains("Tyto"));
@@ -610,7 +610,7 @@ mod tests {
         // Verify notes exist
         let conn = Connection::open(&db_path).unwrap();
         let conn = Arc::new(Mutex::new(conn));
-        let store = MemoryStore::new(conn, core_md).unwrap();
+        let store = SqliteMemory::new(conn, core_md).unwrap();
         let notes = store.list_notes(Some("letta-archival")).unwrap();
         assert_eq!(notes.len(), 2);
 

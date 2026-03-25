@@ -1,3 +1,3 @@
 mod store;
 
-pub use store::{Link, MemoryError, MemoryResult, MemoryStore, Note};
+pub use store::{Link, Memory, MemoryError, MemoryResult, Note, SqliteMemory};

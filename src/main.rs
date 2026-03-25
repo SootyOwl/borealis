@@ -66,15 +66,16 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     // Create the memory store.
-    let memory_store = borealis::memory::MemoryStore::new(
-        Arc::clone(&db_conn),
-        settings.bot.core_persona_path.clone(),
-    )?;
+    let memory_store: Arc<dyn borealis::memory::Memory> =
+        Arc::new(borealis::memory::SqliteMemory::new(
+            Arc::clone(&db_conn),
+            settings.bot.core_persona_path.clone(),
+        )?);
     info!("memory store initialized");
 
     // Create the tool registry with memory tools.
     let mut tool_registry = borealis::tools::ToolRegistry::new();
-    borealis::tools::register_memory_tools(&mut tool_registry, memory_store.clone());
+    borealis::tools::register_memory_tools(&mut tool_registry, Arc::clone(&memory_store));
     let tool_registry = Arc::new(tool_registry);
     info!(
         tool_count = tool_registry.tool_count(),
@@ -241,7 +242,7 @@ fn build_pipeline(
     settings: &borealis::config::Settings,
     history_store: Arc<borealis::history::store::HistoryStore>,
     tool_registry: Arc<borealis::tools::ToolRegistry>,
-    memory_store: borealis::memory::MemoryStore,
+    memory_store: Arc<dyn borealis::memory::Memory>,
 ) -> anyhow::Result<Arc<dyn PipelineRunner>> {
     let sys_path = &settings.bot.system_prompt_path;
     let persona_path = &settings.bot.core_persona_path;

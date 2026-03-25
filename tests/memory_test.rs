@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use borealis::memory::MemoryStore;
+use borealis::memory::{Memory, SqliteMemory};
 use borealis::tools::{ToolCall, ToolContext, ToolRegistry, register_memory_tools};
 use rusqlite::Connection;
 
@@ -12,15 +12,15 @@ fn test_ctx() -> ToolContext {
     }
 }
 
-fn setup() -> (MemoryStore, ToolRegistry) {
+fn setup() -> (Arc<dyn Memory>, ToolRegistry) {
     let conn = Connection::open_in_memory().unwrap();
     let conn = Arc::new(Mutex::new(conn));
     let tmp = std::env::temp_dir().join(format!("borealis_test_core_{}.md", std::process::id()));
     std::fs::write(&tmp, "# Aurora\nI am Aurora, a test persona.").unwrap();
 
-    let store = MemoryStore::new(conn, tmp).unwrap();
+    let store: Arc<dyn Memory> = Arc::new(SqliteMemory::new(conn, tmp).unwrap());
     let mut registry = ToolRegistry::new();
-    register_memory_tools(&mut registry, store.clone());
+    register_memory_tools(&mut registry, Arc::clone(&store));
     (store, registry)
 }
 

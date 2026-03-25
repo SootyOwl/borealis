@@ -1,16 +1,18 @@
-use crate::memory::MemoryStore;
+use std::sync::Arc;
+
+use crate::memory::Memory;
 use crate::tools::{ToolContext, ToolDef, ToolHandler, ToolRegistry, ToolResult};
 
-/// Register all 8 memory tools into the given registry.
-pub fn register_memory_tools(registry: &mut ToolRegistry, store: MemoryStore) {
-    registry.register(MemoryCreate(store.clone()));
-    registry.register(MemorySearch(store.clone()));
-    registry.register(MemoryRead(store.clone()));
-    registry.register(MemoryUpdate(store.clone()));
-    registry.register(MemoryLink(store.clone()));
-    registry.register(MemoryTag(store.clone()));
-    registry.register(MemoryForget(store.clone()));
-    registry.register(MemoryLinks(store.clone()));
+/// Register all 9 memory tools into the given registry.
+pub fn register_memory_tools(registry: &mut ToolRegistry, store: Arc<dyn Memory>) {
+    registry.register(MemoryCreate(Arc::clone(&store)));
+    registry.register(MemorySearch(Arc::clone(&store)));
+    registry.register(MemoryRead(Arc::clone(&store)));
+    registry.register(MemoryUpdate(Arc::clone(&store)));
+    registry.register(MemoryLink(Arc::clone(&store)));
+    registry.register(MemoryTag(Arc::clone(&store)));
+    registry.register(MemoryForget(Arc::clone(&store)));
+    registry.register(MemoryLinks(Arc::clone(&store)));
     registry.register(MemoryList(store));
 }
 
@@ -47,7 +49,7 @@ fn get_string_array(args: &serde_json::Value, field: &str) -> Vec<String> {
 
 // --- memory_create ---
 
-struct MemoryCreate(MemoryStore);
+struct MemoryCreate(Arc<dyn Memory>);
 
 impl ToolHandler for MemoryCreate {
     fn name(&self) -> &str {
@@ -108,7 +110,7 @@ impl ToolHandler for MemoryCreate {
 
 // --- memory_search ---
 
-struct MemorySearch(MemoryStore);
+struct MemorySearch(Arc<dyn Memory>);
 
 impl ToolHandler for MemorySearch {
     fn name(&self) -> &str {
@@ -155,7 +157,7 @@ impl ToolHandler for MemorySearch {
 
 // --- memory_read ---
 
-struct MemoryRead(MemoryStore);
+struct MemoryRead(Arc<dyn Memory>);
 
 impl ToolHandler for MemoryRead {
     fn name(&self) -> &str {
@@ -198,7 +200,7 @@ impl ToolHandler for MemoryRead {
 
 // --- memory_update ---
 
-struct MemoryUpdate(MemoryStore);
+struct MemoryUpdate(Arc<dyn Memory>);
 
 impl ToolHandler for MemoryUpdate {
     fn name(&self) -> &str {
@@ -250,7 +252,7 @@ impl ToolHandler for MemoryUpdate {
 
 // --- memory_link ---
 
-struct MemoryLink(MemoryStore);
+struct MemoryLink(Arc<dyn Memory>);
 
 impl ToolHandler for MemoryLink {
     fn name(&self) -> &str {
@@ -308,7 +310,7 @@ impl ToolHandler for MemoryLink {
 
 // --- memory_tag ---
 
-struct MemoryTag(MemoryStore);
+struct MemoryTag(Arc<dyn Memory>);
 
 impl ToolHandler for MemoryTag {
     fn name(&self) -> &str {
@@ -359,7 +361,7 @@ impl ToolHandler for MemoryTag {
 
 // --- memory_forget ---
 
-struct MemoryForget(MemoryStore);
+struct MemoryForget(Arc<dyn Memory>);
 
 impl ToolHandler for MemoryForget {
     fn name(&self) -> &str {
@@ -406,7 +408,7 @@ impl ToolHandler for MemoryForget {
 
 // --- memory_links ---
 
-struct MemoryLinks(MemoryStore);
+struct MemoryLinks(Arc<dyn Memory>);
 
 impl ToolHandler for MemoryLinks {
     fn name(&self) -> &str {
@@ -448,7 +450,7 @@ impl ToolHandler for MemoryLinks {
 
 // --- memory_list ---
 
-struct MemoryList(MemoryStore);
+struct MemoryList(Arc<dyn Memory>);
 
 impl ToolHandler for MemoryList {
     fn name(&self) -> &str {

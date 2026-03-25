@@ -12,7 +12,7 @@ use crate::core::event::{InEvent, OutEvent};
 use crate::history::budget::{ContextBudget, Turn};
 use crate::history::compaction::{CompactionService, CompactionState};
 use crate::history::store::HistoryStore;
-use crate::memory::MemoryStore;
+use crate::memory::Memory;
 use crate::providers::{Provider, RequestConfig, ToolDef as ProviderToolDef};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{self, estimate_tokens};
@@ -58,7 +58,7 @@ pub struct Pipeline<P: Provider + 'static> {
     core_persona: String,
     history_store: Arc<HistoryStore>,
     tool_registry: Arc<ToolRegistry>,
-    memory_store: MemoryStore,
+    memory_store: Arc<dyn Memory>,
     compaction_service: CompactionService<P>,
     pipeline_config: PipelineConfig,
 }
@@ -72,7 +72,7 @@ impl<P: Provider + 'static> Pipeline<P> {
         core_persona_path: &Path,
         history_store: Arc<HistoryStore>,
         tool_registry: Arc<ToolRegistry>,
-        memory_store: MemoryStore,
+        memory_store: Arc<dyn Memory>,
         compaction_config: CompactionConfig,
         compaction_state: Arc<CompactionState>,
         pipeline_config: PipelineConfig,
@@ -396,7 +396,7 @@ impl<P: Provider + 'static> Pipeline<P> {
         match self.memory_store.search_notes(query, 5) {
             Ok(notes) => notes
                 .into_iter()
-                .map(|n| format!("**{}**: {}", n.title, n.content))
+                .map(|n: crate::memory::Note| format!("**{}**: {}", n.title, n.content))
                 .collect(),
             Err(e) => {
                 warn!(error = %e, "memory retrieval failed, continuing without memories");

@@ -139,88 +139,20 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Wire up the CLI adapter if enabled.
-    let cli_enabled = settings.channels.cli.as_ref().is_some_and(|c| c.enabled);
+    // Register channel adapters via the channel registry.
+    let mut channels = borealis::channels::ChannelRegistry::new();
+    borealis::channels::cli::register(&mut channels, &settings, pipeline.clone(), cancel.clone());
+    borealis::channels::discord::register(
+        &mut channels,
+        &settings,
+        pipeline.clone(),
+        cancel.clone(),
+    );
 
-    if cli_enabled {
-        let (in_tx, mut in_rx) = tokio::sync::mpsc::channel(256);
-        let (out_tx, out_rx) = tokio::sync::mpsc::channel(256);
-
-        let cli = Arc::new(borealis::channels::cli::CliAdapter::new(
-            settings.bot.name.clone(),
-        ));
-
-        // Spawn CLI inbound (stdin reader).
-        let cli_in = cli.clone();
-        let cancel_in = cancel.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                result = borealis::channels::Channel::run_inbound(cli_in, in_tx) => {
-                    if let Err(e) = result {
-                        tracing::error!("CLI inbound error: {e}");
-                    }
-                }
-                _ = cancel_in.cancelled() => {
-                    tracing::debug!("CLI inbound cancelled");
-                }
-            }
-        });
-
-        // Spawn CLI outbound (stdout writer).
-        let cli_out = cli.clone();
-        let cancel_out = cancel.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                result = borealis::channels::Channel::run_outbound(cli_out, out_rx) => {
-                    if let Err(e) = result {
-                        tracing::error!("CLI outbound error: {e}");
-                    }
-                }
-                _ = cancel_out.cancelled() => {
-                    tracing::debug!("CLI outbound cancelled");
-                }
-            }
-        });
-
-        // Spawn the message processing loop.
-        let pipeline_clone = pipeline.clone();
-        let cancel_loop = cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(event) = in_rx.recv() => {
-                        match pipeline_clone.process(&event).await {
-                            Ok(out_event) => {
-                                if out_tx.send(out_event).await.is_err() {
-                                    tracing::debug!("outbound channel closed");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("pipeline error: {e}");
-                                // Send an error message back to the user.
-                                let err_event = borealis::core::event::OutEvent {
-                                    target: event.source.clone(),
-                                    channel_id: event.context.channel_id.clone(),
-                                    text: Some("I'm having trouble thinking right now, try again in a moment.".into()),
-                                    directives: vec![],
-                                    reply_to: Some(event.message.id.clone()),
-                                };
-                                let _ = out_tx.send(err_event).await;
-                            }
-                        }
-                    }
-                    _ = cancel_loop.cancelled() => {
-                        tracing::debug!("processing loop cancelled");
-                        break;
-                    }
-                }
-            }
-        });
-
+    if channels.channel_count() > 0 {
         info!(
-            "CLI adapter running — type a message to chat with {}",
-            settings.bot.name
+            channels = ?channels.channel_names(),
+            "channel registry ready"
         );
     } else {
         info!("no channel adapters enabled — waiting for shutdown signal");
@@ -230,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
     cancel.cancelled().await;
 
     // Run the graceful shutdown sequence with 5s timeout.
-    let drain = async {};
+    let drain = channels.await_shutdown();
     borealis::shutdown::run_shutdown(drain, Some(db_conn)).await;
 
     // Force exit — the tokio stdin reader holds the process alive because

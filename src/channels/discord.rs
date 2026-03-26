@@ -1,18 +1,58 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use poise::serenity_prelude as serenity;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::channels::Channel;
-use crate::channels::modes::ModeRouter;
-use crate::config::DiscordChannelConfig;
+use crate::channels::modes::{AlwaysMode, DigestMode, MentionOnlyMode, ModeRouter, ResponseMode};
+use crate::channels::{Channel, ChannelRegistry};
+use crate::config::{DiscordChannelConfig, Settings};
 use crate::core::event::{
     Author, ChannelSource, ConversationId, Directive, DirectiveKind, InEvent, Message,
     MessageContext, MessageId, OutEvent,
 };
+use crate::core::pipeline::PipelineRunner;
+
+/// Register the Discord adapter with the channel registry if enabled in config.
+pub fn register(
+    registry: &mut ChannelRegistry,
+    settings: &Settings,
+    pipeline: Arc<dyn PipelineRunner>,
+    cancel: CancellationToken,
+) {
+    let config = match &settings.channels.discord {
+        Some(c) if c.enabled => c.clone(),
+        _ => return,
+    };
+
+    // Build mode router from config groups.
+    let mut modes: HashMap<String, Arc<dyn ResponseMode>> = HashMap::new();
+    for group in &config.groups {
+        let mode: Arc<dyn ResponseMode> = match group.response_mode.as_str() {
+            "mention-only" => Arc::new(MentionOnlyMode),
+            "digest" => {
+                let interval = Duration::from_secs(group.digest_interval_min.unwrap_or(5) * 60);
+                let debounce = Duration::from_secs(group.digest_debounce_min.unwrap_or(2) * 60);
+                Arc::new(DigestMode::new(interval, debounce))
+            }
+            _ => Arc::new(AlwaysMode),
+        };
+        modes.insert(group.guild_id.clone(), mode);
+    }
+    let mode_router = Arc::new(ModeRouter::new(modes, Arc::new(AlwaysMode)));
+
+    let discord = Arc::new(DiscordAdapter::new(
+        config,
+        mode_router,
+        settings.bot.name.clone(),
+    ));
+    registry.register(discord, pipeline, cancel);
+}
 
 /// Shared state available inside poise's event handler.
 struct BotData {

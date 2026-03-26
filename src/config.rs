@@ -170,7 +170,7 @@ pub struct CliChannelConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DiscordChannelConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -180,7 +180,7 @@ pub struct DiscordChannelConfig {
     pub groups: Vec<DiscordGroupConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DiscordGroupConfig {
     pub guild_id: String,
     #[serde(default = "default_response_mode")]

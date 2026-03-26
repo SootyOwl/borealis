@@ -11,9 +11,6 @@ pub enum SandboxError {
     #[error("path traversal blocked: {path} escapes sandbox root {root}")]
     PathTraversal { path: String, root: String },
 
-    #[error("access denied: {path} is inside the protected memory directory")]
-    MemoryDirAccess { path: String },
-
     #[error("path resolution failed for {path}: {reason}")]
     ResolutionFailed { path: String, reason: String },
 }
@@ -24,21 +21,17 @@ pub enum SandboxError {
 
 /// Validates file paths against a sandbox root directory.
 ///
-/// Rejects paths that escape the sandbox via traversal (e.g. `../../etc/passwd`)
-/// and paths that access the protected `memory/` directory (memory access is
-/// gated behind the `memory_*` tool handlers).
+/// Rejects paths that escape the sandbox via traversal (e.g. `../../etc/passwd`).
+/// Memory access is handled separately by the `memory_*` tools and their
+/// authorization — the sandbox doesn't need to know about memory paths.
 pub struct Sandbox {
     root: PathBuf,
-    memory_dir: PathBuf,
 }
 
 impl Sandbox {
     /// Create a new sandbox rooted at the given directory.
-    ///
-    /// The `memory_subdir` is relative to `root` (e.g. `"memory"`).
-    pub fn new(root: PathBuf, memory_subdir: &str) -> Self {
-        let memory_dir = root.join(memory_subdir);
-        Self { root, memory_dir }
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
     }
 
     /// Validate that `path` (relative to the sandbox root) stays within bounds.
@@ -81,14 +74,6 @@ impl Sandbox {
             });
         }
 
-        // Check: must not be inside the memory directory
-        let canonical_memory = self.memory_dir.canonicalize().unwrap_or_default();
-        if !canonical_memory.as_os_str().is_empty() && canonical.starts_with(&canonical_memory) {
-            return Err(SandboxError::MemoryDirAccess {
-                path: path.display().to_string(),
-            });
-        }
-
         Ok(canonical)
     }
 
@@ -109,14 +94,10 @@ mod tests {
 
     fn setup_sandbox() -> (tempfile::TempDir, Sandbox) {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
-        // Create memory subdirectory
-        fs::create_dir_all(tmp.path().join("memory")).expect("mkdir memory");
         // Create a file inside the sandbox
         fs::write(tmp.path().join("allowed.txt"), "ok").expect("write allowed.txt");
-        // Create a file inside memory/
-        fs::write(tmp.path().join("memory/core.md"), "persona").expect("write core.md");
 
-        let sandbox = Sandbox::new(tmp.path().to_path_buf(), "memory");
+        let sandbox = Sandbox::new(tmp.path().to_path_buf());
         (tmp, sandbox)
     }
 
@@ -132,13 +113,6 @@ mod tests {
         let (_tmp, sandbox) = setup_sandbox();
         let result = sandbox.validate_path(Path::new("../../etc/passwd"));
         assert!(matches!(result, Err(SandboxError::PathTraversal { .. })));
-    }
-
-    #[test]
-    fn rejects_memory_directory_access() {
-        let (_tmp, sandbox) = setup_sandbox();
-        let result = sandbox.validate_path(Path::new("memory/core.md"));
-        assert!(matches!(result, Err(SandboxError::MemoryDirAccess { .. })));
     }
 
     #[test]

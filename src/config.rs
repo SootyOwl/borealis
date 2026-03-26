@@ -335,8 +335,6 @@ pub struct ComputerUseConfig {
     pub enabled: bool,
     #[serde(default = "default_sandbox_root")]
     pub sandbox_root: PathBuf,
-    #[serde(default = "default_memory_dir")]
-    pub memory_dir: String,
     /// Empty list means all commands are allowed.
     #[serde(default)]
     pub command_allowlist: Vec<String>,
@@ -349,7 +347,6 @@ impl Default for ComputerUseConfig {
         Self {
             enabled: true,
             sandbox_root: default_sandbox_root(),
-            memory_dir: default_memory_dir(),
             command_allowlist: Vec::new(),
             command_timeout_secs: default_command_timeout_secs(),
         }
@@ -358,10 +355,6 @@ impl Default for ComputerUseConfig {
 
 fn default_sandbox_root() -> PathBuf {
     PathBuf::from(".")
-}
-
-fn default_memory_dir() -> String {
-    "memory".into()
 }
 
 fn default_command_timeout_secs() -> u64 {

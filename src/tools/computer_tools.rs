@@ -315,19 +315,6 @@ impl Tool for FileWrite {
             );
         }
 
-        // Check memory directory exclusion
-        let memory_dir = self.sandbox.root().join("memory");
-        if let Ok(canonical_memory) = memory_dir.canonicalize() {
-            let file_in_parent = canonical_parent.join(target.file_name().unwrap_or_default());
-            if file_in_parent.starts_with(&canonical_memory)
-                || canonical_parent.starts_with(&canonical_memory)
-            {
-                return error_result(
-                    call_id,
-                    "access denied: the memory/ directory is protected. Use memory_* tools instead.",
-                );
-            }
-        }
 
         match tokio::fs::write(&target, content).await {
             Ok(()) => ok_result(
@@ -499,7 +486,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("subdir")).expect("mkdir subdir");
         fs::write(tmp.path().join("subdir/nested.txt"), "nested").expect("write nested");
 
-        let sandbox = Arc::new(Sandbox::new(tmp.path().to_path_buf(), "memory"));
+        let sandbox = Arc::new(Sandbox::new(tmp.path().to_path_buf()));
         (tmp, sandbox)
     }
 
@@ -605,18 +592,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_read_rejects_memory_dir() {
-        let (_tmp, sandbox) = setup_sandbox();
-        let tool = FileRead { sandbox };
-
-        let result = tool
-            .execute(serde_json::json!({"path": "memory/core.md"}), &test_ctx())
-            .await;
-        assert!(result.is_error);
-        assert!(result.content["error"].as_str().unwrap().contains("memory"));
-    }
-
-    #[tokio::test]
     async fn file_read_rejects_traversal() {
         let (_tmp, sandbox) = setup_sandbox();
         let tool = FileRead { sandbox };
@@ -662,21 +637,6 @@ mod tests {
 
         let content = fs::read_to_string(tmp.path().join("deep/nested/file.txt")).unwrap();
         assert_eq!(content, "deep");
-    }
-
-    #[tokio::test]
-    async fn file_write_rejects_memory_dir() {
-        let (_tmp, sandbox) = setup_sandbox();
-        let tool = FileWrite { sandbox };
-
-        let result = tool
-            .execute(
-                serde_json::json!({"path": "memory/secret.md", "content": "evil"}),
-                &test_ctx(),
-            )
-            .await;
-        assert!(result.is_error);
-        assert!(result.content["error"].as_str().unwrap().contains("memory"));
     }
 
     #[tokio::test]
@@ -728,25 +688,12 @@ mod tests {
         assert!(names.contains(&"nested.txt"));
     }
 
-    #[tokio::test]
-    async fn file_list_rejects_memory_dir() {
-        let (_tmp, sandbox) = setup_sandbox();
-        let tool = FileList { sandbox };
-
-        let result = tool
-            .execute(serde_json::json!({"path": "memory"}), &test_ctx())
-            .await;
-        assert!(result.is_error);
-        assert!(result.content["error"].as_str().unwrap().contains("memory"));
-    }
-
     // -- registration test --
 
     #[test]
     fn register_computer_tools_adds_four() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(tmp.path().join("memory")).expect("mkdir");
-        let sandbox = Arc::new(Sandbox::new(tmp.path().to_path_buf(), "memory"));
+        let sandbox = Arc::new(Sandbox::new(tmp.path().to_path_buf()));
         let config = ComputerUseConfig::default();
         let mut registry = ToolRegistry::new();
 

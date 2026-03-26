@@ -30,18 +30,15 @@ impl Security {
     ///
     /// - `rate_limit_config`: token bucket settings for per-user and global limits.
     /// - `sandbox_root`: root directory for file operations.
-    /// - `memory_subdir`: subdirectory within `sandbox_root` that is off-limits
-    ///   (defaults to `"memory"` in the design doc).
     /// - `authorized_users`: users permitted to call restricted tools.
     pub fn new(
         rate_limit_config: &RateLimitConfig,
         sandbox_root: PathBuf,
-        memory_subdir: &str,
         authorized_users: impl IntoIterator<Item = String>,
     ) -> Self {
         Self {
             rate_limiter: RateLimiter::new(rate_limit_config),
-            sandbox: Sandbox::new(sandbox_root, memory_subdir),
+            sandbox: Sandbox::new(sandbox_root),
             authorization: Authorization::new(authorized_users),
         }
     }
@@ -78,7 +75,6 @@ mod tests {
 
     fn setup_security() -> (tempfile::TempDir, Security) {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
-        fs::create_dir_all(tmp.path().join("memory")).expect("mkdir memory");
         fs::write(tmp.path().join("test.txt"), "ok").expect("write test.txt");
 
         let config = RateLimitConfig {
@@ -97,7 +93,6 @@ mod tests {
         let mut security = Security::new(
             &config,
             tmp.path().to_path_buf(),
-            "memory",
             ["admin".to_string()],
         );
         security.register_restricted("bash_exec");

@@ -703,7 +703,7 @@ mod tests {
         let config = crate::config::RateLimitConfig::default();
         let tmp = std::env::temp_dir().join("borealis_test_pipeline");
         let _ = std::fs::create_dir_all(&tmp);
-        let mut security = Security::new(&config, tmp, "memory", ["admin".to_string()]);
+        let mut security = Security::new(&config, tmp, ["admin".to_string()]);
         security.register_restricted("bash_exec");
         Arc::new(security)
     }

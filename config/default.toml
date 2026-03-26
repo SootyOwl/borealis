@@ -1,38 +1,54 @@
 # Borealis — default configuration
-# Override per-environment via config/{run_mode}.toml or config/local.toml.
-# Any value can be overridden with BOREALIS__SECTION__KEY env vars.
+#
+# Configuration is loaded in layers (later overrides earlier):
+#   1. config/default.toml        (this file — base defaults)
+#   2. config/{run_mode}.toml     (environment-specific, e.g. config/production.toml)
+#   3. config/local.toml          (developer overrides, gitignored)
+#   4. BOREALIS__SECTION__KEY     (environment variables, double underscore = nesting)
+#
+# Example env override:
+#   BOREALIS__PROVIDERS__OPENAI__MODEL=llama3.1
+
+# ---------------------------------------------------------------------------
+# Bot identity and behavior
+# ---------------------------------------------------------------------------
 
 [bot]
-name = "Aurora"
-system_prompt_path = "config/system_prompt.md"
-core_persona_path = "memory/core.md"
+name = "Aurora"                                # Display name for the bot
+system_prompt_path = "config/system_prompt.md" # Path to system prompt (loaded at startup)
+core_persona_path = "memory/core.md"           # Aurora's self-knowledge file (editable by Aurora)
 
 [bot.compaction]
-enabled = true
-threshold = 0.75
-compaction_model = "default"
+enabled = true                                 # Automatically summarize old conversation history
+threshold = 0.75                               # Trigger compaction at 75% of token budget
+compaction_model = "default"                   # "default" = same as conversation model
 summary_prompt_path = "config/compaction_prompt.md"
 
 # ---------------------------------------------------------------------------
 # LLM Providers
 # ---------------------------------------------------------------------------
-# At least one provider should be configured. API keys use env var indirection:
-# api_key_env names the env var that holds the actual secret.
+# At least one provider must be configured. Borealis tries providers in order:
+# Anthropic first, then OpenAI-compatible.
+#
+# API keys use env var indirection: api_key_env names the env var that holds
+# the actual secret (never put secrets in config files).
 
-# Uncomment and configure in config/local.toml:
+# Anthropic — uncomment and configure in config/local.toml:
 #
 # [providers.anthropic]
 # base_url = "https://api.anthropic.com"
 # model = "claude-sonnet-4-20250514"
-# api_key_env = "ANTHROPIC_API_KEY"
+# api_key_env = "ANTHROPIC_API_KEY"            # name of the env var, not the key itself
 # timeout_secs = 60
 # max_retries = 3
 # max_history_tokens = 8192
 
-# Local Ollama — works out of the box, no API key needed.
+# OpenAI-compatible — works with Ollama, OpenAI, OpenRouter, etc.
+# This default config points at a local Ollama instance (no API key needed).
 [providers.openai]
 base_url = "http://localhost:11434/v1"
 model = "llama3"
+# api_key_env = "OPENAI_API_KEY"               # uncomment for OpenAI/OpenRouter
 timeout_secs = 60
 max_retries = 3
 max_history_tokens = 4096
@@ -40,72 +56,101 @@ max_history_tokens = 4096
 # ---------------------------------------------------------------------------
 # Channel adapters
 # ---------------------------------------------------------------------------
+# Channels are how Aurora communicates. Enable one or more.
 
 [channels.cli]
-enabled = true
+enabled = true                                 # stdin/stdout dev adapter
 
-# Discord is disabled by default — enable in config/local.toml or env override.
+# Discord — enable in config/local.toml with your bot token.
+# Response modes: "always" (reply to everything), "mention-only" (only when
+# @mentioned), "digest" (batch messages and summarize periodically).
+#
 # [channels.discord]
 # enabled = true
-# token_env = "DISCORD_BOT_TOKEN"
+# token_env = "DISCORD_BOT_TOKEN"              # env var holding the bot token
+#
 # [[channels.discord.groups]]
 # guild_id = "123456789"
-# response_mode = "mention-only"
+# response_mode = "mention-only"               # "always", "mention-only", or "digest"
+# digest_interval_min = 30                     # digest mode: max interval between summaries
+# digest_debounce_min = 5                      # digest mode: quiet period before triggering
 
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 
 [database]
-path = "memory/borealis.db"
+path = "memory/borealis.db"                    # SQLite database (WAL mode, auto-created)
 
 # ---------------------------------------------------------------------------
 # Event bus
 # ---------------------------------------------------------------------------
 
 [event_bus]
-channel_capacity = 256
-max_concurrency = 4
-idle_timeout_secs = 1800
+channel_capacity = 256                         # bounded mpsc channel size
+max_concurrency = 4                            # max simultaneous LLM calls (semaphore permits)
+idle_timeout_secs = 1800                       # evict idle per-conversation workers after 30min
 
 # ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------
+# Token bucket rate limiters. Allowlisted users/guilds bypass both limits.
 
 [rate_limit.per_user]
-capacity = 10
-refill_secs = 6
+capacity = 10                                  # max burst per user
+refill_secs = 6                                # 1 token per 6s = 10 msg/min sustained
 
 [rate_limit.global]
-capacity = 30
-refill_secs = 2
+capacity = 30                                  # max burst across all users
+refill_secs = 2                                # 1 token per 2s = 30 msg/min sustained
 
-# allowed_users = []
-# allowed_guilds = []
+# allowed_users = ["user-id-1"]                # users who bypass rate limits
+# allowed_guilds = ["guild-id-1"]              # guilds where rate limits don't apply
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tools — Computer Use
 # ---------------------------------------------------------------------------
+# Give Aurora access to the filesystem and shell.
+# The sandbox restricts where file tools can read/write.
+# Memory is managed separately via memory_* tools — the sandbox doesn't need
+# to know about the memory directory.
 
 [tools.computer_use]
 enabled = true
-sandbox_root = "."
-memory_dir = "memory"
-command_allowlist = []          # empty = all commands allowed
-command_timeout_secs = 30
+sandbox_root = "."                             # file tools are restricted to this directory
+command_allowlist = []                         # empty = all commands allowed; e.g. ["ls", "cat", "grep"]
+command_timeout_secs = 30                      # kill commands that run longer than this
+# excluded_paths = ["secrets/", ".env"]        # (future) additional paths to block
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tools — Web
 # ---------------------------------------------------------------------------
+# Web fetch and search via Jina AI (https://jina.ai).
+# Free tier: 10M tokens per API key, no credit card required.
+# Without an API key, requests are rate-limited by IP.
 
 [tools.web]
 enabled = true
-# jina_api_key_env = "JINA_API_KEY"   # optional, for higher rate limits
-max_fetch_bytes = 51200
+# jina_api_key_env = "JINA_API_KEY"            # optional — env var holding Jina API key
+max_fetch_bytes = 51200                        # 50 KiB max response size (prevents context blowup)
 
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
+# Scheduled events that fire automatically. Aurora's text output during
+# scheduled events is private (not sent to any channel).
+#
+# Event types:
+#   - "recurring": fires every `interval` (e.g. "30m", "1h", "90s")
+#   - "cron": fires on a cron schedule (e.g. "0 22 * * *" = 10pm daily)
+#
+# Options:
+#   - jitter: random delay added to prevent thundering herd (e.g. "5m")
+#   - active_hours: only fire during this window (e.g. "06:00-23:00")
+#   - tools: which tool groups are available (default: all enabled groups)
+#            valid groups: "memory", "computer", "web"
+#   - channels: which channels Aurora can reach via send_message tool
+#               (default: none — output is private)
 
 [scheduler]
 timezone = "UTC"
@@ -116,7 +161,8 @@ type = "recurring"
 interval = "30m"
 jitter = "5m"
 active_hours = "06:00-23:00"
-tools = ["memory", "computer", "web"]   # optional, omit for all enabled tools
+tools = ["memory", "computer", "web"]
+# channels = ["discord"]                       # uncomment to let Aurora post during heartbeats
 prompt = """
 TRIGGER: Scheduled heartbeat
 TIME: {time} ({timezone})
@@ -136,7 +182,7 @@ name = "daily_reflection"
 type = "cron"
 schedule = "0 22 * * *"
 jitter = "15m"
-tools = ["memory"]                       # reflection only gets memory tools
+tools = ["memory"]
 prompt = """
 TRIGGER: Daily reflection
 TIME: {time}

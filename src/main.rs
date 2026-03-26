@@ -77,7 +77,6 @@ async fn main() -> anyhow::Result<()> {
     let security = Arc::new(borealis::security::Security::new(
         &settings.rate_limit,
         settings.tools.computer_use.sandbox_root.clone(),
-        &settings.tools.computer_use.memory_dir,
         settings.rate_limit.allowed_users.clone(),
     ));
     info!("security module initialized");

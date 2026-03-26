@@ -6,15 +6,32 @@ use tracing::info;
 
 use crate::config::{ProviderEntry, Settings};
 use crate::core::observer::{ObserverRegistry, TracingObserver};
-use crate::core::pipeline::{Pipeline, PipelineDeps, PipelineRunner};
+use crate::core::pipeline::{PipelineDeps, PipelineRunner};
 use crate::history::compaction::CompactionState;
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
 use crate::providers::ProviderConfig;
-use crate::providers::anthropic::AnthropicProvider;
-use crate::providers::openai::OpenAiProvider;
 use crate::security::Security;
 use crate::tools::ToolRegistry;
+
+/// A self-registering provider factory.
+///
+/// Each provider module submits one of these via `inventory::submit!`. The
+/// registry iterates them to construct the correct `PipelineRunner` without
+/// hardcoded match arms.
+pub struct ProviderRegistration {
+    /// Provider name (must match the config key, e.g. "anthropic", "openai").
+    pub name: &'static str,
+    /// Build a `PipelineRunner` from resolved provider config and pipeline deps.
+    pub build_pipeline_fn: fn(
+        config: ProviderConfig,
+        sys_path: &Path,
+        persona_path: &Path,
+        deps: PipelineDeps,
+    ) -> Result<Arc<dyn PipelineRunner>>,
+}
+
+inventory::collect!(ProviderRegistration);
 
 /// A resolved provider entry with configuration ready for construction.
 #[derive(Debug, Clone)]
@@ -92,30 +109,27 @@ pub fn resolve_named_provider(name: &str, settings: &Settings) -> Option<Resolve
 /// Construct a concrete provider and wrap it in a `Pipeline`, returning the
 /// object-safe `PipelineRunner`.
 ///
-/// This is the only place that maps provider names to concrete types. Adding a
-/// new provider means adding a match arm here (plus implementing `Provider` and
-/// adding a config section).
+/// Looks up the provider by name in the inventory of `ProviderRegistration`
+/// entries. Each provider module self-registers via `inventory::submit!`, so
+/// adding a new provider requires no changes here.
 fn build_pipeline_for_provider(
     resolved: &ResolvedProvider,
     sys_path: &Path,
     persona_path: &Path,
     deps: PipelineDeps,
 ) -> Result<Arc<dyn PipelineRunner>> {
-    match resolved.name.as_str() {
-        "anthropic" => {
-            let provider = Arc::new(AnthropicProvider::new(resolved.config.clone())?);
-            info!(model = %resolved.config.model, "using Anthropic provider");
-            let pipeline = Pipeline::new(provider, sys_path, persona_path, deps)?;
-            Ok(Arc::new(pipeline))
+    for reg in inventory::iter::<ProviderRegistration> {
+        if reg.name == resolved.name {
+            info!(provider = reg.name, model = %resolved.config.model, "building provider pipeline");
+            return (reg.build_pipeline_fn)(
+                resolved.config.clone(),
+                sys_path,
+                persona_path,
+                deps,
+            );
         }
-        "openai" => {
-            let provider = Arc::new(OpenAiProvider::new(resolved.config.clone())?);
-            info!(model = %resolved.config.model, "using OpenAI-compatible provider");
-            let pipeline = Pipeline::new(provider, sys_path, persona_path, deps)?;
-            Ok(Arc::new(pipeline))
-        }
-        other => bail!("unknown provider type: {other}"),
     }
+    bail!("unknown provider type: {}", resolved.name);
 }
 
 /// Build a `PipelineRunner` from the first valid configured provider.

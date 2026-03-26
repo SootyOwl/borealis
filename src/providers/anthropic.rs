@@ -1,3 +1,5 @@
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,8 +12,27 @@ use super::{
     ChatMessage, LlmResponse, Provider, ProviderConfig, RequestConfig, Role, TokenUsage, ToolCall,
     ToolDef,
 };
+use crate::core::pipeline::{Pipeline, PipelineDeps, PipelineRunner};
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+
+fn build_pipeline(
+    config: ProviderConfig,
+    sys_path: &Path,
+    persona_path: &Path,
+    deps: PipelineDeps,
+) -> Result<Arc<dyn PipelineRunner>> {
+    let provider = Arc::new(AnthropicProvider::new(config)?);
+    let pipeline = Pipeline::new(provider, sys_path, persona_path, deps)?;
+    Ok(Arc::new(pipeline))
+}
+
+inventory::submit! {
+    crate::providers::registry::ProviderRegistration {
+        name: "anthropic",
+        build_pipeline_fn: build_pipeline,
+    }
+}
 
 /// Anthropic native API provider (Claude models).
 pub struct AnthropicProvider {

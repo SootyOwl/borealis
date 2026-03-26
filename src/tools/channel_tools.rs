@@ -169,6 +169,7 @@ mod tests {
     async fn react_tool_returns_success() {
         let tool = ReactTool;
         let ctx = ToolContext {
+            call_id: "call1".into(),
             author_id: "user1".into(),
             conversation_id: "conv1".into(),
             channel_source: "discord".into(),
@@ -184,6 +185,7 @@ mod tests {
     async fn send_message_tool_returns_success() {
         let tool = SendMessageTool;
         let ctx = ToolContext {
+            call_id: "call1".into(),
             author_id: "user1".into(),
             conversation_id: "conv1".into(),
             channel_source: "discord".into(),

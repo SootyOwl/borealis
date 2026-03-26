@@ -6,6 +6,7 @@ use rusqlite::Connection;
 
 fn test_ctx() -> ToolContext {
     ToolContext {
+        call_id: "test_call".to_string(),
         author_id: "test_user".to_string(),
         conversation_id: "test_conv".to_string(),
         channel_source: "cli".to_string(),

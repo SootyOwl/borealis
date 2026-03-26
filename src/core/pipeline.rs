@@ -313,13 +313,13 @@ impl<P: Provider + 'static> Pipeline<P> {
             provider_messages.push(assistant_msg);
 
             // Execute each tool call and collect results.
-            let tool_ctx = ToolContext {
-                author_id: event.message.author.id.clone(),
-                conversation_id: conv_id.to_string(),
-                channel_source: event.source.to_string(),
-            };
-
             for tc in &response.tool_calls {
+                let tool_ctx = ToolContext {
+                    call_id: tc.id.clone(),
+                    author_id: event.message.author.id.clone(),
+                    conversation_id: conv_id.to_string(),
+                    channel_source: event.source.to_string(),
+                };
                 // Observer: tool call
                 self.observers.notify_tool_call(tc, &tool_ctx);
 

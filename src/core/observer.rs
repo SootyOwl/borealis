@@ -335,6 +335,7 @@ mod tests {
 
         reg.notify_llm_response(&resp, Duration::from_millis(1));
         reg.notify_tool_call(&call, &ToolContext {
+            call_id: "tc1".into(),
             author_id: "u1".into(),
             conversation_id: "c1".into(),
             channel_source: "test".into(),

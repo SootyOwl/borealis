@@ -67,7 +67,7 @@ impl Tool for MemoryCreate {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let title = match get_str(&args, "title") {
             Some(t) => t,
             None => return error_result(call_id, "missing required field: title"),
@@ -122,7 +122,7 @@ impl Tool for MemorySearch {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let query = match get_str(&args, "query") {
             Some(q) => q.to_string(),
             None => return error_result(call_id, "missing required field: query"),
@@ -166,7 +166,7 @@ impl Tool for MemoryRead {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let id = match get_str(&args, "id") {
             Some(i) => i.to_string(),
             None => return error_result(call_id, "missing required field: id"),
@@ -214,7 +214,7 @@ impl Tool for MemoryUpdate {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let id = match get_str(&args, "id") {
             Some(i) => i.to_string(),
             None => return error_result(call_id, "missing required field: id"),
@@ -268,7 +268,7 @@ impl Tool for MemoryLink {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let from = match get_str(&args, "from") {
             Some(f) => f.to_string(),
             None => return error_result(call_id, "missing required field: from"),
@@ -323,7 +323,7 @@ impl Tool for MemoryTag {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let id = match get_str(&args, "id") {
             Some(i) => i.to_string(),
             None => return error_result(call_id, "missing required field: id"),
@@ -370,7 +370,7 @@ impl Tool for MemoryForget {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let id = match get_str(&args, "id") {
             Some(i) => i.to_string(),
             None => return error_result(call_id, "missing required field: id"),
@@ -416,7 +416,7 @@ impl Tool for MemoryLinks {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let id = match get_str(&args, "id") {
             Some(i) => i.to_string(),
             None => return error_result(call_id, "missing required field: id"),
@@ -457,7 +457,7 @@ impl Tool for MemoryList {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let tag = get_str(&args, "tag").map(String::from);
 
         let store = self.0.clone();

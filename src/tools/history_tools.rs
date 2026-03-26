@@ -55,7 +55,7 @@ impl Tool for HistoryRecent {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let hours = args
             .get("hours")
             .and_then(|v| v.as_u64())
@@ -106,7 +106,7 @@ impl Tool for HistorySearch {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let query = match args.get("query").and_then(|v| v.as_str()) {
             Some(q) => q.to_string(),
             None => return error_result(call_id, "missing required field: query"),

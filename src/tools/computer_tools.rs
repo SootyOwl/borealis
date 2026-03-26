@@ -101,7 +101,7 @@ impl Tool for BashExec {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let command = match get_str(&args, "command") {
             Some(c) => c,
             None => return error_result(call_id, "missing required field: command"),
@@ -219,7 +219,7 @@ impl Tool for FileRead {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let path_str = match get_str(&args, "path") {
             Some(p) => p,
             None => return error_result(call_id, "missing required field: path"),
@@ -281,7 +281,7 @@ impl Tool for FileWrite {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let path_str = match get_str(&args, "path") {
             Some(p) => p,
             None => return error_result(call_id, "missing required field: path"),
@@ -413,7 +413,7 @@ impl Tool for FileList {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
         let path_str = get_str(&args, "path").unwrap_or(".");
         let recursive = args
             .get("recursive")
@@ -515,8 +515,9 @@ mod tests {
 
     fn test_ctx() -> ToolContext {
         ToolContext {
+            call_id: "test_call".to_string(),
             author_id: "test_user".to_string(),
-            conversation_id: "test_call".to_string(),
+            conversation_id: "test_conv".to_string(),
             channel_source: "cli".to_string(),
         }
     }

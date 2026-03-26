@@ -75,7 +75,7 @@ impl Tool for WebFetch {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
 
         let url = match args.get("url").and_then(|v| v.as_str()) {
             Some(u) => u,
@@ -171,7 +171,7 @@ impl Tool for WebSearch {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let call_id = &ctx.conversation_id;
+        let call_id = &ctx.call_id;
 
         let query = match args.get("query").and_then(|v| v.as_str()) {
             Some(q) => q,
@@ -309,6 +309,7 @@ mod tests {
         });
         let tool = WebFetch(shared);
         let ctx = ToolContext {
+            call_id: "call1".into(),
             author_id: "user1".into(),
             conversation_id: "conv1".into(),
             channel_source: "cli".into(),
@@ -326,6 +327,7 @@ mod tests {
         });
         let tool = WebFetch(shared);
         let ctx = ToolContext {
+            call_id: "call1".into(),
             author_id: "user1".into(),
             conversation_id: "conv1".into(),
             channel_source: "cli".into(),
@@ -347,6 +349,7 @@ mod tests {
         });
         let tool = WebSearch(shared);
         let ctx = ToolContext {
+            call_id: "call1".into(),
             author_id: "user1".into(),
             conversation_id: "conv1".into(),
             channel_source: "cli".into(),

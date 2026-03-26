@@ -140,6 +140,7 @@ pub struct ToolResult {
 /// Context passed to tools for authorization and routing.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
+    pub call_id: String,
     pub author_id: String,
     pub conversation_id: String,
     pub channel_source: String,
@@ -309,6 +310,7 @@ mod tests {
             arguments: serde_json::json!({"text": "hello"}),
         };
         let ctx = ToolContext {
+            call_id: "call_1".to_string(),
             author_id: "user1".to_string(),
             conversation_id: "conv1".to_string(),
             channel_source: "cli".to_string(),
@@ -328,6 +330,7 @@ mod tests {
             arguments: serde_json::json!({}),
         };
         let ctx = ToolContext {
+            call_id: "call_1".to_string(),
             author_id: "user1".to_string(),
             conversation_id: "conv1".to_string(),
             channel_source: "cli".to_string(),

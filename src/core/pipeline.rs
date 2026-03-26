@@ -421,8 +421,11 @@ impl<P: Provider + 'static> Pipeline<P> {
         };
 
         // Persist the final assistant response to history.
+        // Only persist if the loop exited because tool_calls was empty (normal exit).
+        // If it exited due to max iterations, the assistant message was already persisted
+        // inside the loop, so persisting again would create a duplicate.
         let response_text = response.text.clone().unwrap_or_default();
-        if !response_text.is_empty() {
+        if !response_text.is_empty() && response.tool_calls.is_empty() {
             let final_msg = ChatMessage::assistant(&response_text);
             let store = Arc::clone(&self.history_store);
             let cid = conv_id.clone();

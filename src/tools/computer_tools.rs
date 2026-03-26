@@ -7,7 +7,7 @@ use tokio::process::Command;
 use crate::config::ComputerUseConfig;
 use crate::security::Sandbox;
 use crate::tools::{
-    Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult,
+    Tool, ToolContext, ToolDef, ToolDeps, ToolGroup, ToolRegistry, ToolResult,
     error_result, get_str, ok_result,
 };
 
@@ -50,20 +50,20 @@ pub fn register_computer_tools(
     };
     let timeout = Duration::from_secs(config.command_timeout_secs);
 
-    registry.register(BashExec {
+    registry.register_with_group(BashExec {
         sandbox: Arc::clone(&sandbox),
         command_allowlist: allowlist,
         timeout,
-    });
-    registry.register(FileRead {
+    }, ToolGroup::Computer);
+    registry.register_with_group(FileRead {
         sandbox: Arc::clone(&sandbox),
-    });
-    registry.register(FileWrite {
+    }, ToolGroup::Computer);
+    registry.register_with_group(FileWrite {
         sandbox: Arc::clone(&sandbox),
-    });
-    registry.register(FileList {
+    }, ToolGroup::Computer);
+    registry.register_with_group(FileList {
         sandbox: Arc::clone(&sandbox),
-    });
+    }, ToolGroup::Computer);
 }
 
 // ---------------------------------------------------------------------------
@@ -342,8 +342,8 @@ impl Tool for FileWrite {
             );
         }
 
-        // Create parent directories AFTER validation
-        if let Some(parent) = target.parent() {
+        // Create parent directories AFTER validation (use canonical path)
+        if let Some(parent) = canonical_target.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return error_result(
                     call_id,
@@ -352,8 +352,7 @@ impl Tool for FileWrite {
             }
         }
 
-
-        match tokio::fs::write(&target, content).await {
+        match tokio::fs::write(&canonical_target, content).await {
             Ok(()) => ok_result(
                 call_id,
                 serde_json::json!({

@@ -4,7 +4,7 @@ use reqwest::Client;
 
 use crate::config::WebToolsConfig;
 use crate::tools::{
-    Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult,
+    Tool, ToolContext, ToolDef, ToolDeps, ToolGroup, ToolRegistry, ToolResult,
     error_result, ok_result,
 };
 
@@ -42,8 +42,8 @@ pub fn register_web_tools(registry: &mut ToolRegistry, config: &WebToolsConfig) 
         max_fetch_bytes: config.max_fetch_bytes,
     });
 
-    registry.register(WebFetch(Arc::clone(&shared)));
-    registry.register(WebSearch(shared));
+    registry.register_with_group(WebFetch(Arc::clone(&shared)), ToolGroup::Web);
+    registry.register_with_group(WebSearch(shared), ToolGroup::Web);
 }
 
 // ---------------------------------------------------------------------------

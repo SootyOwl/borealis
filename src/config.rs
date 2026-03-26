@@ -24,6 +24,9 @@ pub enum ConfigError {
          provide a non-empty value"
     )]
     EmptyEnvVar { field: String, env_var: String },
+
+    #[error("invalid configuration: {0}")]
+    Validation(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +457,16 @@ impl Settings {
             if let Some(ref key_env) = self.tools.web.jina_api_key_env {
                 resolve_env_var("tools.web.jina_api_key_env", key_env)?;
             }
+        }
+        if self.rate_limit.per_user.refill_secs == 0 {
+            return Err(ConfigError::Validation(
+                "rate_limit.per_user.refill_secs must be > 0".into(),
+            ));
+        }
+        if self.rate_limit.global.refill_secs == 0 {
+            return Err(ConfigError::Validation(
+                "rate_limit.global.refill_secs must be > 0".into(),
+            ));
         }
         Ok(())
     }

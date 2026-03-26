@@ -534,17 +534,19 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 mod tests {
     use super::*;
 
-    fn test_store() -> SqliteMemory {
+    fn test_store() -> (tempfile::NamedTempFile, SqliteMemory) {
         let conn = Connection::open_in_memory().unwrap();
         let conn = Arc::new(Mutex::new(conn));
-        let tmp = std::env::temp_dir().join("test_core.md");
-        std::fs::write(&tmp, "# Test Core\nI am a test persona.").unwrap();
-        SqliteMemory::new(conn, tmp).unwrap()
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        std::fs::write(&tmp_path, "# Test Core\nI am a test persona.").unwrap();
+        let store = SqliteMemory::new(conn, tmp_path).unwrap();
+        (tmp, store)
     }
 
     #[test]
     fn create_and_read_note() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
         let note = store
             .create_note(
                 "Test Title",
@@ -567,7 +569,7 @@ mod tests {
 
     #[test]
     fn update_note() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
         let note = store.create_note("Title", "Old content", &[]).unwrap();
         let updated = store.update_note(&note.id, "New content").unwrap();
         assert_eq!(updated.content, "New content");
@@ -576,7 +578,7 @@ mod tests {
 
     #[test]
     fn forget_note_excludes_from_search() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
         let note = store
             .create_note("Forgettable", "Some content", &["temp".into()])
             .unwrap();
@@ -592,7 +594,7 @@ mod tests {
 
     #[test]
     fn search_by_title_content_tag() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
         store
             .create_note("Rust Programming", "Systems language", &["code".into()])
             .unwrap();
@@ -620,7 +622,7 @@ mod tests {
 
     #[test]
     fn link_notes_directional() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
         let a = store.create_note("Note A", "Content A", &[]).unwrap();
         let b = store.create_note("Note B", "Content B", &[]).unwrap();
 
@@ -644,7 +646,7 @@ mod tests {
 
     #[test]
     fn tag_note_replaces_tags() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
         let note = store
             .create_note("Tagged", "Content", &["old".into()])
             .unwrap();
@@ -661,7 +663,7 @@ mod tests {
 
     #[test]
     fn list_with_tag_filter() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
         store
             .create_note("A", "Content", &["alpha".into()])
             .unwrap();
@@ -679,7 +681,7 @@ mod tests {
 
     #[test]
     fn core_persona_read_and_update() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
 
         let core = store.read_note("core").unwrap();
         assert_eq!(core.id, "core");
@@ -697,7 +699,7 @@ mod tests {
 
     #[test]
     fn read_note_includes_links() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
         let a = store.create_note("Note A", "Content A", &[]).unwrap();
         let b = store.create_note("Note B", "Content B", &[]).unwrap();
 
@@ -724,7 +726,7 @@ mod tests {
 
     #[test]
     fn not_found_errors() {
-        let store = test_store();
+        let (_tmp, store) = test_store();
 
         let err = store.read_note("note_nonexist").unwrap_err();
         assert!(matches!(err, MemoryError::NotFound(_)));

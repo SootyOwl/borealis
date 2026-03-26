@@ -11,7 +11,7 @@ pub use authorization::{Authorization, AuthorizationResult};
 pub use rate_limit::{RateLimitResult, RateLimiter};
 pub use sandbox::{Sandbox, SandboxError};
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::config::RateLimitConfig;
 
@@ -43,13 +43,18 @@ impl Security {
         }
     }
 
+    // TODO: Wire rate_limiter.check() into the pipeline or channel adapters.
+    // Currently only used for authorization; rate limiting is not enforced at runtime.
+
     /// Convenience: check rate limit for a user/guild pair.
+    #[cfg(test)]
     pub fn check_rate_limit(&self, user_id: &str, guild_id: Option<&str>) -> RateLimitResult {
         self.rate_limiter.check(user_id, guild_id)
     }
 
     /// Convenience: validate a file path against the sandbox.
-    pub fn validate_path(&self, path: &Path) -> Result<PathBuf, SandboxError> {
+    #[cfg(test)]
+    pub fn validate_path(&self, path: &std::path::Path) -> Result<PathBuf, SandboxError> {
         self.sandbox.validate_path(path)
     }
 
@@ -72,6 +77,7 @@ impl Security {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
 
     fn setup_security() -> (tempfile::TempDir, Security) {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");

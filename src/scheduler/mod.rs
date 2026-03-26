@@ -47,11 +47,6 @@ impl Scheduler {
         })
     }
 
-    /// Returns the number of configured events.
-    pub fn event_count(&self) -> usize {
-        self.runners.len() + self.handles.len()
-    }
-
     /// Start all event runners as background tasks.
     pub fn start(&mut self) {
         let runners: Vec<_> = self.runners.drain(..).collect();

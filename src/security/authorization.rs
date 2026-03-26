@@ -51,7 +51,8 @@ impl Authorization {
     }
 
     /// Authorize a specific user for a specific restricted tool.
-    pub fn authorize_user_for_tool(&mut self, tool_name: &str, user_id: &str) {
+    #[cfg(test)]
+    fn authorize_user_for_tool(&mut self, tool_name: &str, user_id: &str) {
         self.per_tool_users
             .entry(tool_name.to_owned())
             .or_default()
@@ -87,12 +88,14 @@ impl Authorization {
     }
 
     /// Returns whether the given tool is registered as restricted.
-    pub fn is_restricted_tool(&self, tool_name: &str) -> bool {
+    #[cfg(test)]
+    fn is_restricted_tool(&self, tool_name: &str) -> bool {
         self.restricted_tools.contains(tool_name)
     }
 
     /// Returns whether the given user is globally authorized.
-    pub fn is_user_authorized(&self, user_id: &str) -> bool {
+    #[cfg(test)]
+    fn is_user_authorized(&self, user_id: &str) -> bool {
         self.global_authorized_users.contains(user_id)
     }
 }

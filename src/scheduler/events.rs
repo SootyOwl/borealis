@@ -50,9 +50,15 @@ pub fn parse_active_hours(s: &str) -> Result<(NaiveTime, NaiveTime)> {
 }
 
 /// Check if a time falls within [start, end] (inclusive).
-/// Does NOT handle overnight ranges (e.g., 23:00-06:00).
+/// Handles overnight ranges (e.g., 22:00-06:00) via wrap-around.
 pub fn is_within_active_hours(time: NaiveTime, start: NaiveTime, end: NaiveTime) -> bool {
-    time >= start && time <= end
+    if start <= end {
+        // Normal range: e.g. 06:00-23:00
+        time >= start && time <= end
+    } else {
+        // Overnight range: e.g. 22:00-06:00
+        time >= start || time <= end
+    }
 }
 
 /// Compute a random jitter in the range [-max_jitter, +max_jitter].
@@ -312,5 +318,75 @@ impl ScheduledEventRunner {
         }
 
         debug!(event = %name, "scheduler event fired — flag held until processing completes");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_hours_normal_range() {
+        let start = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
+        let end = NaiveTime::from_hms_opt(23, 0, 0).unwrap();
+
+        // Inside
+        assert!(is_within_active_hours(
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+            start,
+            end,
+        ));
+        // At boundaries
+        assert!(is_within_active_hours(start, start, end));
+        assert!(is_within_active_hours(end, start, end));
+        // Outside
+        assert!(!is_within_active_hours(
+            NaiveTime::from_hms_opt(5, 0, 0).unwrap(),
+            start,
+            end,
+        ));
+        assert!(!is_within_active_hours(
+            NaiveTime::from_hms_opt(23, 30, 0).unwrap(),
+            start,
+            end,
+        ));
+    }
+
+    #[test]
+    fn active_hours_overnight_range() {
+        let start = NaiveTime::from_hms_opt(22, 0, 0).unwrap();
+        let end = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
+
+        // Inside — late evening
+        assert!(is_within_active_hours(
+            NaiveTime::from_hms_opt(23, 0, 0).unwrap(),
+            start,
+            end,
+        ));
+        // Inside — early morning
+        assert!(is_within_active_hours(
+            NaiveTime::from_hms_opt(3, 0, 0).unwrap(),
+            start,
+            end,
+        ));
+        // At boundaries
+        assert!(is_within_active_hours(start, start, end));
+        assert!(is_within_active_hours(end, start, end));
+        // Outside — midday
+        assert!(!is_within_active_hours(
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+            start,
+            end,
+        ));
+        // Outside — just after end
+        assert!(!is_within_active_hours(
+            NaiveTime::from_hms_opt(7, 0, 0).unwrap(),
+            start,
+            end,
+        ));
     }
 }

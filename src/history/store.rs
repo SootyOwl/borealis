@@ -110,6 +110,7 @@ impl HistoryStore {
     }
 
     /// Fetch a conversation by id.  Returns `None` when no row exists.
+    #[cfg(test)]
     pub fn get_conversation(
         &self,
         id: &ConversationId,
@@ -376,6 +377,7 @@ impl HistoryStore {
     /// tool_results from surviving retention cleanup.
     ///
     /// Returns the number of deleted messages.
+    #[cfg(test)]
     pub fn cleanup_old_messages(&self, retention_days: u32) -> Result<usize, StoreError> {
         let conn = self.lock_conn()?;
         let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));

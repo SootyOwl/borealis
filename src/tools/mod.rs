@@ -1,11 +1,9 @@
-mod channel_tools;
 mod computer_tools;
 mod history_tools;
 mod memory_tools;
 mod web_tools;
 
 // Re-export individual registration functions for tests and direct use.
-pub use channel_tools::register_discord_channel_tools;
 pub use computer_tools::register_computer_tools;
 pub use history_tools::register_history_tools;
 pub use memory_tools::register_memory_tools;

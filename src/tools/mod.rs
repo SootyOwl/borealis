@@ -1,6 +1,8 @@
 mod memory_tools;
+mod web_tools;
 
 pub use memory_tools::register_memory_tools;
+pub use web_tools::register_web_tools;
 
 use std::collections::HashMap;
 

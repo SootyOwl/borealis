@@ -44,6 +44,8 @@ pub struct Settings {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +318,43 @@ fn default_global_refill_secs() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ToolsConfig {
+    #[serde(default)]
+    pub web: WebToolsConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WebToolsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Name of the environment variable holding the Jina API key (optional).
+    /// Without a key, requests are rate-limited by IP.
+    #[serde(default)]
+    pub jina_api_key_env: Option<String>,
+    /// Maximum response body size in bytes (default: 50 KiB).
+    #[serde(default = "default_max_fetch_bytes")]
+    pub max_fetch_bytes: usize,
+}
+
+impl Default for WebToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            jina_api_key_env: None,
+            max_fetch_bytes: default_max_fetch_bytes(),
+        }
+    }
+}
+
+fn default_max_fetch_bytes() -> usize {
+    51200
+}
+
+// ---------------------------------------------------------------------------
 // Scheduler
 // ---------------------------------------------------------------------------
 
@@ -410,6 +449,11 @@ impl Settings {
             && discord.enabled
         {
             resolve_env_var("channels.discord.token_env", &discord.token_env)?;
+        }
+        if self.tools.web.enabled {
+            if let Some(ref key_env) = self.tools.web.jina_api_key_env {
+                resolve_env_var("tools.web.jina_api_key_env", key_env)?;
+            }
         }
         Ok(())
     }

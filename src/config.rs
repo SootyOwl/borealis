@@ -44,6 +44,8 @@ pub struct Settings {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +315,55 @@ fn default_global_bucket_capacity() -> u32 {
 
 fn default_global_refill_secs() -> u64 {
     2
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ToolsConfig {
+    #[serde(default)]
+    pub computer_use: ComputerUseConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ComputerUseConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_sandbox_root")]
+    pub sandbox_root: PathBuf,
+    #[serde(default = "default_memory_dir")]
+    pub memory_dir: String,
+    /// Empty list means all commands are allowed.
+    #[serde(default)]
+    pub command_allowlist: Vec<String>,
+    #[serde(default = "default_command_timeout_secs")]
+    pub command_timeout_secs: u64,
+}
+
+impl Default for ComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sandbox_root: default_sandbox_root(),
+            memory_dir: default_memory_dir(),
+            command_allowlist: Vec::new(),
+            command_timeout_secs: default_command_timeout_secs(),
+        }
+    }
+}
+
+fn default_sandbox_root() -> PathBuf {
+    PathBuf::from(".")
+}
+
+fn default_memory_dir() -> String {
+    "memory".into()
+}
+
+fn default_command_timeout_secs() -> u64 {
+    30
 }
 
 // ---------------------------------------------------------------------------

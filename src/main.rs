@@ -81,25 +81,12 @@ async fn main() -> anyhow::Result<()> {
     ));
     info!("security module initialized");
 
-    // Create the tool registry — each group registers based on config.
-    let mut tool_registry = borealis::tools::ToolRegistry::new();
-    borealis::tools::register_memory_tools(&mut tool_registry, Arc::clone(&memory_store));
-    borealis::tools::register_history_tools(&mut tool_registry, Arc::clone(&history_store));
-    if settings.tools.computer_use.enabled {
-        let sandbox = Arc::new(borealis::security::Sandbox::new(
-            settings.tools.computer_use.sandbox_root.clone(),
-        ));
-        borealis::tools::register_computer_tools(
-            &mut tool_registry,
-            sandbox,
-            &settings.tools.computer_use,
-        );
-    }
-    if settings.tools.web.enabled {
-        borealis::tools::register_web_tools(&mut tool_registry, &settings.tools.web);
-    }
-    borealis::tools::register_discord_channel_tools(&mut tool_registry);
-    let tool_registry = Arc::new(tool_registry);
+    // Register all tool groups based on config.
+    let tool_registry = Arc::new(borealis::tools::register_all(
+        &settings,
+        Arc::clone(&memory_store),
+        Arc::clone(&history_store),
+    ));
     info!(
         tool_count = tool_registry.tool_count(),
         "tool registry initialized"

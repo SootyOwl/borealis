@@ -577,6 +577,180 @@ impl HistoryStore {
 }
 
 // ---------------------------------------------------------------------------
+// RecentConversation — summary of a recent conversation for the history tool
+// ---------------------------------------------------------------------------
+
+/// Summary of a recent conversation returned by `recent_conversations`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecentConversation {
+    pub conversation_id: String,
+    pub message_count: i64,
+    pub earliest: String,
+    pub latest: String,
+    pub first_preview: String,
+    pub last_preview: String,
+    pub summary: Option<String>,
+}
+
+/// A single search hit from `search_messages`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MessageSearchResult {
+    pub conversation_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// History query operations on HistoryStore
+// ---------------------------------------------------------------------------
+
+impl HistoryStore {
+    /// Return summaries of the most recent conversations that have messages
+    /// within the last `hours` hours.  Optionally filter to conversations
+    /// whose id contains `channel` (e.g. "discord", "cli").
+    ///
+    /// Limited to 10 conversations, ordered by most-recent message DESC.
+    pub fn recent_conversations(
+        &self,
+        hours: u32,
+        channel: Option<&str>,
+    ) -> Result<Vec<RecentConversation>, StoreError> {
+        let conn = self.lock_conn()?;
+        let cutoff = Utc::now() - chrono::Duration::hours(i64::from(hours));
+        let cutoff_str = cutoff.to_rfc3339();
+
+        // Build channel filter dynamically.
+        let channel_pattern = channel.map(|c| format!("%{c}%"));
+
+        let sql = "\
+            SELECT conversation_id,
+                   COUNT(*) AS msg_count,
+                   MIN(created_at) AS earliest,
+                   MAX(created_at) AS latest
+            FROM messages
+            WHERE created_at >= ?1
+              AND (?2 IS NULL OR conversation_id LIKE ?2)
+            GROUP BY conversation_id
+            ORDER BY MAX(created_at) DESC
+            LIMIT 10";
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(
+            params![cutoff_str, channel_pattern],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+
+        let mut results = Vec::new();
+        for row_result in rows {
+            let (conv_id, msg_count, earliest, latest) = row_result?;
+
+            // Fetch first message preview.
+            let first_preview: String = conn
+                .query_row(
+                    "SELECT content FROM messages WHERE conversation_id = ?1 ORDER BY seq ASC LIMIT 1",
+                    params![conv_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
+
+            // Fetch last message preview.
+            let last_preview: String = conn
+                .query_row(
+                    "SELECT content FROM messages WHERE conversation_id = ?1 ORDER BY seq DESC LIMIT 1",
+                    params![conv_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
+
+            // Check for compaction summary.
+            let summary: Option<String> = conn
+                .query_row(
+                    "SELECT summary_text FROM conversation_summaries WHERE conversation_id = ?1",
+                    params![conv_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            // Truncate previews to 200 chars.
+            let truncate = |s: String| -> String {
+                if s.len() > 200 {
+                    format!("{}…", &s[..200])
+                } else {
+                    s
+                }
+            };
+
+            results.push(RecentConversation {
+                conversation_id: conv_id,
+                message_count: msg_count,
+                earliest,
+                latest,
+                first_preview: truncate(first_preview),
+                last_preview: truncate(last_preview),
+                summary,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Search message content across all conversations using SQL LIKE.
+    ///
+    /// Returns up to `limit` results ordered by created_at DESC.
+    pub fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageSearchResult>, StoreError> {
+        let conn = self.lock_conn()?;
+        let pattern = format!("%{query}%");
+
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, role, content, created_at
+             FROM messages
+             WHERE content LIKE ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut results = Vec::new();
+        for row_result in rows {
+            let (conv_id, role, content, created_at) = row_result?;
+            let truncated = if content.len() > 200 {
+                format!("{}…", &content[..200])
+            } else {
+                content
+            };
+            results.push(MessageSearchResult {
+                conversation_id: conv_id,
+                role,
+                content: truncated,
+                created_at,
+            });
+        }
+
+        Ok(results)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

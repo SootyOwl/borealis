@@ -81,9 +81,10 @@ async fn main() -> anyhow::Result<()> {
     ));
     info!("security module initialized");
 
-    // Create the tool registry with memory tools.
+    // Create the tool registry with memory and history tools.
     let mut tool_registry = borealis::tools::ToolRegistry::new();
     borealis::tools::register_memory_tools(&mut tool_registry, Arc::clone(&memory_store));
+    borealis::tools::register_history_tools(&mut tool_registry, Arc::clone(&history_store));
     let tool_registry = Arc::new(tool_registry);
     info!(
         tool_count = tool_registry.tool_count(),

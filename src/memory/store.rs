@@ -10,20 +10,10 @@ use thiserror::Error;
 inventory::submit! {
     crate::memory::MemoryRegistration {
         name: "sqlite",
-        build_fn: |settings| {
-            let db_conn = Arc::new(Mutex::new(
-                Connection::open(&settings.database.path)?,
-            ));
-            {
-                let conn = db_conn.lock().expect("mutex not poisoned");
-                conn.execute_batch(
-                    "PRAGMA journal_mode = WAL;
-                     PRAGMA busy_timeout = 5000;",
-                )?;
-            }
+        build_fn: |deps| {
             let memory = SqliteMemory::new(
-                db_conn,
-                settings.bot.core_persona_path.clone(),
+                Arc::clone(&deps.db_conn),
+                deps.settings.bot.core_persona_path.clone(),
             )?;
             Ok(Arc::new(memory))
         },

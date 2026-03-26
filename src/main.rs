@@ -66,7 +66,10 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     // Create the memory store via inventory-registered backend.
-    let memory_store = borealis::memory::build_memory(&settings)?;
+    let memory_store = borealis::memory::build_memory(borealis::memory::MemoryDeps {
+        settings: &settings,
+        db_conn: Arc::clone(&db_conn),
+    })?;
     info!("memory store initialized");
 
     // Create the security module.

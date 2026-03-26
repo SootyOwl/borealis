@@ -4,7 +4,18 @@
 //! actions (reactions, cross-channel messaging, etc.). These replace the old
 //! XML directive system.
 
-use crate::tools::{Tool, ToolContext, ToolDef, ToolGroup, ToolRegistry, ToolResult};
+use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolGroup, ToolRegistry, ToolResult};
+
+fn register(registry: &mut ToolRegistry, _deps: &ToolDeps) {
+    register_discord_channel_tools(registry);
+}
+
+inventory::submit! {
+    crate::tools::ToolRegistration {
+        name: "channel",
+        register_fn: register,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Discord channel tools

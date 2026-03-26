@@ -6,7 +6,24 @@ use tokio::process::Command;
 
 use crate::config::ComputerUseConfig;
 use crate::security::Sandbox;
-use crate::tools::{Tool, ToolContext, ToolDef, ToolRegistry, ToolResult};
+use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult};
+
+fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
+    if !deps.settings.tools.computer_use.enabled {
+        return;
+    }
+    let sandbox = Arc::new(Sandbox::new(
+        deps.settings.tools.computer_use.sandbox_root.clone(),
+    ));
+    register_computer_tools(registry, sandbox, &deps.settings.tools.computer_use);
+}
+
+inventory::submit! {
+    crate::tools::ToolRegistration {
+        name: "computer",
+        register_fn: register,
+    }
+}
 
 /// Safe environment variables that are re-added after `env_clear()`.
 /// Prevents leaking API keys (ANTHROPIC_API_KEY, etc.) to child processes.

@@ -17,41 +17,42 @@ use std::sync::Arc;
 use crate::config::Settings;
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
-use crate::security::Sandbox;
 
-/// Register all tool groups based on configuration.
+/// Runtime dependencies available to tool registration functions.
+pub struct ToolDeps<'a> {
+    pub settings: &'a Settings,
+    pub memory_store: Arc<dyn Memory>,
+    pub history_store: Arc<HistoryStore>,
+}
+
+/// A self-registering tool group. Modules submit these via `inventory::submit!`.
+/// They are collected and executed by [`register_all`].
+pub struct ToolRegistration {
+    pub name: &'static str,
+    pub register_fn: fn(&mut ToolRegistry, &ToolDeps),
+}
+
+inventory::collect!(ToolRegistration);
+
+/// Register all tool groups discovered via `inventory`.
 ///
-/// This is the single entry point for tool registration — adding a new tool
-/// group means adding its registration call here, not in main.rs.
+/// Each tool module submits a [`ToolRegistration`] at link time. This function
+/// iterates them and calls each registration function with the shared deps.
 pub fn register_all(
     settings: &Settings,
     memory_store: Arc<dyn Memory>,
     history_store: Arc<HistoryStore>,
 ) -> ToolRegistry {
+    let deps = ToolDeps {
+        settings,
+        memory_store,
+        history_store,
+    };
     let mut registry = ToolRegistry::new();
-
-    // Memory tools — always enabled
-    memory_tools::register_memory_tools(&mut registry, memory_store);
-
-    // History tools — always enabled
-    history_tools::register_history_tools(&mut registry, history_store);
-
-    // Computer use tools — config-gated
-    if settings.tools.computer_use.enabled {
-        let sandbox = Arc::new(Sandbox::new(
-            settings.tools.computer_use.sandbox_root.clone(),
-        ));
-        computer_tools::register_computer_tools(&mut registry, sandbox, &settings.tools.computer_use);
+    for reg in inventory::iter::<ToolRegistration> {
+        tracing::debug!(group = reg.name, "registering tool group");
+        (reg.register_fn)(&mut registry, &deps);
     }
-
-    // Web tools — config-gated
-    if settings.tools.web.enabled {
-        web_tools::register_web_tools(&mut registry, &settings.tools.web);
-    }
-
-    // Channel tools — always registered (stubs until channel-specific impls)
-    channel_tools::register_discord_channel_tools(&mut registry);
-
     registry
 }
 

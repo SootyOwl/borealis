@@ -1,7 +1,18 @@
 use std::sync::Arc;
 
 use crate::memory::Memory;
-use crate::tools::{Tool, ToolContext, ToolDef, ToolRegistry, ToolResult};
+use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult};
+
+fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
+    register_memory_tools(registry, Arc::clone(&deps.memory_store));
+}
+
+inventory::submit! {
+    crate::tools::ToolRegistration {
+        name: "memory",
+        register_fn: register,
+    }
+}
 
 /// Register all 9 memory tools into the given registry.
 pub fn register_memory_tools(registry: &mut ToolRegistry, store: Arc<dyn Memory>) {

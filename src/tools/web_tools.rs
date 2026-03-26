@@ -3,7 +3,21 @@ use std::sync::Arc;
 use reqwest::Client;
 
 use crate::config::WebToolsConfig;
-use crate::tools::{Tool, ToolContext, ToolDef, ToolRegistry, ToolResult};
+use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult};
+
+fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
+    if !deps.settings.tools.web.enabled {
+        return;
+    }
+    register_web_tools(registry, &deps.settings.tools.web);
+}
+
+inventory::submit! {
+    crate::tools::ToolRegistration {
+        name: "web",
+        register_fn: register,
+    }
+}
 
 /// Configuration shared by both web tools at runtime.
 struct WebConfig {

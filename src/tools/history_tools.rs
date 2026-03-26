@@ -1,7 +1,18 @@
 use std::sync::Arc;
 
 use crate::history::store::HistoryStore;
-use crate::tools::{Tool, ToolContext, ToolDef, ToolGroup, ToolRegistry, ToolResult};
+use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolGroup, ToolRegistry, ToolResult};
+
+fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
+    register_history_tools(registry, Arc::clone(&deps.history_store));
+}
+
+inventory::submit! {
+    crate::tools::ToolRegistration {
+        name: "history",
+        register_fn: register,
+    }
+}
 
 /// Register history tools into the given registry under the Memory group.
 pub fn register_history_tools(registry: &mut ToolRegistry, store: Arc<HistoryStore>) {

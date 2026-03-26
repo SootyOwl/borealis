@@ -30,11 +30,13 @@ impl CompactionState {
 
     /// Returns `true` if the flag was successfully set (no compaction in progress).
     fn try_start(&self, conversation_id: &str) -> bool {
-        if self.in_progress.contains_key(conversation_id) {
-            false
-        } else {
-            self.in_progress.insert(conversation_id.to_string(), ());
-            true
+        use dashmap::mapref::entry::Entry;
+        match self.in_progress.entry(conversation_id.to_string()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(());
+                true
+            }
         }
     }
 

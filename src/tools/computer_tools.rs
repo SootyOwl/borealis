@@ -6,7 +6,10 @@ use tokio::process::Command;
 
 use crate::config::ComputerUseConfig;
 use crate::security::Sandbox;
-use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult};
+use crate::tools::{
+    Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult,
+    error_result, get_str, ok_result,
+};
 
 fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
     if !deps.settings.tools.computer_use.enabled {
@@ -63,26 +66,6 @@ pub fn register_computer_tools(
     });
 }
 
-fn error_result(call_id: &str, msg: &str) -> ToolResult {
-    ToolResult {
-        call_id: call_id.to_string(),
-        content: serde_json::json!({ "error": msg }),
-        is_error: true,
-    }
-}
-
-fn ok_result(call_id: &str, value: serde_json::Value) -> ToolResult {
-    ToolResult {
-        call_id: call_id.to_string(),
-        content: value,
-        is_error: false,
-    }
-}
-
-fn get_str<'a>(args: &'a serde_json::Value, field: &str) -> Option<&'a str> {
-    args.get(field).and_then(|v| v.as_str())
-}
-
 // ---------------------------------------------------------------------------
 // bash_exec
 // ---------------------------------------------------------------------------
@@ -124,6 +107,12 @@ impl Tool for BashExec {
             None => return error_result(call_id, "missing required field: command"),
         };
 
+        // If allowlist is configured, reject commands with shell metacharacters
+        const SHELL_METACHARACTERS: &[char] = &[';', '&', '|', '`', '$', '(', ')', '{', '}', '<', '>', '\n'];
+        if self.command_allowlist.is_some() && command.contains(SHELL_METACHARACTERS) {
+            return error_result(call_id, "command contains shell metacharacters which are not allowed when a command allowlist is configured");
+        }
+
         // Check command allowlist if configured
         if let Some(ref allowlist) = self.command_allowlist {
             let base_command = command.split_whitespace().next().unwrap_or("");
@@ -153,13 +142,27 @@ impl Tool for BashExec {
             }
         }
 
-        let result = tokio::time::timeout(self.timeout, cmd.output()).await;
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
 
-        match result {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let exit_code = output.status.code().unwrap_or(-1);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return error_result(call_id, &format!("failed to execute command: {e}")),
+        };
+
+        match tokio::time::timeout(self.timeout, child.wait()).await {
+            Ok(Ok(status)) => {
+                let mut stdout_buf = Vec::new();
+                let mut stderr_buf = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut stdout_buf).await;
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut stderr_buf).await;
+                }
+                let stdout = String::from_utf8_lossy(&stdout_buf);
+                let stderr = String::from_utf8_lossy(&stderr_buf);
+                let exit_code = status.code().unwrap_or(-1);
 
                 ok_result(
                     call_id,
@@ -171,10 +174,13 @@ impl Tool for BashExec {
                 )
             }
             Ok(Err(e)) => error_result(call_id, &format!("failed to execute command: {e}")),
-            Err(_) => error_result(
-                call_id,
-                &format!("command timed out after {}s", self.timeout.as_secs()),
-            ),
+            Err(_) => {
+                let _ = child.kill().await;
+                error_result(
+                    call_id,
+                    &format!("command timed out after {}s", self.timeout.as_secs()),
+                )
+            }
         }
     }
 }
@@ -293,31 +299,9 @@ impl Tool for FileWrite {
             self.sandbox.root().join(path_str)
         };
 
-        // Create parent directories if needed
-        if let Some(parent) = target.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return error_result(
-                    call_id,
-                    &format!("failed to create parent directories: {e}"),
-                );
-            }
-        }
-
-        // Now validate the path (parent exists so canonicalize of parent works)
-        // We validate by checking the canonical parent is within sandbox
-        let canonical_parent = match target.parent() {
-            Some(parent) => match parent.canonicalize() {
-                Ok(p) => p,
-                Err(e) => {
-                    return error_result(
-                        call_id,
-                        &format!("failed to resolve parent directory: {e}"),
-                    );
-                }
-            },
-            None => return error_result(call_id, "invalid path: no parent directory"),
-        };
-
+        // Validate the path BEFORE creating directories to prevent side effects
+        // from malicious paths. We resolve the sandbox root and check that the
+        // normalized target stays within it.
         let canonical_root = match self.sandbox.root().canonicalize() {
             Ok(r) => r,
             Err(e) => {
@@ -325,11 +309,53 @@ impl Tool for FileWrite {
             }
         };
 
-        if !canonical_parent.starts_with(&canonical_root) {
+        // Normalize the target path without requiring it to exist:
+        // canonicalize the longest existing ancestor, then append the remainder.
+        let mut existing_ancestor = target.clone();
+        let mut suffix_parts = Vec::new();
+        while !existing_ancestor.exists() {
+            if let Some(file_name) = existing_ancestor.file_name() {
+                suffix_parts.push(file_name.to_os_string());
+            } else {
+                return error_result(call_id, "invalid path: cannot resolve ancestor");
+            }
+            existing_ancestor = match existing_ancestor.parent() {
+                Some(p) => p.to_path_buf(),
+                None => return error_result(call_id, "invalid path: no parent directory"),
+            };
+        }
+
+        let canonical_ancestor = match existing_ancestor.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return error_result(
+                    call_id,
+                    &format!("failed to resolve ancestor directory: {e}"),
+                );
+            }
+        };
+
+        // Rebuild the full canonical path
+        let mut canonical_target = canonical_ancestor;
+        for part in suffix_parts.into_iter().rev() {
+            canonical_target.push(part);
+        }
+
+        if !canonical_target.starts_with(&canonical_root) {
             return error_result(
                 call_id,
                 &format!("path traversal blocked: {} escapes sandbox root", path_str),
             );
+        }
+
+        // Create parent directories AFTER validation
+        if let Some(parent) = target.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return error_result(
+                    call_id,
+                    &format!("failed to create parent directories: {e}"),
+                );
+            }
         }
 
 
@@ -544,6 +570,27 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("not in the allowlist")
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_exec_rejects_metacharacters_with_allowlist() {
+        let (_tmp, sandbox) = setup_sandbox();
+        let tool = BashExec {
+            sandbox,
+            command_allowlist: Some(Arc::from(vec!["ls".to_string()].into_boxed_slice())),
+            timeout: Duration::from_secs(5),
+        };
+
+        let result = tool
+            .execute(serde_json::json!({"command": "ls; rm -rf /"}), &test_ctx())
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("shell metacharacters")
         );
     }
 

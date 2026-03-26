@@ -26,13 +26,13 @@ inventory::collect!(MemoryRegistration);
 
 /// Build a memory backend from inventory-registered backends.
 ///
-/// Currently there is only one backend ("sqlite"), so this simply uses the
-/// first registered backend. When a config selector is added later, this
-/// function will look up the configured backend by name.
+/// Looks up the backend named "sqlite" specifically rather than taking the
+/// first registered backend.
 pub fn build_memory(settings: &Settings) -> anyhow::Result<Arc<dyn Memory>> {
     for reg in inventory::iter::<MemoryRegistration> {
-        tracing::debug!(memory_backend = reg.name, "registering memory backend");
-        return (reg.build_fn)(settings);
+        if reg.name == "sqlite" {
+            return (reg.build_fn)(settings);
+        }
     }
-    anyhow::bail!("no memory backend registered via inventory")
+    anyhow::bail!("no memory backend named 'sqlite' registered")
 }

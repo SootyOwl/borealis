@@ -679,10 +679,11 @@ impl HistoryStore {
                 )
                 .ok();
 
-            // Truncate previews to 200 chars.
+            // Truncate previews to 200 chars (safe for multi-byte UTF-8).
             let truncate = |s: String| -> String {
                 if s.len() > 200 {
-                    format!("{}…", &s[..200])
+                    let end = (0..=200).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+                    format!("{}…", &s[..end])
                 } else {
                     s
                 }
@@ -734,7 +735,8 @@ impl HistoryStore {
         for row_result in rows {
             let (conv_id, role, content, created_at) = row_result?;
             let truncated = if content.len() > 200 {
-                format!("{}…", &content[..200])
+                let end = (0..=200).rev().find(|&i| content.is_char_boundary(i)).unwrap_or(0);
+                format!("{}…", &content[..end])
             } else {
                 content
             };

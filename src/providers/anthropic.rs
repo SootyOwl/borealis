@@ -195,20 +195,25 @@ struct AnthropicUsage {
 
 // --- Helpers ---
 
-/// Extract the system message (if any) from the message list.
+/// Extract all system messages from the message list and concatenate them.
 /// Anthropic expects system as a top-level field, not in messages.
 fn extract_system(messages: &[ChatMessage]) -> (Option<String>, Vec<&ChatMessage>) {
-    let mut system = None;
+    let mut system_parts = Vec::new();
     let mut rest = Vec::new();
 
     for msg in messages {
         if msg.role == Role::System {
-            // Use the last system message if multiple exist.
-            system = Some(msg.content.clone());
+            system_parts.push(msg.content.clone());
         } else {
             rest.push(msg);
         }
     }
+
+    let system = if system_parts.is_empty() {
+        None
+    } else {
+        Some(system_parts.join("\n\n"))
+    };
 
     (system, rest)
 }
@@ -327,6 +332,37 @@ mod tests {
         assert_eq!(system, Some("You are helpful.".to_string()));
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].content, "Hello");
+    }
+
+    #[test]
+    fn test_extract_system_concatenates_multiple() {
+        let messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "You are helpful.".into(),
+                tool_call_id: None,
+                tool_calls: vec![],
+            },
+            ChatMessage {
+                role: Role::System,
+                content: "Remember: the user likes Rust.".into(),
+                tool_call_id: None,
+                tool_calls: vec![],
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "Hello".into(),
+                tool_call_id: None,
+                tool_calls: vec![],
+            },
+        ];
+
+        let (system, rest) = extract_system(&messages);
+        assert_eq!(
+            system,
+            Some("You are helpful.\n\nRemember: the user likes Rust.".to_string())
+        );
+        assert_eq!(rest.len(), 1);
     }
 
     #[test]

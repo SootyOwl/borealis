@@ -303,9 +303,10 @@ impl Channel for DiscordAdapter {
             // Send text response (empty text = no reply, per REQ-11 convention)
             if let Some(text) = &event.text {
                 if !text.is_empty() {
-                    // Truncate to Discord's 2000 char limit
+                    // Truncate to Discord's 2000 char limit (safe for multi-byte UTF-8)
                     let text = if text.len() > 1997 {
-                        format!("{}...", &text[..1997])
+                        let end = (0..=1997).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+                        format!("{}...", &text[..end])
                     } else {
                         text.clone()
                     };

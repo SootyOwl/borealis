@@ -83,15 +83,6 @@ enabled = true                                 # stdin/stdout dev adapter
 path = "memory/borealis.db"                    # SQLite database (WAL mode, auto-created)
 
 # ---------------------------------------------------------------------------
-# Event bus
-# ---------------------------------------------------------------------------
-
-[event_bus]
-channel_capacity = 256                         # bounded mpsc channel size
-max_concurrency = 4                            # max simultaneous LLM calls (semaphore permits)
-idle_timeout_secs = 1800                       # evict idle per-conversation workers after 30min
-
-# ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------
 # Token bucket rate limiters. Allowlisted users/guilds bypass both limits.

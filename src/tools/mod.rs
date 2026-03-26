@@ -15,6 +15,37 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::Settings;
+
+// ---------------------------------------------------------------------------
+// Shared tool helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn error_result(call_id: &str, msg: &str) -> ToolResult {
+    ToolResult {
+        call_id: call_id.to_string(),
+        content: serde_json::json!({ "error": msg }),
+        is_error: true,
+    }
+}
+
+pub(crate) fn ok_result(call_id: &str, value: serde_json::Value) -> ToolResult {
+    ToolResult {
+        call_id: call_id.to_string(),
+        content: value,
+        is_error: false,
+    }
+}
+
+pub(crate) fn get_str<'a>(args: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    args.get(field).and_then(|v| v.as_str())
+}
+
+pub(crate) fn get_string_array(args: &serde_json::Value, field: &str) -> Vec<String> {
+    args.get(field)
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
 

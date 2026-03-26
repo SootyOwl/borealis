@@ -133,11 +133,11 @@ impl RateLimiter {
         }
 
         // Global check
-        let global_allowed = self
-            .global_bucket
-            .lock()
-            .expect("global bucket lock poisoned")
-            .try_consume();
+        let Ok(mut bucket) = self.global_bucket.lock() else {
+            warn!("global rate limit mutex poisoned — allowing request");
+            return RateLimitResult::Allowed;
+        };
+        let global_allowed = bucket.try_consume();
 
         if !global_allowed {
             warn!("global rate limit exceeded");

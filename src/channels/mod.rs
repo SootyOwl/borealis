@@ -57,8 +57,6 @@ pub fn register_all_channels(
 /// A channel adapter that bridges a platform (Discord, CLI, etc.) with the core event bus.
 ///
 /// Split into two async methods so inbound and outbound run as separate tasks.
-/// If `run_outbound` panics, the supervisor can restart it without affecting inbound.
-#[allow(dead_code)] // Methods used by task supervisor (REQ-9)
 pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
 

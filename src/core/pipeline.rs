@@ -31,13 +31,17 @@ pub trait PipelineRunner: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<OutEvent>> + Send + 'a>>;
 }
 
-/// Configuration for the pipeline's context window budget.
+/// Configuration for the pipeline's context window budget and generation params.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     /// Maximum tokens the model supports.
     pub model_max_tokens: usize,
     /// Tokens reserved for the model's response.
     pub response_reserve: usize,
+    /// Sampling temperature sent to the provider.
+    pub temperature: Option<f64>,
+    /// Maximum tokens the model may generate per response.
+    pub max_response_tokens: Option<usize>,
 }
 
 impl Default for PipelineConfig {
@@ -45,6 +49,8 @@ impl Default for PipelineConfig {
         Self {
             model_max_tokens: 8192,
             response_reserve: 1024,
+            temperature: Some(0.7),
+            max_response_tokens: Some(1024),
         }
     }
 }
@@ -236,8 +242,8 @@ impl<P: Provider + 'static> Pipeline<P> {
         let provider_tools = tool_defs_to_provider(&tool_defs);
 
         let config = RequestConfig {
-            temperature: Some(0.7),
-            max_tokens: Some(1024),
+            temperature: self.pipeline_config.temperature.map(|t| t as f32),
+            max_tokens: self.pipeline_config.max_response_tokens.map(|n| n as u32),
             ..Default::default()
         };
 
@@ -284,12 +290,14 @@ impl<P: Provider + 'static> Pipeline<P> {
                 "LLM response received"
             );
 
-            if response.tool_calls.is_empty() || iterations >= MAX_TOOL_ITERATIONS {
-                if iterations >= MAX_TOOL_ITERATIONS && !response.tool_calls.is_empty() {
-                    warn!(
-                        "tool execution loop hit max iterations ({MAX_TOOL_ITERATIONS}), stopping"
-                    );
-                }
+            if response.tool_calls.is_empty() {
+                break response;
+            }
+
+            if iterations >= MAX_TOOL_ITERATIONS {
+                warn!(
+                    "tool execution loop hit max iterations ({MAX_TOOL_ITERATIONS}), stopping"
+                );
                 break response;
             }
 

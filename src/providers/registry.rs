@@ -147,6 +147,8 @@ pub fn build_pipeline(
     let pipeline_config = crate::core::pipeline::PipelineConfig {
         model_max_tokens: resolved.max_history_tokens,
         response_reserve: 1024,
+        temperature: Some(0.7),
+        max_response_tokens: Some(1024),
     };
 
     let deps = PipelineDeps {
@@ -196,7 +198,6 @@ mod tests {
             },
             channels: ChannelsConfig::default(),
             database: DatabaseConfig::default(),
-            event_bus: EventBusConfig::default(),
             rate_limit: RateLimitConfig::default(),
             scheduler: SchedulerConfig::default(),
             tools: ToolsConfig::default(),

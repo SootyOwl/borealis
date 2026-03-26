@@ -3,7 +3,10 @@ use std::sync::Arc;
 use reqwest::Client;
 
 use crate::config::WebToolsConfig;
-use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult};
+use crate::tools::{
+    Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult,
+    error_result, ok_result,
+};
 
 fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
     if !deps.settings.tools.web.enabled {
@@ -41,22 +44,6 @@ pub fn register_web_tools(registry: &mut ToolRegistry, config: &WebToolsConfig) 
 
     registry.register(WebFetch(Arc::clone(&shared)));
     registry.register(WebSearch(shared));
-}
-
-fn error_result(call_id: &str, msg: &str) -> ToolResult {
-    ToolResult {
-        call_id: call_id.to_string(),
-        content: serde_json::json!({ "error": msg }),
-        is_error: true,
-    }
-}
-
-fn ok_result(call_id: &str, value: serde_json::Value) -> ToolResult {
-    ToolResult {
-        call_id: call_id.to_string(),
-        content: value,
-        is_error: false,
-    }
 }
 
 // ---------------------------------------------------------------------------

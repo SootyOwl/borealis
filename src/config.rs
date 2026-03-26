@@ -39,8 +39,6 @@ pub struct Settings {
     #[serde(default)]
     pub database: DatabaseConfig,
     #[serde(default)]
-    pub event_bus: EventBusConfig,
-    #[serde(default)]
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
@@ -213,42 +211,6 @@ impl Default for DatabaseConfig {
 
 fn default_database_path() -> PathBuf {
     PathBuf::from("memory/borealis.db")
-}
-
-// ---------------------------------------------------------------------------
-// Event Bus
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub struct EventBusConfig {
-    #[serde(default = "default_channel_capacity")]
-    pub channel_capacity: usize,
-    #[serde(default = "default_max_concurrency")]
-    pub max_concurrency: usize,
-    #[serde(default = "default_idle_timeout_secs")]
-    pub idle_timeout_secs: u64,
-}
-
-impl Default for EventBusConfig {
-    fn default() -> Self {
-        Self {
-            channel_capacity: default_channel_capacity(),
-            max_concurrency: default_max_concurrency(),
-            idle_timeout_secs: default_idle_timeout_secs(),
-        }
-    }
-}
-
-fn default_channel_capacity() -> usize {
-    256
-}
-
-fn default_max_concurrency() -> usize {
-    4
-}
-
-fn default_idle_timeout_secs() -> u64 {
-    1800
 }
 
 // ---------------------------------------------------------------------------

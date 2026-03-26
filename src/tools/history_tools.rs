@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use crate::history::store::HistoryStore;
-use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolGroup, ToolRegistry, ToolResult};
+use crate::tools::{
+    Tool, ToolContext, ToolDef, ToolDeps, ToolGroup, ToolRegistry, ToolResult,
+    error_result, ok_result,
+};
 
 fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
     register_history_tools(registry, Arc::clone(&deps.history_store));
@@ -18,22 +21,6 @@ inventory::submit! {
 pub fn register_history_tools(registry: &mut ToolRegistry, store: Arc<HistoryStore>) {
     registry.register_with_group(HistoryRecent(Arc::clone(&store)), ToolGroup::Memory);
     registry.register_with_group(HistorySearch(store), ToolGroup::Memory);
-}
-
-fn error_result(call_id: &str, msg: &str) -> ToolResult {
-    ToolResult {
-        call_id: call_id.to_string(),
-        content: serde_json::json!({ "error": msg }),
-        is_error: true,
-    }
-}
-
-fn ok_result(call_id: &str, value: serde_json::Value) -> ToolResult {
-    ToolResult {
-        call_id: call_id.to_string(),
-        content: value,
-        is_error: false,
-    }
 }
 
 // --- history_recent ---

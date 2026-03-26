@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use crate::memory::Memory;
-use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolRegistry, ToolResult};
+use crate::tools::{
+    Tool, ToolContext, ToolDef, ToolDeps, ToolGroup, ToolRegistry, ToolResult,
+    error_result, get_str, get_string_array, ok_result,
+};
 
 fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
     register_memory_tools(registry, Arc::clone(&deps.memory_store));
@@ -16,46 +19,15 @@ inventory::submit! {
 
 /// Register all 9 memory tools into the given registry.
 pub fn register_memory_tools(registry: &mut ToolRegistry, store: Arc<dyn Memory>) {
-    registry.register(MemoryCreate(Arc::clone(&store)));
-    registry.register(MemorySearch(Arc::clone(&store)));
-    registry.register(MemoryRead(Arc::clone(&store)));
-    registry.register(MemoryUpdate(Arc::clone(&store)));
-    registry.register(MemoryLink(Arc::clone(&store)));
-    registry.register(MemoryTag(Arc::clone(&store)));
-    registry.register(MemoryForget(Arc::clone(&store)));
-    registry.register(MemoryLinks(Arc::clone(&store)));
-    registry.register(MemoryList(store));
-}
-
-fn error_result(call_id: &str, msg: &str) -> ToolResult {
-    ToolResult {
-        call_id: call_id.to_string(),
-        content: serde_json::json!({ "error": msg }),
-        is_error: true,
-    }
-}
-
-fn ok_result(call_id: &str, value: serde_json::Value) -> ToolResult {
-    ToolResult {
-        call_id: call_id.to_string(),
-        content: value,
-        is_error: false,
-    }
-}
-
-fn get_str<'a>(args: &'a serde_json::Value, field: &str) -> Option<&'a str> {
-    args.get(field).and_then(|v| v.as_str())
-}
-
-fn get_string_array(args: &serde_json::Value, field: &str) -> Vec<String> {
-    args.get(field)
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+    registry.register_with_group(MemoryCreate(Arc::clone(&store)), ToolGroup::Memory);
+    registry.register_with_group(MemorySearch(Arc::clone(&store)), ToolGroup::Memory);
+    registry.register_with_group(MemoryRead(Arc::clone(&store)), ToolGroup::Memory);
+    registry.register_with_group(MemoryUpdate(Arc::clone(&store)), ToolGroup::Memory);
+    registry.register_with_group(MemoryLink(Arc::clone(&store)), ToolGroup::Memory);
+    registry.register_with_group(MemoryTag(Arc::clone(&store)), ToolGroup::Memory);
+    registry.register_with_group(MemoryForget(Arc::clone(&store)), ToolGroup::Memory);
+    registry.register_with_group(MemoryLinks(Arc::clone(&store)), ToolGroup::Memory);
+    registry.register_with_group(MemoryList(store), ToolGroup::Memory);
 }
 
 // --- memory_create ---

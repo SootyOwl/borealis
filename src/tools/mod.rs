@@ -1,6 +1,8 @@
+mod computer_tools;
 mod memory_tools;
 mod web_tools;
 
+pub use computer_tools::register_computer_tools;
 pub use memory_tools::register_memory_tools;
 pub use web_tools::register_web_tools;
 

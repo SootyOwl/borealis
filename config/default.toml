@@ -87,6 +87,17 @@ refill_secs = 2
 # Tools
 # ---------------------------------------------------------------------------
 
+[tools.computer_use]
+enabled = true
+sandbox_root = "."
+memory_dir = "memory"
+command_allowlist = []          # empty = all commands allowed
+command_timeout_secs = 30
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
 [tools.web]
 enabled = true
 # jina_api_key_env = "JINA_API_KEY"   # optional, for higher rate limits

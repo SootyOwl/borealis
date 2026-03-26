@@ -440,6 +440,10 @@ pub struct SchedulerEventConfig {
     pub active_hours: Option<String>,
     /// Prompt template with {time}, {timezone}, {interval} placeholders
     pub prompt: String,
+    /// Optional list of tool groups available for this event.
+    /// When omitted, all enabled tool groups are available.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------

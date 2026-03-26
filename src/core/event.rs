@@ -1,5 +1,4 @@
 use std::fmt;
-use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -93,82 +92,9 @@ pub struct InEvent {
     pub source: ChannelSource,
     pub message: Message,
     pub context: MessageContext,
-}
-
-/// Kinds of directives a channel adapter can declare support for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DirectiveKind {
-    NoReply,
-    React,
-    Voice,
-    SendFile,
-    Send,
-}
-
-/// A file attachment classification used by the `SendFile` directive.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FileKind {
-    Image,
-    Audio,
-    Video,
-    Document,
-}
-
-impl FileKind {
-    /// Parse a `FileKind` from a string, returning `None` for unrecognised values.
-    pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "image" => Some(Self::Image),
-            "audio" => Some(Self::Audio),
-            "video" => Some(Self::Video),
-            "document" | "doc" => Some(Self::Document),
-            _ => None,
-        }
-    }
-}
-
-/// An action extracted from an LLM response's `<actions>` block.
-///
-/// Each variant maps to an XML tag the LLM can emit:
-///
-/// - `<noreply/>` — suppress the text reply for this response
-/// - `<react emoji="..." [message_id="..."]/>` — add a reaction
-/// - `<voice>text</voice>` — speak via TTS
-/// - `<sendfile path="..." kind="image|audio|video|document"/>` — attach a file
-/// - `<send channel="..." chat="...">text</send>` — route a message to a specific channel/chat
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Directive {
-    NoReply,
-    React {
-        emoji: String,
-        message_id: Option<String>,
-    },
-    Voice {
-        text: String,
-    },
-    SendFile {
-        path: PathBuf,
-        kind: FileKind,
-    },
-    Send {
-        channel: String,
-        chat: String,
-        text: String,
-    },
-}
-
-impl Directive {
-    /// Returns the [`DirectiveKind`] discriminant for this directive.
-    pub fn kind(&self) -> DirectiveKind {
-        match self {
-            Self::NoReply => DirectiveKind::NoReply,
-            Self::React { .. } => DirectiveKind::React,
-            Self::Voice { .. } => DirectiveKind::Voice,
-            Self::SendFile { .. } => DirectiveKind::SendFile,
-            Self::Send { .. } => DirectiveKind::Send,
-        }
-    }
+    /// Optional list of tool group names available for this event.
+    /// When `None`, all enabled tool groups are available.
+    pub tool_groups: Option<Vec<String>>,
 }
 
 /// An outbound event from the core to a channel adapter.
@@ -177,6 +103,5 @@ pub struct OutEvent {
     pub target: ChannelSource,
     pub channel_id: String,
     pub text: Option<String>,
-    pub directives: Vec<Directive>,
     pub reply_to: Option<MessageId>,
 }

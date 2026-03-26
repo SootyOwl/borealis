@@ -45,7 +45,7 @@ SAFE_GIT = [
     "git status", "git diff", "git log", "git show", "git branch",
     "git remote", "git fetch", "git worktree list", "git rev-parse",
     "git config", "git ls-files", "git describe", "git reflog",
-    "git cat-file", "git for-each-ref",
+    "git cat-file", "git for-each-ref", "git -C",
 ]
 
 # Check if it's a git command
@@ -54,15 +54,22 @@ if not cmd_stripped.startswith("git "):
     json.dump({"decision": "allow"}, sys.stdout)
     sys.exit(0)
 
+# Normalize: strip git -C <path> prefix to get the actual subcommand
+# e.g. "git -C /some/path log --oneline" -> "git log --oneline"
+normalized = cmd_stripped
+parts = cmd_stripped.split()
+if len(parts) >= 4 and parts[1] == "-C":
+    normalized = "git " + " ".join(parts[3:])
+
 # Allow safe commands
 for safe in SAFE_GIT:
-    if cmd_stripped.startswith(safe):
+    if normalized.startswith(safe):
         json.dump({"decision": "allow"}, sys.stdout)
         sys.exit(0)
 
 # Block dangerous commands
 for blocked, suggestion in BLOCKED.items():
-    if cmd_stripped.startswith(blocked):
+    if normalized.startswith(blocked):
         json.dump({
             "decision": "block",
             "reason": f"This is a jj repo. '{blocked}' will corrupt state. {suggestion}"
@@ -70,7 +77,7 @@ for blocked, suggestion in BLOCKED.items():
         sys.exit(0)
 
 # Allow git push (needed for remote sync)
-if cmd_stripped.startswith("git push"):
+if normalized.startswith("git push"):
     json.dump({"decision": "allow"}, sys.stdout)
     sys.exit(0)
 

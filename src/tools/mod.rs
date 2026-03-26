@@ -8,6 +8,32 @@ pub use web_tools::register_web_tools;
 
 use std::collections::HashMap;
 
+/// Identifies a functional group of tools.
+///
+/// Used for per-event tool filtering: scheduler events can restrict which
+/// tool groups are available via the `tools` config field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolGroup {
+    Memory,
+    Computer,
+    Web,
+    Channel,
+}
+
+impl ToolGroup {
+    /// Parse a tool group from a string (case-insensitive).
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "memory" => Some(Self::Memory),
+            "computer" => Some(Self::Computer),
+            "web" => Some(Self::Web),
+            "channel" => Some(Self::Channel),
+            _ => None,
+        }
+    }
+}
+
 /// Describes a tool that the LLM can call.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolDef {
@@ -51,9 +77,11 @@ pub trait Tool: Send + Sync {
     ) -> impl std::future::Future<Output = ToolResult> + Send;
 }
 
-/// Registry that maps tool names to instances.
+/// Registry that maps tool names to instances, with optional group tagging.
 pub struct ToolRegistry {
     handlers: HashMap<String, Box<dyn ErasedTool>>,
+    /// Maps tool names to their group, if registered with one.
+    groups: HashMap<String, ToolGroup>,
 }
 
 /// Object-safe wrapper around Tool to allow dynamic dispatch.
@@ -84,6 +112,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),
+            groups: HashMap::new(),
         }
     }
 
@@ -92,8 +121,29 @@ impl ToolRegistry {
             .insert(handler.name().to_string(), Box::new(handler));
     }
 
+    /// Register a tool and tag it with a group for filtering.
+    pub fn register_with_group<T: Tool + 'static>(&mut self, handler: T, group: ToolGroup) {
+        let name = handler.name().to_string();
+        self.groups.insert(name.clone(), group);
+        self.handlers.insert(name, Box::new(handler));
+    }
+
     pub fn definitions(&self) -> Vec<ToolDef> {
         self.handlers.values().map(|h| h.definition()).collect()
+    }
+
+    /// Return definitions filtered to only include tools from the specified groups.
+    /// Tools registered without a group are excluded.
+    pub fn definitions_for_groups(&self, groups: &[ToolGroup]) -> Vec<ToolDef> {
+        self.handlers
+            .iter()
+            .filter(|(name, _)| {
+                self.groups
+                    .get(name.as_str())
+                    .is_some_and(|g| groups.contains(g))
+            })
+            .map(|(_, h)| h.definition())
+            .collect()
     }
 
     pub async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {

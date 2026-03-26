@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::core::event::{DirectiveKind, InEvent, OutEvent};
+use crate::core::event::{InEvent, OutEvent};
 use crate::core::pipeline::PipelineRunner;
 
 /// A channel adapter that bridges a platform (Discord, CLI, etc.) with the core event bus.
@@ -32,9 +32,6 @@ pub trait Channel: Send + Sync {
         self: Arc<Self>,
         rx: Receiver<OutEvent>,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
-
-    /// Which directive kinds this channel supports.
-    fn supported_directives(&self) -> Vec<DirectiveKind>;
 }
 
 /// Default bounded channel capacity for per-channel mpsc channels.
@@ -129,7 +126,6 @@ impl ChannelRegistry {
                                         target: event.source.clone(),
                                         channel_id: event.context.channel_id.clone(),
                                         text: Some("I'm having trouble thinking right now, try again in a moment.".into()),
-                                        directives: vec![],
                                         reply_to: Some(event.message.id.clone()),
                                     };
                                     let _ = out_tx.send(err_event).await;
@@ -216,6 +212,7 @@ mod tests {
                     channel_id: "mock".into(),
                     reply_to: None,
                 },
+                tool_groups: None,
             };
             let _ = tx.send(event).await;
             Ok(())
@@ -224,10 +221,6 @@ mod tests {
         async fn run_outbound(self: Arc<Self>, mut rx: Receiver<OutEvent>) -> Result<()> {
             while let Some(_event) = rx.recv().await {}
             Ok(())
-        }
-
-        fn supported_directives(&self) -> Vec<DirectiveKind> {
-            vec![]
         }
     }
 
@@ -245,7 +238,6 @@ mod tests {
                     target: event.source.clone(),
                     channel_id: event.context.channel_id.clone(),
                     text: Some(format!("echo: {}", event.message.text)),
-                    directives: vec![],
                     reply_to: Some(event.message.id.clone()),
                 })
             })

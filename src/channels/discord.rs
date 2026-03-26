@@ -13,8 +13,7 @@ use crate::channels::modes::{AlwaysMode, DigestMode, MentionOnlyMode, ModeRouter
 use crate::channels::{Channel, ChannelRegistry};
 use crate::config::{DiscordChannelConfig, Settings};
 use crate::core::event::{
-    Author, ChannelSource, ConversationId, Directive, DirectiveKind, InEvent, Message,
-    MessageContext, MessageId, OutEvent,
+    Author, ChannelSource, ConversationId, InEvent, Message, MessageContext, MessageId, OutEvent,
 };
 use crate::core::pipeline::PipelineRunner;
 
@@ -145,6 +144,7 @@ fn serenity_message_to_in_event(msg: &serenity::Message, bot_user_id: serenity::
                 .as_ref()
                 .map(|m| MessageId(m.id.to_string())),
         },
+        tool_groups: None,
     }
 }
 
@@ -290,65 +290,18 @@ impl Channel for DiscordAdapter {
 
             let channel = serenity::ChannelId::new(channel_id);
 
-            // Send text response
+            // Send text response (empty text = no reply, per REQ-11 convention)
             if let Some(text) = &event.text {
-                // Truncate to Discord's 2000 char limit
-                let text = if text.len() > 1997 {
-                    format!("{}...", &text[..1997])
-                } else {
-                    text.clone()
-                };
+                if !text.is_empty() {
+                    // Truncate to Discord's 2000 char limit
+                    let text = if text.len() > 1997 {
+                        format!("{}...", &text[..1997])
+                    } else {
+                        text.clone()
+                    };
 
-                if let Err(e) = channel.say(&http, &text).await {
-                    error!(error = %e, "failed to send Discord message");
-                }
-            }
-
-            // Handle directives
-            for directive in &event.directives {
-                match directive {
-                    Directive::NoReply => {
-                        debug!("Discord: NoReply directive");
-                    }
-                    Directive::React { emoji, message_id } => {
-                        if let Some(msg_id) = message_id
-                            .as_ref()
-                            .and_then(|id| id.parse::<u64>().ok())
-                            .or_else(|| event.reply_to.as_ref()?.0.parse::<u64>().ok())
-                        {
-                            let reaction = serenity::ReactionType::Unicode(emoji.clone());
-                            if let Err(e) = http
-                                .create_reaction(channel_id.into(), msg_id.into(), &reaction)
-                                .await
-                            {
-                                warn!(error = %e, emoji, "failed to add reaction");
-                            }
-                        } else {
-                            debug!(
-                                emoji,
-                                "React directive without target message ID — skipping"
-                            );
-                        }
-                    }
-                    Directive::Send {
-                        channel: target_channel,
-                        text,
-                        ..
-                    } => {
-                        if let Ok(target_id) = target_channel.parse::<u64>() {
-                            let target = serenity::ChannelId::new(target_id);
-                            if let Err(e) = target.say(&http, text).await {
-                                error!(error = %e, target = target_channel, "failed to send cross-channel message");
-                            }
-                        } else {
-                            warn!(
-                                target = target_channel,
-                                "Send directive with non-numeric channel — skipping"
-                            );
-                        }
-                    }
-                    Directive::Voice { .. } | Directive::SendFile { .. } => {
-                        debug!(directive = ?directive, "unsupported Discord directive — skipping");
+                    if let Err(e) = channel.say(&http, &text).await {
+                        error!(error = %e, "failed to send Discord message");
                     }
                 }
             }
@@ -356,13 +309,5 @@ impl Channel for DiscordAdapter {
 
         info!("Discord adapter outbound finished");
         Ok(())
-    }
-
-    fn supported_directives(&self) -> Vec<DirectiveKind> {
-        vec![
-            DirectiveKind::NoReply,
-            DirectiveKind::React,
-            DirectiveKind::Send,
-        ]
     }
 }

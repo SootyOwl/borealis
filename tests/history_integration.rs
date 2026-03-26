@@ -45,8 +45,8 @@ fn build_turns(store: &HistoryStore, conv_id: &ConversationId) -> Vec<Turn> {
 #[test]
 fn full_flow_store_and_assemble() {
     let store = setup();
-    let conv_id = ConversationId::DM {
-        channel_type: "cli".into(),
+    let conv_id = ConversationId::Dm {
+        channel_type: ChannelSource::Cli,
         user_id: "alice".into(),
     };
     store
@@ -109,8 +109,8 @@ fn full_flow_store_and_assemble() {
 #[test]
 fn eviction_preserves_turn_integrity() {
     let store = setup();
-    let conv_id = ConversationId::DM {
-        channel_type: "cli".into(),
+    let conv_id = ConversationId::Dm {
+        channel_type: ChannelSource::Cli,
         user_id: "bob".into(),
     };
     store
@@ -182,7 +182,7 @@ fn eviction_preserves_turn_integrity() {
     for msg in &result.included[0].messages {
         assert_ne!(msg.role, Role::Tool, "no orphaned tool results");
         assert!(
-            msg.tool_calls.is_none(),
+            msg.tool_calls.is_empty(),
             "no orphaned tool_calls in included turns"
         );
     }
@@ -199,8 +199,8 @@ fn eviction_preserves_turn_integrity() {
 #[test]
 fn four_hundred_recovery_drops_to_minimal() {
     let store = setup();
-    let conv_id = ConversationId::DM {
-        channel_type: "cli".into(),
+    let conv_id = ConversationId::Dm {
+        channel_type: ChannelSource::Cli,
         user_id: "carol".into(),
     };
     store
@@ -258,8 +258,8 @@ fn four_hundred_recovery_drops_to_minimal() {
 #[test]
 fn delete_oldest_turns_from_store() {
     let store = setup();
-    let conv_id = ConversationId::DM {
-        channel_type: "cli".into(),
+    let conv_id = ConversationId::Dm {
+        channel_type: ChannelSource::Cli,
         user_id: "dave".into(),
     };
     store
@@ -312,8 +312,8 @@ async fn async_store_operations() {
     schema::initialize(&conn).unwrap();
     let store = Arc::new(HistoryStore::new(Arc::new(Mutex::new(conn))));
 
-    let conv_id = ConversationId::DM {
-        channel_type: "cli".into(),
+    let conv_id = ConversationId::Dm {
+        channel_type: ChannelSource::Cli,
         user_id: "dev".into(),
     };
 

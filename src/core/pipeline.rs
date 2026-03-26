@@ -14,10 +14,10 @@ use crate::history::budget::{ContextBudget, Turn};
 use crate::history::compaction::{CompactionService, CompactionState};
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
-use crate::providers::{Provider, RequestConfig, ToolDef as ProviderToolDef};
+use crate::providers::{Provider, RequestConfig};
 use crate::security::{AuthorizationResult, Security};
-use crate::tools::{ToolContext, ToolRegistry};
-use crate::types::{self, estimate_tokens};
+use crate::tools::{ToolContext, ToolRegistry, ToolResult};
+use crate::types::{ChatMessage, ConversationId, ConversationMode, estimate_tokens};
 
 /// Maximum number of tool-call → LLM round-trips before we stop looping.
 const MAX_TOOL_ITERATIONS: usize = 10;
@@ -158,11 +158,11 @@ impl<P: Provider + 'static> Pipeline<P> {
         // Observer: message received
         self.observers.notify_message_received(event);
 
-        let conv_id = event_conv_id_to_types(&event.context.conversation_id);
+        let conv_id = event.context.conversation_id.clone();
 
         // Ensure conversation exists in the store.
         self.history_store
-            .ensure_conversation(&conv_id, types::ConversationMode::Shared)
+            .ensure_conversation(&conv_id, ConversationMode::Shared)
             .context("failed to ensure conversation")?;
 
         // Build the user message and persist it.
@@ -170,7 +170,7 @@ impl<P: Provider + 'static> Pipeline<P> {
             "{}: {}",
             event.message.author.display_name, event.message.text
         );
-        let user_msg = types::ChatMessage::user(&user_text);
+        let user_msg = ChatMessage::user(&user_text);
         let turn_id = self
             .history_store
             .append_message(&conv_id, &user_msg, None)
@@ -232,14 +232,11 @@ impl<P: Provider + 'static> Pipeline<P> {
             event.source, event.context.conversation_id
         );
 
-        // Convert assembled messages to provider format and inject channel context.
-        let mut provider_messages = types_to_provider_messages(&assembled);
+        // Inject channel context into first message (types are now unified, no conversion needed).
+        let mut provider_messages = assembled;
         if let Some(first) = provider_messages.first_mut() {
             first.content.push_str(&channel_context);
         }
-
-        // Convert tool definitions to provider format.
-        let provider_tools = tool_defs_to_provider(&tool_defs);
 
         let config = RequestConfig {
             temperature: self.pipeline_config.temperature.map(|t| t as f32),
@@ -261,12 +258,12 @@ impl<P: Provider + 'static> Pipeline<P> {
 
             // Observer: LLM request
             self.observers
-                .notify_llm_request(&provider_messages, &provider_tools);
+                .notify_llm_request(&provider_messages, &tool_defs);
 
             let llm_start = Instant::now();
             let response = self
                 .provider
-                .chat(provider_messages.clone(), &provider_tools, &config)
+                .chat(provider_messages.clone(), &tool_defs, &config)
                 .await;
             let llm_duration = llm_start.elapsed();
 
@@ -303,31 +300,17 @@ impl<P: Provider + 'static> Pipeline<P> {
 
             // Append assistant message with tool calls to history and provider messages.
             let assistant_text = response.text.clone().unwrap_or_default();
-            let tool_calls_for_history: Vec<types::ToolCall> = response
-                .tool_calls
-                .iter()
-                .map(|tc| types::ToolCall {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    arguments: tc.arguments.clone(),
-                })
-                .collect();
 
-            let assistant_msg = types::ChatMessage::assistant_with_tool_calls(
+            let assistant_msg = ChatMessage::assistant_with_tool_calls(
                 &assistant_text,
-                tool_calls_for_history,
+                response.tool_calls.clone(),
             );
             self.history_store
                 .append_message(&conv_id, &assistant_msg, Some(&turn_id))
                 .context("failed to append assistant tool-call message")?;
 
-            // Add assistant message to provider messages.
-            provider_messages.push(crate::providers::ChatMessage {
-                role: crate::providers::Role::Assistant,
-                content: assistant_text,
-                tool_call_id: None,
-                tool_calls: response.tool_calls.clone(),
-            });
+            // Add assistant message to provider messages (same type now).
+            provider_messages.push(assistant_msg);
 
             // Execute each tool call and collect results.
             let tool_ctx = ToolContext {
@@ -337,14 +320,8 @@ impl<P: Provider + 'static> Pipeline<P> {
             };
 
             for tc in &response.tool_calls {
-                let tools_call = crate::tools::ToolCall {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    arguments: tc.arguments.clone(),
-                };
-
                 // Observer: tool call
-                self.observers.notify_tool_call(&tools_call, &tool_ctx);
+                self.observers.notify_tool_call(tc, &tool_ctx);
 
                 // Security: check authorization (system events bypass)
                 if !is_system_event {
@@ -355,7 +332,7 @@ impl<P: Provider + 'static> Pipeline<P> {
                         .security
                         .check_authorization(&tc.name, &event.message.author.id)
                     {
-                        let denied_result = crate::tools::ToolResult {
+                        let denied_result = ToolResult {
                             call_id: tc.id.clone(),
                             content: serde_json::json!({
                                 "error": format!(
@@ -370,50 +347,39 @@ impl<P: Provider + 'static> Pipeline<P> {
 
                         // Observer: tool result (authorization denied)
                         self.observers.notify_tool_result(
-                            &tools_call,
+                            tc,
                             &denied_result,
                             std::time::Duration::ZERO,
                         );
 
-                        let tool_msg =
-                            types::ChatMessage::tool_result(&tc.id, &result_content);
+                        let tool_msg = ChatMessage::tool_result(&tc.id, &result_content);
                         self.history_store
                             .append_message(&conv_id, &tool_msg, Some(&turn_id))
                             .context("failed to append tool result")?;
 
-                        provider_messages.push(crate::providers::ChatMessage {
-                            role: crate::providers::Role::Tool,
-                            content: result_content,
-                            tool_call_id: Some(tc.id.clone()),
-                            tool_calls: vec![],
-                        });
+                        provider_messages.push(tool_msg);
                         continue;
                     }
                 }
 
                 let tool_start = Instant::now();
-                let result = self.tool_registry.execute(&tools_call, &tool_ctx).await;
+                let result = self.tool_registry.execute(tc, &tool_ctx).await;
                 let tool_duration = tool_start.elapsed();
 
                 // Observer: tool result
                 self.observers
-                    .notify_tool_result(&tools_call, &result, tool_duration);
+                    .notify_tool_result(tc, &result, tool_duration);
 
                 let result_content = serde_json::to_string(&result.content).unwrap_or_default();
 
                 // Persist tool result to history.
-                let tool_msg = types::ChatMessage::tool_result(&tc.id, &result_content);
+                let tool_msg = ChatMessage::tool_result(&tc.id, &result_content);
                 self.history_store
                     .append_message(&conv_id, &tool_msg, Some(&turn_id))
                     .context("failed to append tool result")?;
 
                 // Add to provider messages.
-                provider_messages.push(crate::providers::ChatMessage {
-                    role: crate::providers::Role::Tool,
-                    content: result_content,
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_calls: vec![],
-                });
+                provider_messages.push(tool_msg);
             }
 
             iterations += 1;
@@ -422,7 +388,7 @@ impl<P: Provider + 'static> Pipeline<P> {
         // Persist the final assistant response to history.
         let response_text = response.text.clone().unwrap_or_default();
         if !response_text.is_empty() {
-            let final_msg = types::ChatMessage::assistant(&response_text);
+            let final_msg = ChatMessage::assistant(&response_text);
             self.history_store
                 .append_message(&conv_id, &final_msg, Some(&turn_id))
                 .context("failed to append final assistant message")?;
@@ -441,7 +407,7 @@ impl<P: Provider + 'static> Pipeline<P> {
     }
 
     /// Load conversation history as turns, incorporating any compaction summary.
-    fn load_history_turns(&self, conv_id: &types::ConversationId) -> Result<(Vec<Turn>, usize)> {
+    fn load_history_turns(&self, conv_id: &ConversationId) -> Result<(Vec<Turn>, usize)> {
         let summary = self.history_store.load_summary(conv_id)?;
 
         let messages = match &summary {
@@ -459,7 +425,7 @@ impl<P: Provider + 'static> Pipeline<P> {
         if let Some(ref s) = summary {
             turns.push(Turn {
                 turn_id: "__summary__".to_string(),
-                messages: vec![types::ChatMessage::system(format!(
+                messages: vec![ChatMessage::system(format!(
                     "## Conversation Summary\n\n{}",
                     s.summary_text
                 ))],
@@ -470,7 +436,7 @@ impl<P: Provider + 'static> Pipeline<P> {
 
         // Group messages by turn_id.
         let mut current_turn_id: Option<String> = None;
-        let mut current_messages: Vec<types::ChatMessage> = Vec::new();
+        let mut current_messages: Vec<ChatMessage> = Vec::new();
         let mut current_tokens: usize = 0;
 
         for stored in &messages {
@@ -552,83 +518,6 @@ fn default_compaction_prompt() -> String {
         .to_string()
 }
 
-// ---------------------------------------------------------------------------
-// Type conversion helpers
-// ---------------------------------------------------------------------------
-
-/// Convert event-system ConversationId to the types-system ConversationId
-/// used by the history store.
-fn event_conv_id_to_types(event_id: &crate::core::event::ConversationId) -> types::ConversationId {
-    match event_id {
-        crate::core::event::ConversationId::Dm {
-            channel_type,
-            user_id,
-        } => types::ConversationId::DM {
-            channel_type: channel_type.to_string(),
-            user_id: user_id.clone(),
-        },
-        crate::core::event::ConversationId::Group {
-            channel_type,
-            group_id,
-        } => types::ConversationId::Group {
-            channel_type: channel_type.to_string(),
-            group_id: group_id.clone(),
-        },
-        crate::core::event::ConversationId::System { event_name } => {
-            types::ConversationId::System {
-                event_name: event_name.clone(),
-            }
-        }
-    }
-}
-
-/// Convert `types::ChatMessage` list to `providers::ChatMessage` list.
-fn types_to_provider_messages(
-    messages: &[types::ChatMessage],
-) -> Vec<crate::providers::ChatMessage> {
-    messages
-        .iter()
-        .map(|m| crate::providers::ChatMessage {
-            role: types_role_to_provider(&m.role),
-            content: m.content.clone(),
-            tool_call_id: m.tool_call_id.clone(),
-            tool_calls: m
-                .tool_calls
-                .as_ref()
-                .map(|tcs| {
-                    tcs.iter()
-                        .map(|tc| crate::providers::ToolCall {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            arguments: tc.arguments.clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        })
-        .collect()
-}
-
-fn types_role_to_provider(role: &types::Role) -> crate::providers::Role {
-    match role {
-        types::Role::User => crate::providers::Role::User,
-        types::Role::Assistant => crate::providers::Role::Assistant,
-        types::Role::Tool => crate::providers::Role::Tool,
-        types::Role::System => crate::providers::Role::System,
-    }
-}
-
-/// Convert internal `tools::ToolDef` to `providers::ToolDef`.
-fn tool_defs_to_provider(defs: &[crate::tools::ToolDef]) -> Vec<ProviderToolDef> {
-    defs.iter()
-        .map(|d| ProviderToolDef {
-            name: d.name.clone(),
-            description: d.description.clone(),
-            parameters: d.parameters.clone(),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +526,7 @@ mod tests {
     };
     use crate::core::observer::ObserverRegistry;
     use crate::providers::{LlmResponse, TokenUsage};
+    use crate::tools::{ToolCall, ToolDef};
     use crate::security::Security;
     use std::sync::Mutex;
 
@@ -660,8 +550,8 @@ mod tests {
 
         async fn chat(
             &self,
-            _messages: Vec<crate::providers::ChatMessage>,
-            _tools: &[crate::providers::ToolDef],
+            _messages: Vec<ChatMessage>,
+            _tools: &[ToolDef],
             _config: &crate::providers::RequestConfig,
         ) -> anyhow::Result<LlmResponse> {
             let mut responses = self.responses.lock().unwrap();
@@ -766,7 +656,7 @@ mod tests {
         let responses = vec![
             LlmResponse {
                 text: Some("Let me run that.".into()),
-                tool_calls: vec![crate::providers::ToolCall {
+                tool_calls: vec![ToolCall {
                     id: "tc_1".into(),
                     name: "bash_exec".into(),
                     arguments: serde_json::json!({"command": "echo hi"}),
@@ -803,7 +693,7 @@ mod tests {
         let responses = vec![
             LlmResponse {
                 text: Some("Running.".into()),
-                tool_calls: vec![crate::providers::ToolCall {
+                tool_calls: vec![ToolCall {
                     id: "tc_1".into(),
                     name: "bash_exec".into(),
                     arguments: serde_json::json!({"command": "echo hi"}),
@@ -838,7 +728,7 @@ mod tests {
         let responses = vec![
             LlmResponse {
                 text: Some("System task.".into()),
-                tool_calls: vec![crate::providers::ToolCall {
+                tool_calls: vec![ToolCall {
                     id: "tc_1".into(),
                     name: "bash_exec".into(),
                     arguments: serde_json::json!({"command": "echo hi"}),

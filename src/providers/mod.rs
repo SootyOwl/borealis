@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::pipeline::{PipelineDeps, PipelineRunner};
 
+// Re-export unified types so provider implementations can keep using
+// `use super::{ChatMessage, Role, ToolCall, ToolDef, ToolResult, ...}`.
+pub use crate::tools::{ToolCall, ToolDef, ToolResult};
+pub use crate::types::{ChatMessage, Role};
+
 /// A self-registering provider factory.
 ///
 /// Each provider module submits one of these via `inventory::submit!`. The
@@ -29,53 +34,6 @@ pub struct ProviderRegistration {
 }
 
 inventory::collect!(ProviderRegistration);
-
-/// Role in a conversation message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-/// A message in a conversation, used as input to the provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: Role,
-    pub content: String,
-    /// Tool call ID this message is responding to (for Role::Tool messages).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    /// Tool calls made by the assistant in this message.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub tool_calls: Vec<ToolCall>,
-}
-
-/// Describes a tool the LLM can call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolDef {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-}
-
-/// A tool call returned by the LLM.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
-}
-
-/// Result of executing a tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResult {
-    pub call_id: String,
-    pub content: serde_json::Value,
-    pub is_error: bool,
-}
 
 /// Token usage reported by the provider.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

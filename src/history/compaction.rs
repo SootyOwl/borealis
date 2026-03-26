@@ -4,10 +4,8 @@ use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
 use crate::config::CompactionConfig;
-use crate::providers::{
-    ChatMessage as ProviderMessage, Provider, RequestConfig, Role as ProviderRole,
-};
-use crate::types::ConversationId;
+use crate::providers::{Provider, RequestConfig};
+use crate::types::{ChatMessage, ConversationId};
 
 use super::store::{CompactionSummary, HistoryStore, StoredMessage};
 
@@ -195,18 +193,8 @@ async fn run_compaction<P: Provider>(
 
     // Call the provider
     let provider_messages = vec![
-        ProviderMessage {
-            role: ProviderRole::System,
-            content: compaction_prompt.to_string(),
-            tool_call_id: None,
-            tool_calls: vec![],
-        },
-        ProviderMessage {
-            role: ProviderRole::User,
-            content: user_content,
-            tool_call_id: None,
-            tool_calls: vec![],
-        },
+        ChatMessage::system(compaction_prompt),
+        ChatMessage::user(user_content),
     ];
 
     let request_config = RequestConfig {
@@ -279,8 +267,8 @@ fn build_summarization_input(
 mod tests {
     use super::*;
     use crate::history::schema;
-    use crate::providers::{LlmResponse, TokenUsage, ToolDef};
-    use crate::types::{ChatMessage, ConversationMode};
+    use crate::providers::{LlmResponse, TokenUsage};
+    use crate::types::{ChannelSource, ConversationMode, ToolDef};
     use anyhow::Result;
     use rusqlite::Connection;
     use std::sync::Mutex;
@@ -292,8 +280,8 @@ mod tests {
     }
 
     fn test_conv_id() -> ConversationId {
-        ConversationId::DM {
-            channel_type: "test".to_string(),
+        ConversationId::Dm {
+            channel_type: ChannelSource::Cli,
             user_id: "user1".to_string(),
         }
     }
@@ -318,7 +306,7 @@ mod tests {
 
         async fn chat(
             &self,
-            _messages: Vec<ProviderMessage>,
+            _messages: Vec<ChatMessage>,
             _tools: &[ToolDef],
             _config: &RequestConfig,
         ) -> Result<LlmResponse> {
@@ -339,7 +327,7 @@ mod tests {
     #[test]
     fn compaction_state_try_start_and_finish() {
         let state = CompactionState::new();
-        let key = "dm:test:user1";
+        let key = "dm:cli:user1";
 
         assert!(!state.is_compacting(key));
         assert!(state.try_start(key));
@@ -503,7 +491,7 @@ mod tests {
                 role: crate::types::Role::User,
                 content: "Hello there".into(),
                 tool_call_id: None,
-                tool_calls: None,
+                tool_calls: vec![],
                 token_estimate: 5,
                 created_at: "2026-01-01T00:00:00Z".into(),
             },
@@ -515,7 +503,7 @@ mod tests {
                 role: crate::types::Role::Assistant,
                 content: "Hi! How can I help?".into(),
                 tool_call_id: None,
-                tool_calls: None,
+                tool_calls: vec![],
                 token_estimate: 8,
                 created_at: "2026-01-01T00:00:01Z".into(),
             },
@@ -545,7 +533,7 @@ mod tests {
             role: crate::types::Role::User,
             content: "What about lifetimes?".into(),
             tool_call_id: None,
-            tool_calls: None,
+            tool_calls: vec![],
             token_estimate: 5,
             created_at: "2026-01-01T00:01:00Z".into(),
         }];

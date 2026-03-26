@@ -1,7 +1,23 @@
 use std::fmt;
+use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error, PartialEq)]
+pub enum ConversationIdError {
+    #[error("invalid conversation id format: {0}")]
+    InvalidFormat(String),
+}
+
+// ---------------------------------------------------------------------------
+// ChannelSource
+// ---------------------------------------------------------------------------
 
 /// Identifies the source/target channel type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -10,6 +26,8 @@ pub enum ChannelSource {
     Discord,
     Cli,
     Scheduler,
+    /// Legacy channel source for imported Letta/MemGPT conversations.
+    Letta,
 }
 
 impl fmt::Display for ChannelSource {
@@ -18,9 +36,30 @@ impl fmt::Display for ChannelSource {
             Self::Discord => write!(f, "discord"),
             Self::Cli => write!(f, "cli"),
             Self::Scheduler => write!(f, "scheduler"),
+            Self::Letta => write!(f, "letta"),
         }
     }
 }
+
+impl FromStr for ChannelSource {
+    type Err = ConversationIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "discord" => Ok(Self::Discord),
+            "cli" => Ok(Self::Cli),
+            "scheduler" => Ok(Self::Scheduler),
+            "letta" => Ok(Self::Letta),
+            other => Err(ConversationIdError::InvalidFormat(format!(
+                "unknown channel source: {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConversationId
+// ---------------------------------------------------------------------------
 
 /// Identifies a conversation for routing and history storage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,6 +75,32 @@ pub enum ConversationId {
     System {
         event_name: String,
     },
+}
+
+impl ConversationId {
+    /// Parse from the canonical string representation.
+    ///
+    /// Formats:
+    /// - `dm:<channel_source>:<user_id>`
+    /// - `group:<channel_source>:<group_id>`
+    /// - `system:<event_name>`
+    pub fn parse(s: &str) -> Result<Self, ConversationIdError> {
+        let parts: Vec<&str> = s.splitn(3, ':').collect();
+        match parts.as_slice() {
+            ["dm", channel_type, user_id] => Ok(ConversationId::Dm {
+                channel_type: ChannelSource::from_str(channel_type)?,
+                user_id: user_id.to_string(),
+            }),
+            ["group", channel_type, group_id] => Ok(ConversationId::Group {
+                channel_type: ChannelSource::from_str(channel_type)?,
+                group_id: group_id.to_string(),
+            }),
+            ["system", event_name] => Ok(ConversationId::System {
+                event_name: event_name.to_string(),
+            }),
+            _ => Err(ConversationIdError::InvalidFormat(s.to_string())),
+        }
+    }
 }
 
 impl fmt::Display for ConversationId {

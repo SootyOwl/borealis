@@ -9,6 +9,8 @@ use crate::types::{
     ChatMessage, ConversationId, ConversationIdError, ConversationMode, ParseError, Role, ToolCall,
     estimate_tokens,
 };
+#[cfg(test)]
+use crate::types::ChannelSource;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -51,7 +53,7 @@ pub struct StoredMessage {
     pub role: Role,
     pub content: String,
     pub tool_call_id: Option<String>,
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Vec<ToolCall>,
     pub token_estimate: usize,
     pub created_at: String,
 }
@@ -61,8 +63,8 @@ impl StoredMessage {
         ChatMessage {
             role: self.role.clone(),
             content: self.content.clone(),
-            tool_calls: self.tool_calls.clone(),
             tool_call_id: self.tool_call_id.clone(),
+            tool_calls: self.tool_calls.clone(),
         }
     }
 }
@@ -151,11 +153,13 @@ impl HistoryStore {
             None => Uuid::new_v4().to_string(),
         };
 
-        let tool_calls_json: Option<String> = match &message.tool_calls {
-            Some(tc) => Some(
-                serde_json::to_string(tc).map_err(|e| StoreError::InvalidData(e.to_string()))?,
-            ),
-            None => None,
+        let tool_calls_json: Option<String> = if message.tool_calls.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&message.tool_calls)
+                    .map_err(|e| StoreError::InvalidData(e.to_string()))?,
+            )
         };
 
         // Token estimate covers content + serialised tool calls (if any).
@@ -256,12 +260,10 @@ impl HistoryStore {
 
             let role = Role::from_str(&role_str)?;
 
-            let tool_calls: Option<Vec<ToolCall>> = match tool_calls_json {
-                None => None,
-                Some(json) => Some(
-                    serde_json::from_str(&json)
-                        .map_err(|e| StoreError::InvalidData(e.to_string()))?,
-                ),
+            let tool_calls: Vec<ToolCall> = match tool_calls_json {
+                None => vec![],
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|e| StoreError::InvalidData(e.to_string()))?,
             };
 
             messages.push(StoredMessage {
@@ -539,12 +541,10 @@ impl HistoryStore {
 
             let role = Role::from_str(&role_str)?;
 
-            let tool_calls: Option<Vec<ToolCall>> = match tool_calls_json {
-                None => None,
-                Some(json) => Some(
-                    serde_json::from_str(&json)
-                        .map_err(|e| StoreError::InvalidData(e.to_string()))?,
-                ),
+            let tool_calls: Vec<ToolCall> = match tool_calls_json {
+                None => vec![],
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|e| StoreError::InvalidData(e.to_string()))?,
             };
 
             messages.push(StoredMessage {
@@ -770,8 +770,8 @@ mod tests {
     }
 
     fn test_conv_id() -> ConversationId {
-        ConversationId::DM {
-            channel_type: "slack".to_string(),
+        ConversationId::Dm {
+            channel_type: ChannelSource::Cli,
             user_id: "U001".to_string(),
         }
     }
@@ -857,7 +857,7 @@ mod tests {
         assert_eq!(stored.content, "Hello, Borealis!");
         assert_eq!(stored.turn_id, turn_id);
         assert!(stored.tool_call_id.is_none());
-        assert!(stored.tool_calls.is_none());
+        assert!(stored.tool_calls.is_empty());
     }
 
     #[test]

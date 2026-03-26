@@ -1,86 +1,20 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::str::FromStr;
 use thiserror::Error;
+
+// Re-export canonical types from their home modules.
+pub use crate::core::event::{ChannelSource, ConversationId, ConversationIdError};
+pub use crate::tools::{ToolCall, ToolDef, ToolResult};
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Error, PartialEq)]
-pub enum ConversationIdError {
-    #[error("invalid conversation id format: {0}")]
-    InvalidFormat(String),
-}
-
-/// General parse error used for types other than ConversationId.
+/// General parse error used for types like Role, ConversationMode.
 #[derive(Debug, Error, PartialEq)]
 pub enum ParseError {
     #[error("unknown value: {0}")]
     UnknownValue(String),
-}
-
-// ---------------------------------------------------------------------------
-// ConversationId
-// ---------------------------------------------------------------------------
-
-/// Identifies a conversation by its context type.
-///
-/// String formats:
-/// - `dm:<channel_type>:<user_id>`
-/// - `group:<channel_type>:<group_id>`
-/// - `system:<event_name>`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum ConversationId {
-    DM {
-        channel_type: String,
-        user_id: String,
-    },
-    Group {
-        channel_type: String,
-        group_id: String,
-    },
-    System {
-        event_name: String,
-    },
-}
-
-impl ConversationId {
-    /// Parse from the canonical string representation.
-    pub fn parse(s: &str) -> Result<Self, ConversationIdError> {
-        let parts: Vec<&str> = s.splitn(3, ':').collect();
-        match parts.as_slice() {
-            ["dm", channel_type, user_id] => Ok(ConversationId::DM {
-                channel_type: channel_type.to_string(),
-                user_id: user_id.to_string(),
-            }),
-            ["group", channel_type, group_id] => Ok(ConversationId::Group {
-                channel_type: channel_type.to_string(),
-                group_id: group_id.to_string(),
-            }),
-            ["system", event_name] => Ok(ConversationId::System {
-                event_name: event_name.to_string(),
-            }),
-            _ => Err(ConversationIdError::InvalidFormat(s.to_string())),
-        }
-    }
-}
-
-impl std::fmt::Display for ConversationId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConversationId::DM {
-                channel_type,
-                user_id,
-            } => write!(f, "dm:{channel_type}:{user_id}"),
-            ConversationId::Group {
-                channel_type,
-                group_id,
-            } => write!(f, "group:{channel_type}:{group_id}"),
-            ConversationId::System { event_name } => write!(f, "system:{event_name}"),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,17 +62,6 @@ impl FromStr for Role {
 }
 
 // ---------------------------------------------------------------------------
-// ToolCall
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: Value,
-}
-
-// ---------------------------------------------------------------------------
 // ChatMessage
 // ---------------------------------------------------------------------------
 
@@ -146,8 +69,12 @@ pub struct ToolCall {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
-    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Tool call ID this message is responding to (for Role::Tool messages).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Tool calls made by the assistant in this message.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl ChatMessage {
@@ -155,7 +82,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: content.into(),
-            tool_calls: None,
+            tool_calls: vec![],
             tool_call_id: None,
         }
     }
@@ -164,7 +91,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
-            tool_calls: None,
+            tool_calls: vec![],
             tool_call_id: None,
         }
     }
@@ -176,7 +103,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
-            tool_calls: Some(tool_calls),
+            tool_calls,
             tool_call_id: None,
         }
     }
@@ -185,7 +112,7 @@ impl ChatMessage {
         Self {
             role: Role::Tool,
             content: content.into(),
-            tool_calls: None,
+            tool_calls: vec![],
             tool_call_id: Some(tool_call_id.into()),
         }
     }
@@ -194,7 +121,7 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: content.into(),
-            tool_calls: None,
+            tool_calls: vec![],
             tool_call_id: None,
         }
     }
@@ -255,85 +182,6 @@ pub fn estimate_tokens(text: &str) -> usize {
 mod tests {
     use super::*;
 
-    // --- ConversationId serialization ---
-
-    #[test]
-    fn conversation_id_dm_to_string() {
-        let id = ConversationId::DM {
-            channel_type: "slack".to_string(),
-            user_id: "U12345".to_string(),
-        };
-        assert_eq!(id.to_string(), "dm:slack:U12345");
-    }
-
-    #[test]
-    fn conversation_id_group_to_string() {
-        let id = ConversationId::Group {
-            channel_type: "slack".to_string(),
-            group_id: "G99999".to_string(),
-        };
-        assert_eq!(id.to_string(), "group:slack:G99999");
-    }
-
-    #[test]
-    fn conversation_id_system_to_string() {
-        let id = ConversationId::System {
-            event_name: "startup".to_string(),
-        };
-        assert_eq!(id.to_string(), "system:startup");
-    }
-
-    // --- ConversationId roundtrip ---
-
-    #[test]
-    fn conversation_id_dm_roundtrip() {
-        let id = ConversationId::DM {
-            channel_type: "matrix".to_string(),
-            user_id: "alice".to_string(),
-        };
-        assert_eq!(ConversationId::parse(&id.to_string()).unwrap(), id);
-    }
-
-    #[test]
-    fn conversation_id_group_roundtrip() {
-        let id = ConversationId::Group {
-            channel_type: "matrix".to_string(),
-            group_id: "room-42".to_string(),
-        };
-        assert_eq!(ConversationId::parse(&id.to_string()).unwrap(), id);
-    }
-
-    #[test]
-    fn conversation_id_system_roundtrip() {
-        let id = ConversationId::System {
-            event_name: "heartbeat".to_string(),
-        };
-        assert_eq!(ConversationId::parse(&id.to_string()).unwrap(), id);
-    }
-
-    // --- ConversationId rejects invalid input ---
-
-    #[test]
-    fn conversation_id_parse_rejects_empty() {
-        assert!(ConversationId::parse("").is_err());
-    }
-
-    #[test]
-    fn conversation_id_parse_rejects_unknown_prefix() {
-        assert!(ConversationId::parse("channel:foo:bar").is_err());
-    }
-
-    #[test]
-    fn conversation_id_parse_rejects_dm_missing_user_id() {
-        // "dm:slack" has only 2 parts when split on ':' with no third segment
-        assert!(ConversationId::parse("dm:slack").is_err());
-    }
-
-    #[test]
-    fn conversation_id_parse_rejects_system_missing_event() {
-        assert!(ConversationId::parse("system").is_err());
-    }
-
     // --- ChatMessage constructors ---
 
     #[test]
@@ -341,7 +189,7 @@ mod tests {
         let msg = ChatMessage::user("hello");
         assert_eq!(msg.role, Role::User);
         assert_eq!(msg.content, "hello");
-        assert!(msg.tool_calls.is_none());
+        assert!(msg.tool_calls.is_empty());
         assert!(msg.tool_call_id.is_none());
     }
 
@@ -350,7 +198,7 @@ mod tests {
         let msg = ChatMessage::assistant("hi there");
         assert_eq!(msg.role, Role::Assistant);
         assert_eq!(msg.content, "hi there");
-        assert!(msg.tool_calls.is_none());
+        assert!(msg.tool_calls.is_empty());
         assert!(msg.tool_call_id.is_none());
     }
 
@@ -363,8 +211,8 @@ mod tests {
         };
         let msg = ChatMessage::assistant_with_tool_calls("thinking", vec![tc.clone()]);
         assert_eq!(msg.role, Role::Assistant);
-        assert_eq!(msg.tool_calls.as_ref().unwrap().len(), 1);
-        assert_eq!(msg.tool_calls.unwrap()[0], tc);
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0], tc);
         assert!(msg.tool_call_id.is_none());
     }
 
@@ -374,7 +222,7 @@ mod tests {
         assert_eq!(msg.role, Role::Tool);
         assert_eq!(msg.content, "result content");
         assert_eq!(msg.tool_call_id.as_deref(), Some("call_1"));
-        assert!(msg.tool_calls.is_none());
+        assert!(msg.tool_calls.is_empty());
     }
 
     #[test]
@@ -382,7 +230,7 @@ mod tests {
         let msg = ChatMessage::system("you are a helpful assistant");
         assert_eq!(msg.role, Role::System);
         assert_eq!(msg.content, "you are a helpful assistant");
-        assert!(msg.tool_calls.is_none());
+        assert!(msg.tool_calls.is_empty());
         assert!(msg.tool_call_id.is_none());
     }
 

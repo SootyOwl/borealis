@@ -114,7 +114,7 @@ impl ToolGroup {
 }
 
 /// Describes a tool that the LLM can call.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
@@ -122,7 +122,7 @@ pub struct ToolDef {
 }
 
 /// A tool call from the LLM.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -130,7 +130,7 @@ pub struct ToolCall {
 }
 
 /// Result of executing a tool.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolResult {
     pub call_id: String,
     pub content: serde_json::Value,

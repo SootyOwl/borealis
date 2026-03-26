@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use crate::history::{schema as history_schema, store::HistoryStore};
 use crate::memory::{Memory, SqliteMemory};
-use crate::types::{ChatMessage, ConversationId, ConversationMode, ToolCall};
+use crate::types::{ChannelSource, ChatMessage, ConversationId, ConversationMode, ToolCall};
 
 // ---------------------------------------------------------------------------
 // Letta JSON structures — core memory
@@ -337,8 +337,8 @@ fn import_messages(
     }
 
     let agent_hash = extract_agent_id(messages);
-    let conv_id = ConversationId::DM {
-        channel_type: "letta".to_string(),
+    let conv_id = ConversationId::Dm {
+        channel_type: ChannelSource::Letta,
         user_id: agent_hash,
     };
 

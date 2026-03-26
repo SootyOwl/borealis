@@ -24,7 +24,9 @@ pub fn register_computer_tools(
     let allowlist = if config.command_allowlist.is_empty() {
         None
     } else {
-        Some(Arc::from(config.command_allowlist.clone().into_boxed_slice()))
+        Some(Arc::from(
+            config.command_allowlist.clone().into_boxed_slice(),
+        ))
     };
     let timeout = Duration::from_secs(config.command_timeout_secs);
 
@@ -154,10 +156,7 @@ impl Tool for BashExec {
             Ok(Err(e)) => error_result(call_id, &format!("failed to execute command: {e}")),
             Err(_) => error_result(
                 call_id,
-                &format!(
-                    "command timed out after {}s",
-                    self.timeout.as_secs()
-                ),
+                &format!("command timed out after {}s", self.timeout.as_secs()),
             ),
         }
     }
@@ -280,7 +279,10 @@ impl Tool for FileWrite {
         // Create parent directories if needed
         if let Some(parent) = target.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return error_result(call_id, &format!("failed to create parent directories: {e}"));
+                return error_result(
+                    call_id,
+                    &format!("failed to create parent directories: {e}"),
+                );
             }
         }
 
@@ -293,7 +295,7 @@ impl Tool for FileWrite {
                     return error_result(
                         call_id,
                         &format!("failed to resolve parent directory: {e}"),
-                    )
+                    );
                 }
             },
             None => return error_result(call_id, "invalid path: no parent directory"),
@@ -301,16 +303,15 @@ impl Tool for FileWrite {
 
         let canonical_root = match self.sandbox.root().canonicalize() {
             Ok(r) => r,
-            Err(e) => return error_result(call_id, &format!("sandbox root resolution failed: {e}")),
+            Err(e) => {
+                return error_result(call_id, &format!("sandbox root resolution failed: {e}"));
+            }
         };
 
         if !canonical_parent.starts_with(&canonical_root) {
             return error_result(
                 call_id,
-                &format!(
-                    "path traversal blocked: {} escapes sandbox root",
-                    path_str
-                ),
+                &format!("path traversal blocked: {} escapes sandbox root", path_str),
             );
         }
 
@@ -318,7 +319,9 @@ impl Tool for FileWrite {
         let memory_dir = self.sandbox.root().join("memory");
         if let Ok(canonical_memory) = memory_dir.canonicalize() {
             let file_in_parent = canonical_parent.join(target.file_name().unwrap_or_default());
-            if file_in_parent.starts_with(&canonical_memory) || canonical_parent.starts_with(&canonical_memory) {
+            if file_in_parent.starts_with(&canonical_memory)
+                || canonical_parent.starts_with(&canonical_memory)
+            {
                 return error_result(
                     call_id,
                     "access denied: the memory/ directory is protected. Use memory_* tools instead.",
@@ -386,10 +389,7 @@ impl Tool for FileList {
             .get("recursive")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let max_depth = args
-            .get("max_depth")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3) as usize;
+        let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
 
         let canonical = match self.sandbox.validate_path(Path::new(path_str)) {
             Ok(p) => p,
@@ -401,7 +401,16 @@ impl Tool for FileList {
         }
 
         let mut entries = Vec::new();
-        if let Err(e) = list_dir(&canonical, &canonical, recursive, max_depth, 0, &mut entries).await {
+        if let Err(e) = list_dir(
+            &canonical,
+            &canonical,
+            recursive,
+            max_depth,
+            0,
+            &mut entries,
+        )
+        .await
+        {
             return error_result(call_id, &format!("failed to list directory: {e}"));
         }
 
@@ -526,10 +535,12 @@ mod tests {
             .execute(serde_json::json!({"command": "rm -rf /"}), &test_ctx())
             .await;
         assert!(result.is_error);
-        assert!(result.content["error"]
-            .as_str()
-            .unwrap()
-            .contains("not in the allowlist"));
+        assert!(
+            result.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("not in the allowlist")
+        );
     }
 
     #[tokio::test]
@@ -545,10 +556,12 @@ mod tests {
             .execute(serde_json::json!({"command": "sleep 10"}), &test_ctx())
             .await;
         assert!(result.is_error);
-        assert!(result.content["error"]
-            .as_str()
-            .unwrap()
-            .contains("timed out"));
+        assert!(
+            result.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("timed out")
+        );
     }
 
     #[tokio::test]
@@ -561,7 +574,8 @@ mod tests {
         };
 
         // Set a fake API key in the environment
-        std::env::set_var("ANTHROPIC_API_KEY", "sk-test-secret");
+        // SAFETY: test-only, single-threaded test
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-test-secret") };
 
         let result = tool
             .execute(
@@ -572,7 +586,8 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(result.content["stdout"], "NOT_SET\n");
 
-        std::env::remove_var("ANTHROPIC_API_KEY");
+        // SAFETY: test-only, single-threaded test
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
     }
 
     // -- file_read tests --
@@ -598,10 +613,7 @@ mod tests {
             .execute(serde_json::json!({"path": "memory/core.md"}), &test_ctx())
             .await;
         assert!(result.is_error);
-        assert!(result.content["error"]
-            .as_str()
-            .unwrap()
-            .contains("memory"));
+        assert!(result.content["error"].as_str().unwrap().contains("memory"));
     }
 
     #[tokio::test]
@@ -610,10 +622,7 @@ mod tests {
         let tool = FileRead { sandbox };
 
         let result = tool
-            .execute(
-                serde_json::json!({"path": "../../etc/passwd"}),
-                &test_ctx(),
-            )
+            .execute(serde_json::json!({"path": "../../etc/passwd"}), &test_ctx())
             .await;
         assert!(result.is_error);
     }
@@ -667,10 +676,7 @@ mod tests {
             )
             .await;
         assert!(result.is_error);
-        assert!(result.content["error"]
-            .as_str()
-            .unwrap()
-            .contains("memory"));
+        assert!(result.content["error"].as_str().unwrap().contains("memory"));
     }
 
     #[tokio::test]
@@ -699,10 +705,7 @@ mod tests {
             .await;
         assert!(!result.is_error);
         let entries = result.content["entries"].as_array().unwrap();
-        let names: Vec<&str> = entries
-            .iter()
-            .filter_map(|e| e["name"].as_str())
-            .collect();
+        let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
         assert!(names.contains(&"hello.txt"));
         assert!(names.contains(&"subdir"));
         assert!(names.contains(&"memory"));
@@ -721,10 +724,7 @@ mod tests {
             .await;
         assert!(!result.is_error);
         let entries = result.content["entries"].as_array().unwrap();
-        let names: Vec<&str> = entries
-            .iter()
-            .filter_map(|e| e["name"].as_str())
-            .collect();
+        let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
         assert!(names.contains(&"nested.txt"));
     }
 
@@ -737,10 +737,7 @@ mod tests {
             .execute(serde_json::json!({"path": "memory"}), &test_ctx())
             .await;
         assert!(result.is_error);
-        assert!(result.content["error"]
-            .as_str()
-            .unwrap()
-            .contains("memory"));
+        assert!(result.content["error"].as_str().unwrap().contains("memory"));
     }
 
     // -- registration test --

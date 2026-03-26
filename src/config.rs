@@ -46,8 +46,6 @@ pub struct Settings {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
-    #[serde(default)]
-    pub tools: ToolsConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +325,8 @@ fn default_global_refill_secs() -> u64 {
 pub struct ToolsConfig {
     #[serde(default)]
     pub computer_use: ComputerUseConfig,
+    #[serde(default)]
+    pub web: WebToolsConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -366,16 +366,6 @@ fn default_memory_dir() -> String {
 
 fn default_command_timeout_secs() -> u64 {
     30
-}
-
-// ---------------------------------------------------------------------------
-// Tools
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Default, Deserialize)]
-pub struct ToolsConfig {
-    #[serde(default)]
-    pub web: WebToolsConfig,
 }
 
 #[derive(Debug, Deserialize)]

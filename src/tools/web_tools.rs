@@ -105,10 +105,7 @@ impl Tool for WebFetch {
 
         let status = response.status();
         if !status.is_success() {
-            return error_result(
-                call_id,
-                &format!("Jina Reader returned HTTP {status}"),
-            );
+            return error_result(call_id, &format!("Jina Reader returned HTTP {status}"));
         }
 
         let body = match response.text().await {
@@ -199,10 +196,7 @@ impl Tool for WebSearch {
 
         let status = response.status();
         if !status.is_success() {
-            return error_result(
-                call_id,
-                &format!("Jina Search returned HTTP {status}"),
-            );
+            return error_result(call_id, &format!("Jina Search returned HTTP {status}"));
         }
 
         let body = match response.text().await {
@@ -214,7 +208,7 @@ impl Tool for WebSearch {
         let parsed: serde_json::Value = match serde_json::from_str(&body) {
             Ok(v) => v,
             Err(e) => {
-                return error_result(call_id, &format!("failed to parse search results: {e}"))
+                return error_result(call_id, &format!("failed to parse search results: {e}"));
             }
         };
 
@@ -358,23 +352,5 @@ mod tests {
         };
         let result = tool.execute(serde_json::json!({}), &ctx).await;
         assert!(result.is_error);
-    }
-
-    #[tokio::test]
-    async fn web_fetch_with_mock_server() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/https://example.com")
-            .with_status(200)
-            .with_header("content-type", "text/markdown")
-            .with_body("# Example\n\nHello world")
-            .create_async()
-            .await;
-
-        // Build a client that points to the mock server instead of r.jina.ai.
-        // We do this by overriding the tool to use a custom base URL through
-        // a direct HTTP call in the test rather than modifying the tool internals.
-        // Instead, we'll test the truncation logic and URL validation directly.
-        mock.assert_async().await;
     }
 }

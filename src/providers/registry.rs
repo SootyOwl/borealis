@@ -221,6 +221,7 @@ mod tests {
             event_bus: EventBusConfig::default(),
             rate_limit: RateLimitConfig::default(),
             scheduler: SchedulerConfig::default(),
+            tools: ToolsConfig::default(),
         }
     }
 

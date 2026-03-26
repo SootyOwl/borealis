@@ -5,33 +5,14 @@ use anyhow::{Result, bail};
 use tracing::info;
 
 use crate::config::{ProviderEntry, Settings};
-use crate::core::observer::{ObserverRegistry, TracingObserver};
+use crate::core::observer::build_observer_registry;
 use crate::core::pipeline::{PipelineDeps, PipelineRunner};
 use crate::history::compaction::CompactionState;
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
-use crate::providers::ProviderConfig;
+use crate::providers::{ProviderConfig, ProviderRegistration};
 use crate::security::Security;
 use crate::tools::ToolRegistry;
-
-/// A self-registering provider factory.
-///
-/// Each provider module submits one of these via `inventory::submit!`. The
-/// registry iterates them to construct the correct `PipelineRunner` without
-/// hardcoded match arms.
-pub struct ProviderRegistration {
-    /// Provider name (must match the config key, e.g. "anthropic", "openai").
-    pub name: &'static str,
-    /// Build a `PipelineRunner` from resolved provider config and pipeline deps.
-    pub build_pipeline_fn: fn(
-        config: ProviderConfig,
-        sys_path: &Path,
-        persona_path: &Path,
-        deps: PipelineDeps,
-    ) -> Result<Arc<dyn PipelineRunner>>,
-}
-
-inventory::collect!(ProviderRegistration);
 
 /// A resolved provider entry with configuration ready for construction.
 #[derive(Debug, Clone)]
@@ -157,10 +138,8 @@ pub fn build_pipeline(
     let compaction_config = settings.bot.compaction.clone();
     let compaction_state = Arc::new(CompactionState::new());
 
-    // Create observer registry with TracingObserver.
-    let mut observers = ObserverRegistry::new();
-    observers.register(Box::new(TracingObserver));
-    let observers = Arc::new(observers);
+    // Build observer registry from inventory-registered observers.
+    let observers = Arc::new(build_observer_registry());
 
     // Use the first configured provider.
     let resolved = &providers[0];

@@ -3,6 +3,33 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, params};
 use thiserror::Error;
 
+// ---------------------------------------------------------------------------
+// Inventory self-registration
+// ---------------------------------------------------------------------------
+
+inventory::submit! {
+    crate::memory::MemoryRegistration {
+        name: "sqlite",
+        build_fn: |settings| {
+            let db_conn = Arc::new(Mutex::new(
+                Connection::open(&settings.database.path)?,
+            ));
+            {
+                let conn = db_conn.lock().expect("mutex not poisoned");
+                conn.execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     PRAGMA busy_timeout = 5000;",
+                )?;
+            }
+            let memory = SqliteMemory::new(
+                db_conn,
+                settings.bot.core_persona_path.clone(),
+            )?;
+            Ok(Arc::new(memory))
+        },
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MemoryError {
     #[error("note not found: {0}")]

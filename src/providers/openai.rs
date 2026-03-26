@@ -26,7 +26,7 @@ fn build_pipeline(
 }
 
 inventory::submit! {
-    crate::providers::registry::ProviderRegistration {
+    crate::providers::ProviderRegistration {
         name: "openai",
         build_pipeline_fn: build_pipeline,
     }

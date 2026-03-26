@@ -7,12 +7,22 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::channels::{Channel, ChannelRegistry};
+use crate::channels::{Channel, ChannelRegistration, ChannelRegistry};
 use crate::config::Settings;
 use crate::core::event::{
     Author, ChannelSource, ConversationId, InEvent, Message, MessageContext, MessageId, OutEvent,
 };
 use crate::core::pipeline::PipelineRunner;
+
+// Auto-registration via inventory
+inventory::submit! {
+    ChannelRegistration {
+        name: "cli",
+        register_fn: |registry, deps| {
+            register(registry, deps.settings, deps.pipeline.clone(), deps.cancel.clone());
+        },
+    }
+}
 
 /// Register the CLI adapter with the channel registry if enabled in config.
 pub fn register(

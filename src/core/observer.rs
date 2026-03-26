@@ -110,11 +110,46 @@ impl Default for ObserverRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Inventory-based observer registration
+// ---------------------------------------------------------------------------
+
+/// A self-registering observer factory.
+///
+/// Each observer module submits one of these via `inventory::submit!`.
+/// At startup, `build_observer_registry()` iterates them to construct an
+/// `ObserverRegistry` with all registered observers.
+pub struct ObserverRegistration {
+    /// Observer name (e.g. "tracing", "metrics").
+    pub name: &'static str,
+    /// Build an observer instance.
+    pub build_fn: fn() -> Box<dyn Observer>,
+}
+
+inventory::collect!(ObserverRegistration);
+
+/// Build an `ObserverRegistry` populated with all inventory-registered observers.
+pub fn build_observer_registry() -> ObserverRegistry {
+    let mut registry = ObserverRegistry::new();
+    for reg in inventory::iter::<ObserverRegistration> {
+        tracing::debug!(observer = reg.name, "registering observer");
+        registry.register((reg.build_fn)());
+    }
+    registry
+}
+
+// ---------------------------------------------------------------------------
 // TracingObserver
 // ---------------------------------------------------------------------------
 
 /// An [`Observer`] that emits structured log events via the `tracing` crate.
 pub struct TracingObserver;
+
+inventory::submit! {
+    ObserverRegistration {
+        name: "tracing",
+        build_fn: || Box::new(TracingObserver),
+    }
+}
 
 impl Observer for TracingObserver {
     fn on_llm_response(&self, response: &LlmResponse, duration: Duration) {

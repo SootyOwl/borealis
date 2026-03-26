@@ -65,12 +65,8 @@ async fn main() -> anyhow::Result<()> {
         &db_conn,
     )));
 
-    // Create the memory store.
-    let memory_store: Arc<dyn borealis::memory::Memory> =
-        Arc::new(borealis::memory::SqliteMemory::new(
-            Arc::clone(&db_conn),
-            settings.bot.core_persona_path.clone(),
-        )?);
+    // Create the memory store via inventory-registered backend.
+    let memory_store = borealis::memory::build_memory(&settings)?;
     info!("memory store initialized");
 
     // Create the security module.
@@ -150,11 +146,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Register channel adapters via the channel registry.
-    let mut channels = borealis::channels::ChannelRegistry::new();
-    borealis::channels::cli::register(&mut channels, &settings, pipeline.clone(), cancel.clone());
-    borealis::channels::discord::register(
-        &mut channels,
+    // Register channel adapters via inventory-based auto-discovery.
+    let channels = borealis::channels::register_all_channels(
         &settings,
         pipeline.clone(),
         cancel.clone(),

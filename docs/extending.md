@@ -84,7 +84,7 @@ Providers are LLM backends. They also self-register via `inventory`.
 use std::sync::Arc;
 use crate::core::pipeline::{Pipeline, PipelineDeps, PipelineRunner};
 use crate::providers::{Provider, ProviderConfig};
-use crate::providers::registry::ProviderRegistration;
+use crate::providers::ProviderRegistration;
 
 pub struct MyProvider { /* ... */ }
 
@@ -130,25 +130,36 @@ api_key_env = "MY_PROVIDER_API_KEY"
 
 ## Adding a new Channel
 
-Channels are platform adapters (Discord, CLI, Telegram, etc.). Unlike tools and providers, channels require async task spawning at startup, so they use explicit registration functions rather than `inventory`.
+Channels are platform adapters (Discord, CLI, Telegram, etc.). They self-register via `inventory` — no changes to `main.rs` needed.
 
 **Steps:**
 
 1. Create `src/channels/my_channel.rs`
 2. Implement the `Channel` trait
-3. Add a `pub fn register()` function
+3. Add a `pub fn register()` function and `inventory::submit!` block
 4. Add `pub mod my_channel;` to `src/channels/mod.rs`
-5. Add the registration call in `src/main.rs`
-6. Add config section to `src/config.rs` (in `ChannelsConfig`)
+5. Add config section to `src/config.rs` (in `ChannelsConfig`)
 
 **Template:**
 
 ```rust
 use std::sync::Arc;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
-use crate::channels::{Channel, ChannelRegistry};
+use crate::channels::{Channel, ChannelRegistration, ChannelRegistry};
 use crate::config::Settings;
+use crate::core::event::{InEvent, OutEvent};
 use crate::core::pipeline::PipelineRunner;
+
+// Auto-registration via inventory
+inventory::submit! {
+    ChannelRegistration {
+        name: "my_channel",
+        register_fn: |registry, deps| {
+            register(registry, deps.settings, deps.pipeline.clone(), deps.cancel.clone());
+        },
+    }
+}
 
 pub struct MyChannel { /* ... */ }
 
@@ -182,33 +193,61 @@ pub fn register(
 }
 ```
 
-**Why not inventory?** Channel registration spawns async tasks (inbound, outbound, processing loops) which requires the tokio runtime and `Arc<dyn PipelineRunner>`. These don't exist at link time when `inventory` collects registrations.
+**That's it.** The `inventory::submit!` block causes automatic registration at startup. No changes to `main.rs` or `register_all_channels()`.
 
 ## Adding a new Memory backend
 
-Memory backends implement the `Memory` trait. The active backend is selected at startup in `main.rs`.
+Memory backends implement the `Memory` trait. They self-register via `inventory` — no changes to `main.rs` needed.
 
 **Steps:**
 
 1. Create `src/memory/my_backend.rs`
 2. Implement the `Memory` trait (10 methods)
-3. Add `pub mod my_backend;` to `src/memory/mod.rs`
-4. Add selection logic in `main.rs`
+3. Add an `inventory::submit!` block with a `MemoryRegistration`
+4. Add `pub mod my_backend;` to `src/memory/mod.rs`
+
+**Template:**
+
+```rust
+use std::sync::Arc;
+use crate::config::Settings;
+use crate::memory::{Memory, MemoryRegistration, MemoryResult, Note, Link};
+
+pub struct MyMemory { /* ... */ }
+
+impl Memory for MyMemory {
+    // Implement all 10 methods
+}
+
+inventory::submit! {
+    MemoryRegistration {
+        name: "my_backend",
+        build_fn: |settings| {
+            let backend = MyMemory::new(/* from settings */)?;
+            Ok(Arc::new(backend))
+        },
+    }
+}
+```
 
 The `Memory` trait is synchronous — callers wrap calls in `tokio::task::spawn_blocking`. If your backend needs async I/O, do the async work internally and block on it.
 
 ## Adding a new Observer
 
-Observers receive lifecycle events from the pipeline. They implement the `Observer` trait with default no-op methods — override only the hooks you care about.
+Observers receive lifecycle events from the pipeline. They self-register via `inventory` — no changes to `registry.rs` or `main.rs` needed.
 
 **Steps:**
 
 1. Create your observer (can be in any module)
 2. Implement the `Observer` trait
-3. Register it in `src/providers/registry.rs` where `ObserverRegistry` is created
+3. Add an `inventory::submit!` block with an `ObserverRegistration`
+
+**Template:**
 
 ```rust
-use crate::core::observer::Observer;
+use std::time::Duration;
+use crate::core::observer::{Observer, ObserverRegistration};
+use crate::providers::LlmResponse;
 
 pub struct MetricsObserver { /* ... */ }
 
@@ -217,7 +256,16 @@ impl Observer for MetricsObserver {
         // Record metrics
     }
 }
+
+inventory::submit! {
+    ObserverRegistration {
+        name: "metrics",
+        build_fn: || Box::new(MetricsObserver { /* ... */ }),
+    }
+}
 ```
+
+**That's it.** The `inventory::submit!` block causes automatic registration at startup. No changes to `registry.rs` or `main.rs`.
 
 ## Summary
 
@@ -225,6 +273,6 @@ impl Observer for MetricsObserver {
 |-------|-------------|---------------|----------------|
 | **Tool** | `inventory::submit!` | Optional (for enabled flag) | No |
 | **Provider** | `inventory::submit!` | Yes (provider entry) | No |
-| **Channel** | Explicit `register()` | Yes (channel config) | Yes (one line) |
-| **Memory** | Manual selection | Yes (backend choice) | Yes |
-| **Observer** | Manual registration | No | No |
+| **Channel** | `inventory::submit!` | Yes (channel config) | No |
+| **Memory** | `inventory::submit!` | Yes (backend choice) | No |
+| **Observer** | `inventory::submit!` | No | No |

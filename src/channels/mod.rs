@@ -10,8 +10,49 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+use crate::config::Settings;
 use crate::core::event::{InEvent, OutEvent};
 use crate::core::pipeline::PipelineRunner;
+
+/// Runtime dependencies available to channel registration functions.
+pub struct ChannelDeps<'a> {
+    pub settings: &'a Settings,
+    pub pipeline: Arc<dyn PipelineRunner>,
+    pub cancel: CancellationToken,
+}
+
+/// A self-registering channel adapter.
+///
+/// Each channel module submits one of these via `inventory::submit!`. They are
+/// collected and executed by [`register_all_channels`].
+pub struct ChannelRegistration {
+    pub name: &'static str,
+    pub register_fn: fn(&mut ChannelRegistry, &ChannelDeps<'_>),
+}
+
+inventory::collect!(ChannelRegistration);
+
+/// Register all channel adapters discovered via `inventory`.
+///
+/// Each channel module submits a [`ChannelRegistration`] at link time. This
+/// function iterates them and calls each registration function with the shared deps.
+pub fn register_all_channels(
+    settings: &Settings,
+    pipeline: Arc<dyn PipelineRunner>,
+    cancel: CancellationToken,
+) -> ChannelRegistry {
+    let deps = ChannelDeps {
+        settings,
+        pipeline,
+        cancel,
+    };
+    let mut registry = ChannelRegistry::new();
+    for reg in inventory::iter::<ChannelRegistration> {
+        tracing::debug!(channel = reg.name, "registering channel");
+        (reg.register_fn)(&mut registry, &deps);
+    }
+    registry
+}
 
 /// A channel adapter that bridges a platform (Discord, CLI, etc.) with the core event bus.
 ///

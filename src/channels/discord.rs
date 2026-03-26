@@ -10,12 +10,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::channels::modes::{AlwaysMode, DigestMode, MentionOnlyMode, ModeRouter, ResponseMode};
-use crate::channels::{Channel, ChannelRegistry};
+use crate::channels::{Channel, ChannelRegistration, ChannelRegistry};
 use crate::config::{DiscordChannelConfig, Settings};
 use crate::core::event::{
     Author, ChannelSource, ConversationId, InEvent, Message, MessageContext, MessageId, OutEvent,
 };
 use crate::core::pipeline::PipelineRunner;
+
+// Auto-registration via inventory
+inventory::submit! {
+    ChannelRegistration {
+        name: "discord",
+        register_fn: |registry, deps| {
+            register(registry, deps.settings, deps.pipeline.clone(), deps.cancel.clone());
+        },
+    }
+}
 
 /// Register the Discord adapter with the channel registry if enabled in config.
 pub fn register(

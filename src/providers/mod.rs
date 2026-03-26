@@ -3,8 +3,32 @@ pub mod openai;
 pub mod registry;
 mod retry;
 
+use std::path::Path;
+use std::sync::Arc;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+use crate::core::pipeline::{PipelineDeps, PipelineRunner};
+
+/// A self-registering provider factory.
+///
+/// Each provider module submits one of these via `inventory::submit!`. The
+/// registry iterates them to construct the correct `PipelineRunner` without
+/// hardcoded match arms.
+pub struct ProviderRegistration {
+    /// Provider name (must match the config key, e.g. "anthropic", "openai").
+    pub name: &'static str,
+    /// Build a `PipelineRunner` from resolved provider config and pipeline deps.
+    pub build_pipeline_fn: fn(
+        config: ProviderConfig,
+        sys_path: &Path,
+        persona_path: &Path,
+        deps: PipelineDeps,
+    ) -> Result<Arc<dyn PipelineRunner>>,
+}
+
+inventory::collect!(ProviderRegistration);
 
 /// Role in a conversation message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

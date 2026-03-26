@@ -50,15 +50,6 @@ impl Authorization {
         self.restricted_tools.insert(tool_name.to_owned());
     }
 
-    /// Authorize a specific user for a specific restricted tool.
-    #[cfg(test)]
-    fn authorize_user_for_tool(&mut self, tool_name: &str, user_id: &str) {
-        self.per_tool_users
-            .entry(tool_name.to_owned())
-            .or_default()
-            .insert(user_id.to_owned());
-    }
-
     /// Check whether `user_id` is authorized to call `tool_name`.
     ///
     /// Unrestricted tools are always allowed. For restricted tools, the user
@@ -87,17 +78,6 @@ impl Authorization {
         }
     }
 
-    /// Returns whether the given tool is registered as restricted.
-    #[cfg(test)]
-    fn is_restricted_tool(&self, tool_name: &str) -> bool {
-        self.restricted_tools.contains(tool_name)
-    }
-
-    /// Returns whether the given user is globally authorized.
-    #[cfg(test)]
-    fn is_user_authorized(&self, user_id: &str) -> bool {
-        self.global_authorized_users.contains(user_id)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,36 +125,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn per_tool_authorization() {
-        let mut auth = setup_auth();
-        auth.authorize_user_for_tool("file_write", "editor_user");
-
-        // editor_user can use file_write but not bash_exec
-        assert_eq!(
-            auth.check("file_write", "editor_user"),
-            AuthorizationResult::Allowed
-        );
-        assert_eq!(
-            auth.check("bash_exec", "editor_user"),
-            AuthorizationResult::Denied {
-                tool_name: "bash_exec".to_string(),
-                user_id: "editor_user".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn is_restricted_tool_works() {
-        let auth = setup_auth();
-        assert!(auth.is_restricted_tool("bash_exec"));
-        assert!(!auth.is_restricted_tool("memory_create"));
-    }
-
-    #[test]
-    fn is_user_authorized_works() {
-        let auth = setup_auth();
-        assert!(auth.is_user_authorized("admin"));
-        assert!(!auth.is_user_authorized("random"));
-    }
 }

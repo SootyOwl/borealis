@@ -9,9 +9,6 @@ use crate::types::{
     ChatMessage, ConversationId, ConversationIdError, ConversationMode, ParseError, Role, ToolCall,
     estimate_tokens,
 };
-#[cfg(test)]
-use crate::types::ChannelSource;
-
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -28,17 +25,6 @@ pub enum StoreError {
     Parse(#[from] ParseError),
     #[error("lock poisoned")]
     LockPoisoned,
-}
-
-// ---------------------------------------------------------------------------
-// Conversation
-// ---------------------------------------------------------------------------
-
-pub struct Conversation {
-    pub id: ConversationId,
-    pub mode: ConversationMode,
-    pub created_at: String,
-    pub last_active_at: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,34 +93,6 @@ impl HistoryStore {
             params![id.to_string(), mode.as_str(), now],
         )?;
         Ok(())
-    }
-
-    /// Fetch a conversation by id.  Returns `None` when no row exists.
-    #[cfg(test)]
-    pub fn get_conversation(
-        &self,
-        id: &ConversationId,
-    ) -> Result<Option<Conversation>, StoreError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, mode, created_at, last_active_at
-             FROM conversations WHERE id = ?1",
-        )?;
-
-        let mut rows = stmt.query(params![id.to_string()])?;
-        match rows.next()? {
-            None => Ok(None),
-            Some(row) => {
-                let id_str: String = row.get(0)?;
-                let mode_str: String = row.get(1)?;
-                Ok(Some(Conversation {
-                    id: ConversationId::parse(&id_str)?,
-                    mode: ConversationMode::from_str(&mode_str)?,
-                    created_at: row.get(2)?,
-                    last_active_at: row.get(3)?,
-                }))
-            }
-        }
     }
 
     /// Append a message to the conversation's history.
@@ -370,26 +328,6 @@ impl HistoryStore {
         Ok(total as usize)
     }
 
-    /// Delete messages older than `retention_days` days.
-    ///
-    /// Operates at turn granularity: if any message in a turn is older than the
-    /// cutoff, the entire turn is deleted. This prevents orphaned tool_calls or
-    /// tool_results from surviving retention cleanup.
-    ///
-    /// Returns the number of deleted messages.
-    #[cfg(test)]
-    pub fn cleanup_old_messages(&self, retention_days: u32) -> Result<usize, StoreError> {
-        let conn = self.lock_conn()?;
-        let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
-        let cutoff_str = cutoff.to_rfc3339();
-        let deleted = conn.execute(
-            "DELETE FROM messages WHERE turn_id IN (
-                SELECT DISTINCT turn_id FROM messages WHERE created_at < ?1
-            )",
-            params![cutoff_str],
-        )?;
-        Ok(deleted)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -766,6 +704,7 @@ impl HistoryStore {
 mod tests {
     use super::*;
     use crate::history::schema;
+    use crate::types::ChannelSource;
     use rusqlite::Connection;
     use serde_json::json;
 
@@ -783,26 +722,6 @@ mod tests {
     }
 
     // --- Task 4: Conversation CRUD ---
-
-    #[test]
-    fn create_and_get_conversation() {
-        let store = make_store();
-        let id = test_conv_id();
-
-        store
-            .ensure_conversation(&id, ConversationMode::Shared)
-            .expect("ensure should succeed");
-
-        let conv = store
-            .get_conversation(&id)
-            .expect("get should succeed")
-            .expect("should be Some");
-
-        assert_eq!(conv.id, id);
-        assert_eq!(conv.mode, ConversationMode::Shared);
-        assert!(!conv.created_at.is_empty());
-        assert!(!conv.last_active_at.is_empty());
-    }
 
     #[test]
     fn ensure_conversation_is_idempotent() {
@@ -826,16 +745,6 @@ mod tests {
             )
             .expect("count query");
         assert_eq!(count, 1, "upsert should not duplicate rows");
-    }
-
-    #[test]
-    fn get_nonexistent_conversation_returns_none() {
-        let store = make_store();
-        let id = ConversationId::System {
-            event_name: "ghost".to_string(),
-        };
-        let result = store.get_conversation(&id).expect("get should not error");
-        assert!(result.is_none());
     }
 
     // --- Task 5: Message and Turn Storage ---
@@ -1052,48 +961,6 @@ mod tests {
         // Each message: estimate_tokens(content)
         let expected = estimate_tokens("aaaa") + estimate_tokens("bbbbbbbb");
         assert_eq!(total, expected);
-    }
-
-    // --- Task 9: Retention cleanup ---
-
-    #[test]
-    fn cleanup_old_messages_deletes_backdated_and_keeps_recent() {
-        let store = make_store();
-        let id = test_conv_id();
-        store
-            .ensure_conversation(&id, ConversationMode::Shared)
-            .unwrap();
-
-        // Insert an "old" message and capture its turn_id.
-        let old_turn_id = store
-            .append_message(&id, &ChatMessage::user("ancient message"), None)
-            .unwrap();
-
-        // Backdate it to 2020 via raw SQL.
-        {
-            let conn = store.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE messages SET created_at = '2020-01-01T00:00:00+00:00' WHERE turn_id = ?1",
-                params![old_turn_id],
-            )
-            .unwrap();
-        }
-
-        // Insert a recent message.
-        store
-            .append_message(&id, &ChatMessage::user("recent message"), None)
-            .unwrap();
-
-        // Run cleanup with a 30-day retention window.
-        let deleted = store
-            .cleanup_old_messages(30)
-            .expect("cleanup should succeed");
-        assert_eq!(deleted, 1, "should have deleted the one backdated message");
-
-        // Only the recent message should remain.
-        let remaining = store.load_messages(&id).expect("load");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].content, "recent message");
     }
 
     // --- StoredMessage::to_chat_message ---

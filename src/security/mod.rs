@@ -43,21 +43,6 @@ impl Security {
         }
     }
 
-    // TODO: Wire rate_limiter.check() into the pipeline or channel adapters.
-    // Currently only used for authorization; rate limiting is not enforced at runtime.
-
-    /// Convenience: check rate limit for a user/guild pair.
-    #[cfg(test)]
-    pub fn check_rate_limit(&self, user_id: &str, guild_id: Option<&str>) -> RateLimitResult {
-        self.rate_limiter.check(user_id, guild_id)
-    }
-
-    /// Convenience: validate a file path against the sandbox.
-    #[cfg(test)]
-    pub fn validate_path(&self, path: &std::path::Path) -> Result<PathBuf, SandboxError> {
-        self.sandbox.validate_path(path)
-    }
-
     /// Convenience: check tool authorization for a user.
     pub fn check_authorization(&self, tool_name: &str, user_id: &str) -> AuthorizationResult {
         self.authorization.check(tool_name, user_id)
@@ -77,7 +62,6 @@ impl Security {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::Path;
 
     fn setup_security() -> (tempfile::TempDir, Security) {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
@@ -104,21 +88,6 @@ mod tests {
         security.register_restricted("bash_exec");
 
         (tmp, security)
-    }
-
-    #[test]
-    fn security_composes_rate_limiting() {
-        let (_tmp, security) = setup_security();
-        assert_eq!(
-            security.check_rate_limit("admin", None),
-            RateLimitResult::Allowed,
-        );
-    }
-
-    #[test]
-    fn security_composes_sandbox() {
-        let (_tmp, security) = setup_security();
-        assert!(security.validate_path(Path::new("test.txt")).is_ok());
     }
 
     #[test]

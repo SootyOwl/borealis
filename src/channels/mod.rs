@@ -252,6 +252,7 @@ mod tests {
                     reply_to: None,
                 },
                 tool_groups: None,
+                completion_flag: None,
             };
             let _ = tx.send(event).await;
             Ok(())

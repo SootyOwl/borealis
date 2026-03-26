@@ -30,6 +30,8 @@ pub enum MemoryError {
     Database(#[from] rusqlite::Error),
     #[error("core.md I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("lock poisoned")]
+    LockPoisoned,
 }
 
 pub type MemoryResult<T> = Result<T, MemoryError>;
@@ -94,8 +96,13 @@ impl SqliteMemory {
         Ok(store)
     }
 
+    /// Acquire the database connection, recovering from mutex poisoning.
+    fn lock_conn(&self) -> MemoryResult<std::sync::MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|_| MemoryError::LockPoisoned)
+    }
+
     fn init_schema(&self) -> MemoryResult<()> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
@@ -128,7 +135,7 @@ impl SqliteMemory {
     /// Generate a note ID like `note_a1b2c3d4` using a random u32.
     /// Checks for collisions and regenerates if needed.
     fn generate_id(&self) -> MemoryResult<String> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
         loop {
             let id = format!("note_{:08x}", rand::random::<u32>());
             let exists: bool = conn.query_row(
@@ -236,7 +243,7 @@ impl Memory for SqliteMemory {
     fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
         let id = self.generate_id()?;
         let now = Self::now_iso();
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
 
         conn.execute(
             "INSERT INTO notes (id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -266,7 +273,7 @@ impl Memory for SqliteMemory {
             return self.read_core();
         }
 
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
         let note = conn
             .query_row(
                 "SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ?1 AND deleted_at IS NULL",
@@ -303,7 +310,7 @@ impl Memory for SqliteMemory {
         }
 
         let now = Self::now_iso();
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
 
         let rows = conn.execute(
             "UPDATE notes SET content = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
@@ -324,7 +331,7 @@ impl Memory for SqliteMemory {
         }
 
         let now = Self::now_iso();
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
 
         let rows = conn.execute(
             "UPDATE notes SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
@@ -339,15 +346,16 @@ impl Memory for SqliteMemory {
     }
 
     fn search_notes(&self, query: &str, limit: usize) -> MemoryResult<Vec<Note>> {
-        let conn = self.conn.lock().expect("mutex poisoned");
-        let pattern = format!("%{}%", query);
+        let conn = self.lock_conn()?;
+        let escaped = query.replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
 
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.title, n.content, n.created_at, n.updated_at
              FROM notes n
              LEFT JOIN tags t ON n.id = t.note_id
              WHERE n.deleted_at IS NULL
-               AND (n.title LIKE ?1 OR n.content LIKE ?1 OR t.tag LIKE ?1)
+               AND (n.title LIKE ?1 ESCAPE '\\' OR n.content LIKE ?1 ESCAPE '\\' OR t.tag LIKE ?1 ESCAPE '\\')
              ORDER BY n.updated_at DESC
              LIMIT ?2",
         )?;
@@ -377,7 +385,7 @@ impl Memory for SqliteMemory {
     }
 
     fn list_notes(&self, tag_filter: Option<&str>) -> MemoryResult<Vec<Note>> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
 
         let notes = if let Some(tag) = tag_filter {
             let mut stmt = conn.prepare(
@@ -434,7 +442,7 @@ impl Memory for SqliteMemory {
             return Err(MemoryError::ReservedId);
         }
 
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
 
         // Verify both notes exist and are not deleted
         self.assert_note_exists_locked(&conn, from_id)?;
@@ -455,7 +463,7 @@ impl Memory for SqliteMemory {
     }
 
     fn get_links_for_note(&self, id: &str) -> MemoryResult<Vec<Link>> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT from_id, to_id, relation, 'outgoing' AS direction FROM links WHERE from_id = ?1
              UNION ALL
@@ -479,7 +487,7 @@ impl Memory for SqliteMemory {
             return Err(MemoryError::ReservedId);
         }
 
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.lock_conn()?;
         self.assert_note_exists_locked(&conn, id)?;
 
         // Replace all tags

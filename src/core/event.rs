@@ -160,6 +160,9 @@ pub struct InEvent {
     /// Optional list of tool group names available for this event.
     /// When `None`, all enabled tool groups are available.
     pub tool_groups: Option<Vec<String>>,
+    /// Optional flag cleared when processing completes, used by the scheduler
+    /// for overlap prevention.
+    pub completion_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// An outbound event from the core to a channel adapter.

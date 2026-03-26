@@ -73,11 +73,24 @@ async fn main() -> anyhow::Result<()> {
     info!("memory store initialized");
 
     // Create the security module.
-    let security = Arc::new(borealis::security::Security::new(
+    let mut security = borealis::security::Security::new(
         &settings.rate_limit,
         settings.tools.computer_use.sandbox_root.clone(),
         settings.rate_limit.allowed_users.clone(),
-    ));
+    );
+
+    // Register memory write tools as restricted so only authorized users can call them.
+    for tool_name in &[
+        "memory_create",
+        "memory_update",
+        "memory_link",
+        "memory_tag",
+        "memory_forget",
+    ] {
+        security.register_restricted(tool_name);
+    }
+
+    let security = Arc::new(security);
     info!("security module initialized");
 
     // Register all tool groups based on config.
@@ -126,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     Some(event) = sched_rx.recv() => {
+                        let completion_flag = event.completion_flag.clone();
                         match pipeline_sched.process(&event).await {
                             Ok(_out_event) => {
                                 tracing::debug!("scheduler event processed");
@@ -133,6 +147,10 @@ async fn main() -> anyhow::Result<()> {
                             Err(e) => {
                                 tracing::error!("scheduler pipeline error: {e}");
                             }
+                        }
+                        // Clear the overlap-prevention flag now that processing is done.
+                        if let Some(flag) = completion_flag {
+                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
                     _ = cancel_sched.cancelled() => {

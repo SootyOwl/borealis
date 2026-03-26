@@ -68,7 +68,10 @@ impl Tool for HistoryRecent {
         })
         .await
         {
-            Ok(Ok(convos)) => ok_result(call_id, serde_json::to_value(convos).unwrap()),
+            Ok(Ok(convos)) => ok_result(call_id, match serde_json::to_value(&convos) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }
@@ -118,7 +121,10 @@ impl Tool for HistorySearch {
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.search_messages(&query, limit)).await {
-            Ok(Ok(results)) => ok_result(call_id, serde_json::to_value(results).unwrap()),
+            Ok(Ok(results)) => ok_result(call_id, match serde_json::to_value(&results) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }

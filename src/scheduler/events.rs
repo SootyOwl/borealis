@@ -301,6 +301,8 @@ impl ScheduledEventRunner {
                 reply_to: None,
             },
             tool_groups: self.config.tools.clone(),
+            // Pass the processing flag so the consumer can clear it when done.
+            completion_flag: Some(Arc::clone(&processing)),
         };
 
         if let Err(e) = self.event_tx.send(event).await {
@@ -309,11 +311,6 @@ impl ScheduledEventRunner {
             return;
         }
 
-        debug!(event = %name, "scheduler event fired");
-
-        // Note: In production, the processing flag should be cleared by the core
-        // when the event finishes processing via a completion callback. For now,
-        // we clear it after send since we don't have that callback yet.
-        processing.store(false, Ordering::SeqCst);
+        debug!(event = %name, "scheduler event fired — flag held until processing completes");
     }
 }

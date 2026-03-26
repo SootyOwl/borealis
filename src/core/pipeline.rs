@@ -652,6 +652,7 @@ mod tests {
                 reply_to: None,
             },
             tool_groups: None,
+            completion_flag: None,
         }
     }
 

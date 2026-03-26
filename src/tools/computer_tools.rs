@@ -145,24 +145,18 @@ impl Tool for BashExec {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = match cmd.spawn() {
+        let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return error_result(call_id, &format!("failed to execute command: {e}")),
         };
 
-        match tokio::time::timeout(self.timeout, child.wait()).await {
-            Ok(Ok(status)) => {
-                let mut stdout_buf = Vec::new();
-                let mut stderr_buf = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut stdout_buf).await;
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut stderr_buf).await;
-                }
-                let stdout = String::from_utf8_lossy(&stdout_buf);
-                let stderr = String::from_utf8_lossy(&stderr_buf);
-                let exit_code = status.code().unwrap_or(-1);
+        // Use wait_with_output() to read pipes concurrently with waiting,
+        // preventing deadlock when the child produces large output.
+        match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let exit_code = output.status.code().unwrap_or(-1);
 
                 ok_result(
                     call_id,
@@ -175,7 +169,7 @@ impl Tool for BashExec {
             }
             Ok(Err(e)) => error_result(call_id, &format!("failed to execute command: {e}")),
             Err(_) => {
-                let _ = child.kill().await;
+                // Timeout: the child is dropped here which sends SIGKILL on Unix.
                 error_result(
                     call_id,
                     &format!("command timed out after {}s", self.timeout.as_secs()),

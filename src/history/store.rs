@@ -620,8 +620,11 @@ impl HistoryStore {
         let cutoff = Utc::now() - chrono::Duration::hours(i64::from(hours));
         let cutoff_str = cutoff.to_rfc3339();
 
-        // Build channel filter dynamically.
-        let channel_pattern = channel.map(|c| format!("%{c}%"));
+        // Build channel filter dynamically, escaping LIKE wildcards.
+        let channel_pattern = channel.map(|c| {
+            let escaped = c.replace('%', "\\%").replace('_', "\\_");
+            format!("%{escaped}%")
+        });
 
         let sql = "\
             SELECT conversation_id,
@@ -630,7 +633,7 @@ impl HistoryStore {
                    MAX(created_at) AS latest
             FROM messages
             WHERE created_at >= ?1
-              AND (?2 IS NULL OR conversation_id LIKE ?2)
+              AND (?2 IS NULL OR conversation_id LIKE ?2 ESCAPE '\\')
             GROUP BY conversation_id
             ORDER BY MAX(created_at) DESC
             LIMIT 10";
@@ -712,12 +715,13 @@ impl HistoryStore {
         limit: usize,
     ) -> Result<Vec<MessageSearchResult>, StoreError> {
         let conn = self.lock_conn()?;
-        let pattern = format!("%{query}%");
+        let escaped = query.replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
 
         let mut stmt = conn.prepare(
             "SELECT conversation_id, role, content, created_at
              FROM messages
-             WHERE content LIKE ?1
+             WHERE content LIKE ?1 ESCAPE '\\'
              ORDER BY created_at DESC
              LIMIT ?2",
         )?;

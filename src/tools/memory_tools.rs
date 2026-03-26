@@ -84,7 +84,10 @@ impl Tool for MemoryCreate {
 
         match tokio::task::spawn_blocking(move || store.create_note(&title, &content, &tags)).await
         {
-            Ok(Ok(note)) => ok_result(call_id, serde_json::to_value(note).unwrap()),
+            Ok(Ok(note)) => ok_result(call_id, match serde_json::to_value(&note) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }
@@ -131,7 +134,10 @@ impl Tool for MemorySearch {
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.search_notes(&query, limit)).await {
-            Ok(Ok(notes)) => ok_result(call_id, serde_json::to_value(notes).unwrap()),
+            Ok(Ok(notes)) => ok_result(call_id, match serde_json::to_value(&notes) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }
@@ -174,7 +180,10 @@ impl Tool for MemoryRead {
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.read_note(&id)).await {
-            Ok(Ok(note)) => ok_result(call_id, serde_json::to_value(note).unwrap()),
+            Ok(Ok(note)) => ok_result(call_id, match serde_json::to_value(&note) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }
@@ -226,7 +235,10 @@ impl Tool for MemoryUpdate {
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.update_note(&id, &content)).await {
-            Ok(Ok(note)) => ok_result(call_id, serde_json::to_value(note).unwrap()),
+            Ok(Ok(note)) => ok_result(call_id, match serde_json::to_value(&note) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }
@@ -284,7 +296,10 @@ impl Tool for MemoryLink {
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.link_notes(&from, &to, &relation)).await {
-            Ok(Ok(link)) => ok_result(call_id, serde_json::to_value(link).unwrap()),
+            Ok(Ok(link)) => ok_result(call_id, match serde_json::to_value(&link) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }
@@ -335,7 +350,10 @@ impl Tool for MemoryTag {
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.tag_note(&id, &tags)).await {
-            Ok(Ok(note)) => ok_result(call_id, serde_json::to_value(note).unwrap()),
+            Ok(Ok(note)) => ok_result(call_id, match serde_json::to_value(&note) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }
@@ -424,7 +442,10 @@ impl Tool for MemoryLinks {
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.get_links_for_note(&id)).await {
-            Ok(Ok(links)) => ok_result(call_id, serde_json::to_value(links).unwrap()),
+            Ok(Ok(links)) => ok_result(call_id, match serde_json::to_value(&links) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }
@@ -462,7 +483,10 @@ impl Tool for MemoryList {
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.list_notes(tag.as_deref())).await {
-            Ok(Ok(notes)) => ok_result(call_id, serde_json::to_value(notes).unwrap()),
+            Ok(Ok(notes)) => ok_result(call_id, match serde_json::to_value(&notes) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
             Ok(Err(e)) => error_result(call_id, &e.to_string()),
             Err(e) => error_result(call_id, &format!("task join error: {e}")),
         }

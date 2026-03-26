@@ -155,17 +155,16 @@ fn serenity_message_to_in_event(msg: &serenity::Message, bot_user_id: serenity::
                 .map(|m| MessageId(m.id.to_string())),
         },
         tool_groups: None,
+        completion_flag: None,
     }
 }
 
 /// Determine the group ID for mode routing.
-/// DMs use the user ID, guild channels use the channel ID.
+/// DMs use the user ID, guild channels use the guild ID (matching mode router keys).
 fn group_id_for_message(msg: &serenity::Message) -> String {
-    if msg.guild_id.is_none() {
-        // DMs — route by user
-        msg.author.id.to_string()
-    } else {
-        msg.channel_id.to_string()
+    match msg.guild_id {
+        Some(guild_id) => guild_id.to_string(),
+        None => msg.author.id.to_string(),
     }
 }
 

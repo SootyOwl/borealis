@@ -6,7 +6,12 @@
 
 use crate::tools::{Tool, ToolContext, ToolDef, ToolDeps, ToolGroup, ToolRegistry, ToolResult};
 
-fn register(registry: &mut ToolRegistry, _deps: &ToolDeps) {
+fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
+    // Only register Discord channel tools when Discord is configured and enabled.
+    match &deps.settings.channels.discord {
+        Some(c) if c.enabled => {}
+        _ => return,
+    }
     register_discord_channel_tools(registry);
 }
 
@@ -54,7 +59,7 @@ impl Tool for ReactTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let emoji = args
             .get("emoji")
             .and_then(|v| v.as_str())
@@ -64,7 +69,7 @@ impl Tool for ReactTool {
         // Stub: in a real implementation, this would use the serenity HTTP client
         // to add the reaction via the Discord API.
         ToolResult {
-            call_id: String::new(), // filled by registry
+            call_id: ctx.call_id.clone(),
             content: serde_json::json!({
                 "status": "ok",
                 "emoji": emoji,
@@ -108,7 +113,7 @@ impl Tool for SendMessageTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let channel_name = args
             .get("channel_name")
             .and_then(|v| v.as_str())
@@ -121,7 +126,7 @@ impl Tool for SendMessageTool {
         // Stub: in a real implementation, this would resolve the channel name
         // to an ID and send via the serenity HTTP client.
         ToolResult {
-            call_id: String::new(),
+            call_id: ctx.call_id.clone(),
             content: serde_json::json!({
                 "status": "ok",
                 "channel_name": channel_name,

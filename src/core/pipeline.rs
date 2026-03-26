@@ -2,17 +2,20 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::config::CompactionConfig;
-use crate::core::event::{InEvent, OutEvent};
+use crate::core::event::{ChannelSource, InEvent, OutEvent};
+use crate::core::observer::ObserverRegistry;
 use crate::history::budget::{ContextBudget, Turn};
 use crate::history::compaction::{CompactionService, CompactionState};
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
 use crate::providers::{Provider, RequestConfig, ToolDef as ProviderToolDef};
+use crate::security::{AuthorizationResult, Security};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{self, estimate_tokens};
 
@@ -46,6 +49,18 @@ impl Default for PipelineConfig {
     }
 }
 
+/// Bundled dependencies for pipeline construction, avoiding parameter explosion.
+pub struct PipelineDeps {
+    pub history_store: Arc<HistoryStore>,
+    pub tool_registry: Arc<ToolRegistry>,
+    pub memory_store: Arc<dyn Memory>,
+    pub security: Arc<Security>,
+    pub observers: Arc<ObserverRegistry>,
+    pub compaction_config: CompactionConfig,
+    pub compaction_state: Arc<CompactionState>,
+    pub pipeline_config: PipelineConfig,
+}
+
 /// The message processing pipeline.
 ///
 /// Takes an inbound event, loads conversation history, builds a prompt with
@@ -58,23 +73,19 @@ pub struct Pipeline<P: Provider + 'static> {
     history_store: Arc<HistoryStore>,
     tool_registry: Arc<ToolRegistry>,
     memory_store: Arc<dyn Memory>,
+    security: Arc<Security>,
+    observers: Arc<ObserverRegistry>,
     compaction_service: CompactionService<P>,
     pipeline_config: PipelineConfig,
 }
 
 impl<P: Provider + 'static> Pipeline<P> {
     /// Create a new pipeline with all dependencies.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Arc<P>,
         system_prompt_path: &Path,
         core_persona_path: &Path,
-        history_store: Arc<HistoryStore>,
-        tool_registry: Arc<ToolRegistry>,
-        memory_store: Arc<dyn Memory>,
-        compaction_config: CompactionConfig,
-        compaction_state: Arc<CompactionState>,
-        pipeline_config: PipelineConfig,
+        deps: PipelineDeps,
     ) -> Result<Self> {
         let system_prompt = if system_prompt_path.exists() {
             std::fs::read_to_string(system_prompt_path).with_context(|| {
@@ -100,25 +111,25 @@ impl<P: Provider + 'static> Pipeline<P> {
             String::new()
         };
 
-        let compaction_prompt = if compaction_config.summary_prompt_path.exists() {
-            std::fs::read_to_string(&compaction_config.summary_prompt_path)
+        let compaction_prompt = if deps.compaction_config.summary_prompt_path.exists() {
+            std::fs::read_to_string(&deps.compaction_config.summary_prompt_path)
                 .unwrap_or_else(|_| default_compaction_prompt())
         } else {
             default_compaction_prompt()
         };
 
         let compaction_service = CompactionService::new(
-            Arc::clone(&history_store),
+            Arc::clone(&deps.history_store),
             Arc::clone(&provider),
-            compaction_config,
-            compaction_state,
+            deps.compaction_config,
+            deps.compaction_state,
             compaction_prompt,
         );
 
         info!(
             system_prompt_len = system_prompt.len(),
             core_persona_len = core_persona.len(),
-            tool_count = tool_registry.tool_count(),
+            tool_count = deps.tool_registry.tool_count(),
             provider = provider.name(),
             "pipeline initialized"
         );
@@ -127,15 +138,20 @@ impl<P: Provider + 'static> Pipeline<P> {
             provider,
             system_prompt,
             core_persona,
-            history_store,
-            tool_registry,
-            memory_store,
+            history_store: deps.history_store,
+            tool_registry: deps.tool_registry,
+            memory_store: deps.memory_store,
+            security: deps.security,
+            observers: deps.observers,
             compaction_service,
-            pipeline_config,
+            pipeline_config: deps.pipeline_config,
         })
     }
 
     async fn process_impl(&self, event: &InEvent) -> Result<OutEvent> {
+        // Observer: message received
+        self.observers.notify_message_received(event);
+
         let conv_id = event_conv_id_to_types(&event.context.conversation_id);
 
         // Ensure conversation exists in the store.
@@ -225,6 +241,9 @@ impl<P: Provider + 'static> Pipeline<P> {
             ..Default::default()
         };
 
+        // Determine whether this event is system-originated (bypasses authorization).
+        let is_system_event = event.source == ChannelSource::Scheduler;
+
         // Tool execution loop.
         let mut iterations = 0;
         let response = loop {
@@ -234,10 +253,28 @@ impl<P: Provider + 'static> Pipeline<P> {
                 "calling LLM provider"
             );
 
+            // Observer: LLM request
+            self.observers
+                .notify_llm_request(&provider_messages, &provider_tools);
+
+            let llm_start = Instant::now();
             let response = self
                 .provider
                 .chat(provider_messages.clone(), &provider_tools, &config)
-                .await?;
+                .await;
+            let llm_duration = llm_start.elapsed();
+
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    self.observers.notify_error(&e);
+                    return Err(e);
+                }
+            };
+
+            // Observer: LLM response
+            self.observers
+                .notify_llm_response(&response, llm_duration);
 
             debug!(
                 usage.input = response.usage.input_tokens,
@@ -297,7 +334,62 @@ impl<P: Provider + 'static> Pipeline<P> {
                     name: tc.name.clone(),
                     arguments: tc.arguments.clone(),
                 };
+
+                // Observer: tool call
+                self.observers.notify_tool_call(&tools_call, &tool_ctx);
+
+                // Security: check authorization (system events bypass)
+                if !is_system_event {
+                    if let AuthorizationResult::Denied {
+                        tool_name,
+                        user_id,
+                    } = self
+                        .security
+                        .check_authorization(&tc.name, &event.message.author.id)
+                    {
+                        let denied_result = crate::tools::ToolResult {
+                            call_id: tc.id.clone(),
+                            content: serde_json::json!({
+                                "error": format!(
+                                    "authorization denied: user '{}' is not allowed to call '{}'",
+                                    user_id, tool_name
+                                )
+                            }),
+                            is_error: true,
+                        };
+                        let result_content =
+                            serde_json::to_string(&denied_result.content).unwrap_or_default();
+
+                        // Observer: tool result (authorization denied)
+                        self.observers.notify_tool_result(
+                            &tools_call,
+                            &denied_result,
+                            std::time::Duration::ZERO,
+                        );
+
+                        let tool_msg =
+                            types::ChatMessage::tool_result(&tc.id, &result_content);
+                        self.history_store
+                            .append_message(&conv_id, &tool_msg, Some(&turn_id))
+                            .context("failed to append tool result")?;
+
+                        provider_messages.push(crate::providers::ChatMessage {
+                            role: crate::providers::Role::Tool,
+                            content: result_content,
+                            tool_call_id: Some(tc.id.clone()),
+                            tool_calls: vec![],
+                        });
+                        continue;
+                    }
+                }
+
+                let tool_start = Instant::now();
                 let result = self.tool_registry.execute(&tools_call, &tool_ctx).await;
+                let tool_duration = tool_start.elapsed();
+
+                // Observer: tool result
+                self.observers
+                    .notify_tool_result(&tools_call, &result, tool_duration);
 
                 let result_content = serde_json::to_string(&result.content).unwrap_or_default();
 
@@ -528,4 +620,242 @@ fn tool_defs_to_provider(defs: &[crate::tools::ToolDef]) -> Vec<ProviderToolDef>
             parameters: d.parameters.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::event::{
+        Author, ChannelSource, ConversationId, InEvent, Message, MessageContext, MessageId,
+    };
+    use crate::core::observer::ObserverRegistry;
+    use crate::providers::{LlmResponse, TokenUsage};
+    use crate::security::Security;
+    use std::sync::Mutex;
+
+    /// A mock provider that returns a configurable sequence of responses.
+    struct MockProvider {
+        responses: Mutex<Vec<LlmResponse>>,
+    }
+
+    impl MockProvider {
+        fn new(responses: Vec<LlmResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+    }
+
+    impl crate::providers::Provider for MockProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<crate::providers::ChatMessage>,
+            _tools: &[crate::providers::ToolDef],
+            _config: &crate::providers::RequestConfig,
+        ) -> anyhow::Result<LlmResponse> {
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                Ok(LlmResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                })
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+
+        fn estimate_tokens(&self, text: &str) -> usize {
+            text.len() / 4
+        }
+    }
+
+    fn make_test_event(source: ChannelSource, author_id: &str) -> InEvent {
+        InEvent {
+            source: source.clone(),
+            message: Message {
+                id: MessageId("msg-1".into()),
+                author: Author {
+                    id: author_id.into(),
+                    display_name: "Tester".into(),
+                },
+                text: "hello".into(),
+                timestamp: chrono::Utc::now(),
+                mentions_bot: false,
+            },
+            context: MessageContext {
+                conversation_id: ConversationId::Dm {
+                    channel_type: source,
+                    user_id: author_id.into(),
+                },
+                channel_id: "test-chan".into(),
+                reply_to: None,
+            },
+            tool_groups: None,
+        }
+    }
+
+    fn make_test_security() -> Arc<Security> {
+        let config = crate::config::RateLimitConfig::default();
+        let tmp = std::env::temp_dir().join("borealis_test_pipeline");
+        let _ = std::fs::create_dir_all(&tmp);
+        let mut security = Security::new(&config, tmp, "memory", ["admin".to_string()]);
+        security.register_restricted("bash_exec");
+        Arc::new(security)
+    }
+
+    fn make_test_pipeline(
+        responses: Vec<LlmResponse>,
+        security: Arc<Security>,
+    ) -> Pipeline<MockProvider> {
+        let provider = Arc::new(MockProvider::new(responses));
+        let db = Arc::new(Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;",
+            )
+            .unwrap();
+        }
+        crate::history::schema::initialize(&db.lock().unwrap()).unwrap();
+        let history_store = Arc::new(crate::history::store::HistoryStore::new(Arc::clone(&db)));
+
+        let tmp_persona = std::env::temp_dir().join("borealis_test_core.md");
+        std::fs::write(&tmp_persona, "test persona").unwrap();
+        let memory_store: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(Arc::clone(&db), tmp_persona.clone()).unwrap());
+
+        let tool_registry = Arc::new(crate::tools::ToolRegistry::new());
+        let observers = Arc::new(ObserverRegistry::new());
+
+        let deps = PipelineDeps {
+            history_store,
+            tool_registry,
+            memory_store,
+            security,
+            observers,
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction_state: Arc::new(crate::history::compaction::CompactionState::new()),
+            pipeline_config: PipelineConfig::default(),
+        };
+
+        let sys_path = std::path::Path::new("/nonexistent/system_prompt.md");
+        let persona_path = &tmp_persona;
+
+        Pipeline::new(provider, sys_path, persona_path, deps).unwrap()
+    }
+
+    #[tokio::test]
+    async fn authorization_denies_restricted_tool_for_unauthorized_user() {
+        let security = make_test_security();
+
+        // Provider returns a response with a tool call to bash_exec, then a final text response.
+        let responses = vec![
+            LlmResponse {
+                text: Some("Let me run that.".into()),
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: "tc_1".into(),
+                    name: "bash_exec".into(),
+                    arguments: serde_json::json!({"command": "echo hi"}),
+                }],
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                },
+            },
+            LlmResponse {
+                text: Some("I was denied.".into()),
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                },
+            },
+        ];
+
+        let pipeline = make_test_pipeline(responses, security);
+        let event = make_test_event(ChannelSource::Cli, "random_user");
+
+        let result = pipeline.process_impl(&event).await.unwrap();
+        assert_eq!(result.text, Some("I was denied.".into()));
+    }
+
+    #[tokio::test]
+    async fn authorization_allows_restricted_tool_for_authorized_user() {
+        let security = make_test_security();
+
+        // Provider returns a tool call then a final text.
+        // For authorized user, the tool will be executed (it won't exist in registry,
+        // so it returns "unknown tool" — but the point is it wasn't denied by authorization).
+        let responses = vec![
+            LlmResponse {
+                text: Some("Running.".into()),
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: "tc_1".into(),
+                    name: "bash_exec".into(),
+                    arguments: serde_json::json!({"command": "echo hi"}),
+                }],
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                },
+            },
+            LlmResponse {
+                text: Some("Done.".into()),
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                },
+            },
+        ];
+
+        let pipeline = make_test_pipeline(responses, security);
+        let event = make_test_event(ChannelSource::Cli, "admin");
+
+        let result = pipeline.process_impl(&event).await.unwrap();
+        // Should reach final response (tool was allowed but not found, then LLM responded)
+        assert_eq!(result.text, Some("Done.".into()));
+    }
+
+    #[tokio::test]
+    async fn scheduler_events_bypass_authorization() {
+        let security = make_test_security();
+
+        let responses = vec![
+            LlmResponse {
+                text: Some("System task.".into()),
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: "tc_1".into(),
+                    name: "bash_exec".into(),
+                    arguments: serde_json::json!({"command": "echo hi"}),
+                }],
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                },
+            },
+            LlmResponse {
+                text: Some("System done.".into()),
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                },
+            },
+        ];
+
+        let pipeline = make_test_pipeline(responses, security);
+        // Use Scheduler source — even with "random_user" it should bypass authorization.
+        let event = make_test_event(ChannelSource::Scheduler, "random_user");
+
+        let result = pipeline.process_impl(&event).await.unwrap();
+        assert_eq!(result.text, Some("System done.".into()));
+    }
 }

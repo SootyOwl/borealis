@@ -73,6 +73,15 @@ async fn main() -> anyhow::Result<()> {
         )?);
     info!("memory store initialized");
 
+    // Create the security module.
+    let security = Arc::new(borealis::security::Security::new(
+        &settings.rate_limit,
+        settings.tools.computer_use.sandbox_root.clone(),
+        &settings.tools.computer_use.memory_dir,
+        settings.rate_limit.allowed_users.clone(),
+    ));
+    info!("security module initialized");
+
     // Create the tool registry with memory tools.
     let mut tool_registry = borealis::tools::ToolRegistry::new();
     borealis::tools::register_memory_tools(&mut tool_registry, Arc::clone(&memory_store));
@@ -97,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&history_store),
         Arc::clone(&tool_registry),
         memory_store,
+        Arc::clone(&security),
     )?;
 
     // Spawn the scheduler if events are configured.

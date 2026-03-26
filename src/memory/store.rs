@@ -710,4 +710,149 @@ mod tests {
         let err = store.forget_note("note_nonexist").unwrap_err();
         assert!(matches!(err, MemoryError::NotFound(_)));
     }
+
+    /// A mock memory implementation to verify the Memory trait is object-safe
+    /// and can be used as `Arc<dyn Memory>`.
+    struct MockMemory {
+        notes: std::sync::Mutex<Vec<Note>>,
+    }
+
+    impl MockMemory {
+        fn new() -> Self {
+            Self {
+                notes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Memory for MockMemory {
+        fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
+            let note = Note {
+                id: format!("mock_{}", self.notes.lock().unwrap().len()),
+                title: title.to_string(),
+                content: content.to_string(),
+                tags: tags.to_vec(),
+                links: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+            };
+            self.notes.lock().unwrap().push(note.clone());
+            Ok(note)
+        }
+
+        fn read_note(&self, id: &str) -> MemoryResult<Note> {
+            self.notes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|n| n.id == id)
+                .cloned()
+                .ok_or_else(|| MemoryError::NotFound(id.to_string()))
+        }
+
+        fn update_note(&self, id: &str, content: &str) -> MemoryResult<Note> {
+            let mut notes = self.notes.lock().unwrap();
+            let note = notes
+                .iter_mut()
+                .find(|n| n.id == id)
+                .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+            note.content = content.to_string();
+            Ok(note.clone())
+        }
+
+        fn forget_note(&self, id: &str) -> MemoryResult<()> {
+            let mut notes = self.notes.lock().unwrap();
+            let pos = notes
+                .iter()
+                .position(|n| n.id == id)
+                .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+            notes.remove(pos);
+            Ok(())
+        }
+
+        fn search_notes(&self, query: &str, limit: usize) -> MemoryResult<Vec<Note>> {
+            let notes = self.notes.lock().unwrap();
+            Ok(notes
+                .iter()
+                .filter(|n| n.title.contains(query) || n.content.contains(query))
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn list_notes(&self, tag_filter: Option<&str>) -> MemoryResult<Vec<Note>> {
+            let notes = self.notes.lock().unwrap();
+            Ok(match tag_filter {
+                Some(tag) => notes
+                    .iter()
+                    .filter(|n| n.tags.iter().any(|t| t == tag))
+                    .cloned()
+                    .collect(),
+                None => notes.clone(),
+            })
+        }
+
+        fn link_notes(&self, from_id: &str, to_id: &str, relation: &str) -> MemoryResult<Link> {
+            Ok(Link {
+                from_id: from_id.to_string(),
+                to_id: to_id.to_string(),
+                relation: relation.to_string(),
+                direction: None,
+            })
+        }
+
+        fn get_links_for_note(&self, _id: &str) -> MemoryResult<Vec<Link>> {
+            Ok(Vec::new())
+        }
+
+        fn tag_note(&self, id: &str, tags: &[String]) -> MemoryResult<Note> {
+            let mut notes = self.notes.lock().unwrap();
+            let note = notes
+                .iter_mut()
+                .find(|n| n.id == id)
+                .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+            note.tags = tags.to_vec();
+            Ok(note.clone())
+        }
+
+        fn load_core_persona(&self) -> MemoryResult<String> {
+            Ok("Mock persona".to_string())
+        }
+    }
+
+    #[test]
+    fn mock_memory_is_object_safe_and_usable_as_arc_dyn() {
+        // Verify the Memory trait is object-safe by constructing Arc<dyn Memory>.
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory::new());
+
+        // Exercise the trait through the dyn reference.
+        let note = memory
+            .create_note("Test", "Content", &["tag1".into()])
+            .unwrap();
+        assert_eq!(note.title, "Test");
+        assert_eq!(note.id, "mock_0");
+
+        let read = memory.read_note(&note.id).unwrap();
+        assert_eq!(read.content, "Content");
+
+        let updated = memory.update_note(&note.id, "New content").unwrap();
+        assert_eq!(updated.content, "New content");
+
+        let found = memory.search_notes("New", 10).unwrap();
+        assert_eq!(found.len(), 1);
+
+        let listed = memory.list_notes(Some("tag1")).unwrap();
+        assert_eq!(listed.len(), 1);
+
+        let tagged = memory
+            .tag_note(&note.id, &["new_tag".into()])
+            .unwrap();
+        assert_eq!(tagged.tags, vec!["new_tag"]);
+
+        let persona = memory.load_core_persona().unwrap();
+        assert_eq!(persona, "Mock persona");
+
+        memory.forget_note(&note.id).unwrap();
+        assert!(memory.read_note(&note.id).is_err());
+    }
 }

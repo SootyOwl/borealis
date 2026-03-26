@@ -4,14 +4,16 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use tracing::info;
 
-use crate::config::{CompactionConfig, ProviderEntry, Settings};
-use crate::core::pipeline::{Pipeline, PipelineConfig, PipelineRunner};
+use crate::config::{ProviderEntry, Settings};
+use crate::core::observer::{ObserverRegistry, TracingObserver};
+use crate::core::pipeline::{Pipeline, PipelineDeps, PipelineRunner};
 use crate::history::compaction::CompactionState;
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
 use crate::providers::ProviderConfig;
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::openai::OpenAiProvider;
+use crate::security::Security;
 use crate::tools::ToolRegistry;
 
 /// A resolved provider entry with configuration ready for construction.
@@ -93,53 +95,23 @@ pub fn resolve_named_provider(name: &str, settings: &Settings) -> Option<Resolve
 /// This is the only place that maps provider names to concrete types. Adding a
 /// new provider means adding a match arm here (plus implementing `Provider` and
 /// adding a config section).
-#[allow(clippy::too_many_arguments)]
 fn build_pipeline_for_provider(
     resolved: &ResolvedProvider,
     sys_path: &Path,
     persona_path: &Path,
-    history_store: Arc<HistoryStore>,
-    tool_registry: Arc<ToolRegistry>,
-    memory_store: Arc<dyn Memory>,
-    compaction_config: CompactionConfig,
-    compaction_state: Arc<CompactionState>,
+    deps: PipelineDeps,
 ) -> Result<Arc<dyn PipelineRunner>> {
-    let pipeline_config = PipelineConfig {
-        model_max_tokens: resolved.max_history_tokens,
-        response_reserve: 1024,
-    };
-
     match resolved.name.as_str() {
         "anthropic" => {
             let provider = Arc::new(AnthropicProvider::new(resolved.config.clone())?);
             info!(model = %resolved.config.model, "using Anthropic provider");
-            let pipeline = Pipeline::new(
-                provider,
-                sys_path,
-                persona_path,
-                history_store,
-                tool_registry,
-                memory_store,
-                compaction_config,
-                compaction_state,
-                pipeline_config,
-            )?;
+            let pipeline = Pipeline::new(provider, sys_path, persona_path, deps)?;
             Ok(Arc::new(pipeline))
         }
         "openai" => {
             let provider = Arc::new(OpenAiProvider::new(resolved.config.clone())?);
             info!(model = %resolved.config.model, "using OpenAI-compatible provider");
-            let pipeline = Pipeline::new(
-                provider,
-                sys_path,
-                persona_path,
-                history_store,
-                tool_registry,
-                memory_store,
-                compaction_config,
-                compaction_state,
-                pipeline_config,
-            )?;
+            let pipeline = Pipeline::new(provider, sys_path, persona_path, deps)?;
             Ok(Arc::new(pipeline))
         }
         other => bail!("unknown provider type: {other}"),
@@ -156,6 +128,7 @@ pub fn build_pipeline(
     history_store: Arc<HistoryStore>,
     tool_registry: Arc<ToolRegistry>,
     memory_store: Arc<dyn Memory>,
+    security: Arc<Security>,
 ) -> Result<Arc<dyn PipelineRunner>> {
     let providers = resolve_configured_providers(settings);
 
@@ -170,19 +143,31 @@ pub fn build_pipeline(
     let compaction_config = settings.bot.compaction.clone();
     let compaction_state = Arc::new(CompactionState::new());
 
+    // Create observer registry with TracingObserver.
+    let mut observers = ObserverRegistry::new();
+    observers.register(Box::new(TracingObserver));
+    let observers = Arc::new(observers);
+
     // Use the first configured provider.
     let resolved = &providers[0];
 
-    build_pipeline_for_provider(
-        resolved,
-        sys_path,
-        persona_path,
+    let pipeline_config = crate::core::pipeline::PipelineConfig {
+        model_max_tokens: resolved.max_history_tokens,
+        response_reserve: 1024,
+    };
+
+    let deps = PipelineDeps {
         history_store,
         tool_registry,
         memory_store,
+        security,
+        observers,
         compaction_config,
         compaction_state,
-    )
+        pipeline_config,
+    };
+
+    build_pipeline_for_provider(resolved, sys_path, persona_path, deps)
 }
 
 #[cfg(test)]

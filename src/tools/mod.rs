@@ -1,7 +1,9 @@
+mod channel_tools;
 mod computer_tools;
 mod memory_tools;
 mod web_tools;
 
+pub use channel_tools::register_discord_channel_tools;
 pub use computer_tools::register_computer_tools;
 pub use memory_tools::register_memory_tools;
 pub use web_tools::register_web_tools;
@@ -256,5 +258,87 @@ mod tests {
 
         let result = registry.execute(&call, &ctx).await;
         assert!(result.is_error);
+    }
+
+    /// A second tool for group filtering tests.
+    struct PingTool;
+
+    impl Tool for PingTool {
+        fn name(&self) -> &str {
+            "ping"
+        }
+
+        fn definition(&self) -> ToolDef {
+            ToolDef {
+                name: "ping".to_string(),
+                description: "Returns pong".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult {
+                call_id: "test".to_string(),
+                content: serde_json::json!("pong"),
+                is_error: false,
+            }
+        }
+    }
+
+    #[test]
+    fn definitions_for_groups_filters_correctly() {
+        let mut registry = ToolRegistry::new();
+        registry.register_with_group(EchoTool, ToolGroup::Memory);
+        registry.register_with_group(PingTool, ToolGroup::Computer);
+
+        // Request only Memory group — should get echo but not ping.
+        let memory_defs = registry.definitions_for_groups(&[ToolGroup::Memory]);
+        assert_eq!(memory_defs.len(), 1);
+        assert_eq!(memory_defs[0].name, "echo");
+
+        // Request only Computer group — should get ping but not echo.
+        let computer_defs = registry.definitions_for_groups(&[ToolGroup::Computer]);
+        assert_eq!(computer_defs.len(), 1);
+        assert_eq!(computer_defs[0].name, "ping");
+
+        // Request both — should get both.
+        let both_defs =
+            registry.definitions_for_groups(&[ToolGroup::Memory, ToolGroup::Computer]);
+        assert_eq!(both_defs.len(), 2);
+
+        // Request a group with no tools — should get nothing.
+        let web_defs = registry.definitions_for_groups(&[ToolGroup::Web]);
+        assert!(web_defs.is_empty());
+
+        // Empty group list — should get nothing.
+        let empty_defs = registry.definitions_for_groups(&[]);
+        assert!(empty_defs.is_empty());
+    }
+
+    #[test]
+    fn definitions_for_groups_excludes_ungrouped_tools() {
+        let mut registry = ToolRegistry::new();
+        // Register without a group.
+        registry.register(EchoTool);
+        // Register with a group.
+        registry.register_with_group(PingTool, ToolGroup::Computer);
+
+        // definitions() returns all tools.
+        assert_eq!(registry.definitions().len(), 2);
+
+        // definitions_for_groups returns only grouped tools.
+        let computer_defs = registry.definitions_for_groups(&[ToolGroup::Computer]);
+        assert_eq!(computer_defs.len(), 1);
+        assert_eq!(computer_defs[0].name, "ping");
+
+        // Ungrouped echo is excluded from group filtering.
+        let all_groups = registry.definitions_for_groups(&[
+            ToolGroup::Memory,
+            ToolGroup::Computer,
+            ToolGroup::Web,
+            ToolGroup::Channel,
+        ]);
+        assert_eq!(all_groups.len(), 1);
+        assert_eq!(all_groups[0].name, "ping");
     }
 }

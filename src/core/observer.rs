@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crate::core::event::InEvent;
-use crate::providers::{ChatMessage, LlmResponse};
-use crate::tools::{ToolCall, ToolContext, ToolDef, ToolResult};
+use crate::providers::{ChatMessage, LlmResponse, ToolDef as ProviderToolDef};
+use crate::tools::{ToolCall, ToolContext, ToolResult};
 
 // ---------------------------------------------------------------------------
 // Observer trait
@@ -17,7 +17,7 @@ pub trait Observer: Send + Sync {
     fn on_message_received(&self, _event: &InEvent) {}
 
     /// Called just before an LLM request is sent.
-    fn on_llm_request(&self, _messages: &[ChatMessage], _tools: &[ToolDef]) {}
+    fn on_llm_request(&self, _messages: &[ChatMessage], _tools: &[ProviderToolDef]) {}
 
     /// Called when an LLM response is received.
     fn on_llm_response(&self, _response: &LlmResponse, _duration: Duration) {}
@@ -72,7 +72,7 @@ impl ObserverRegistry {
         }
     }
 
-    pub fn notify_llm_request(&self, messages: &[ChatMessage], tools: &[ToolDef]) {
+    pub fn notify_llm_request(&self, messages: &[ChatMessage], tools: &[ProviderToolDef]) {
         for obs in &self.observers {
             obs.on_llm_request(messages, tools);
         }

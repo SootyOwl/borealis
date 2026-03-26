@@ -161,9 +161,15 @@ impl<P: Provider + 'static> Pipeline<P> {
         let conv_id = event.context.conversation_id.clone();
 
         // Ensure conversation exists in the store.
-        self.history_store
-            .ensure_conversation(&conv_id, ConversationMode::Shared)
-            .context("failed to ensure conversation")?;
+        {
+            let store = Arc::clone(&self.history_store);
+            let cid = conv_id.clone();
+            tokio::task::spawn_blocking(move || {
+                store.ensure_conversation(&cid, ConversationMode::Shared)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("task join error: {e}"))??;
+        }
 
         // Build the user message and persist it.
         let user_text = format!(
@@ -171,16 +177,21 @@ impl<P: Provider + 'static> Pipeline<P> {
             event.message.author.display_name, event.message.text
         );
         let user_msg = ChatMessage::user(&user_text);
-        let turn_id = self
-            .history_store
-            .append_message(&conv_id, &user_msg, None)
-            .context("failed to append user message")?;
+        let turn_id = {
+            let store = Arc::clone(&self.history_store);
+            let cid = conv_id.clone();
+            let msg = user_msg.clone();
+            tokio::task::spawn_blocking(move || store.append_message(&cid, &msg, None))
+                .await
+                .map_err(|e| anyhow::anyhow!("task join error: {e}"))?
+                .context("failed to append user message")?
+        };
 
         // Load conversation history (with compaction summary support).
-        let (turns, summary_token_overhead) = self.load_history_turns(&conv_id)?;
+        let (turns, summary_token_overhead) = self.load_history_turns(&conv_id).await?;
 
         // Retrieve relevant memories based on user message.
-        let retrieved_memories = self.retrieve_memories(&event.message.text);
+        let retrieved_memories = self.retrieve_memories(&event.message.text).await;
 
         // Build the context budget.
         let system_tokens = estimate_tokens(&self.system_prompt);
@@ -305,9 +316,17 @@ impl<P: Provider + 'static> Pipeline<P> {
                 &assistant_text,
                 response.tool_calls.clone(),
             );
-            self.history_store
-                .append_message(&conv_id, &assistant_msg, Some(&turn_id))
-                .context("failed to append assistant tool-call message")?;
+            {
+                let store = Arc::clone(&self.history_store);
+                let cid = conv_id.clone();
+                let msg = assistant_msg.clone();
+                let tid = turn_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.append_message(&cid, &msg, Some(&tid))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("task join error: {e}"))??;
+            }
 
             // Add assistant message to provider messages (same type now).
             provider_messages.push(assistant_msg);
@@ -353,9 +372,17 @@ impl<P: Provider + 'static> Pipeline<P> {
                         );
 
                         let tool_msg = ChatMessage::tool_result(&tc.id, &result_content);
-                        self.history_store
-                            .append_message(&conv_id, &tool_msg, Some(&turn_id))
-                            .context("failed to append tool result")?;
+                        {
+                            let store = Arc::clone(&self.history_store);
+                            let cid = conv_id.clone();
+                            let msg = tool_msg.clone();
+                            let tid = turn_id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                store.append_message(&cid, &msg, Some(&tid))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("task join error: {e}"))??;
+                        }
 
                         provider_messages.push(tool_msg);
                         continue;
@@ -374,9 +401,17 @@ impl<P: Provider + 'static> Pipeline<P> {
 
                 // Persist tool result to history.
                 let tool_msg = ChatMessage::tool_result(&tc.id, &result_content);
-                self.history_store
-                    .append_message(&conv_id, &tool_msg, Some(&turn_id))
-                    .context("failed to append tool result")?;
+                {
+                    let store = Arc::clone(&self.history_store);
+                    let cid = conv_id.clone();
+                    let msg = tool_msg.clone();
+                    let tid = turn_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        store.append_message(&cid, &msg, Some(&tid))
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("task join error: {e}"))??;
+                }
 
                 // Add to provider messages.
                 provider_messages.push(tool_msg);
@@ -389,16 +424,24 @@ impl<P: Provider + 'static> Pipeline<P> {
         let response_text = response.text.clone().unwrap_or_default();
         if !response_text.is_empty() {
             let final_msg = ChatMessage::assistant(&response_text);
-            self.history_store
-                .append_message(&conv_id, &final_msg, Some(&turn_id))
-                .context("failed to append final assistant message")?;
+            let store = Arc::clone(&self.history_store);
+            let cid = conv_id.clone();
+            tokio::task::spawn_blocking(move || {
+                store.append_message(&cid, &final_msg, Some(&turn_id))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("task join error: {e}"))??;
         }
 
         // Check if compaction should be triggered.
-        let history_tokens = self
-            .history_store
-            .total_history_tokens(&conv_id)
-            .unwrap_or(0);
+        let history_tokens = {
+            let store = Arc::clone(&self.history_store);
+            let cid = conv_id.clone();
+            tokio::task::spawn_blocking(move || store.total_history_tokens(&cid))
+                .await
+                .map_err(|e| anyhow::anyhow!("task join error: {e}"))?
+                .unwrap_or(0)
+        };
         let history_budget = budget.available_for_history();
         self.compaction_service
             .maybe_trigger(&conv_id, history_tokens, history_budget);
@@ -407,76 +450,92 @@ impl<P: Provider + 'static> Pipeline<P> {
     }
 
     /// Load conversation history as turns, incorporating any compaction summary.
-    fn load_history_turns(&self, conv_id: &ConversationId) -> Result<(Vec<Turn>, usize)> {
-        let summary = self.history_store.load_summary(conv_id)?;
+    ///
+    /// All SQLite I/O runs on the blocking thread pool via `spawn_blocking`.
+    async fn load_history_turns(&self, conv_id: &ConversationId) -> Result<(Vec<Turn>, usize)> {
+        let store = Arc::clone(&self.history_store);
+        let cid = conv_id.clone();
 
-        let messages = match &summary {
-            Some(s) => self
-                .history_store
-                .load_messages_after(conv_id, s.compacted_up_to)?,
-            None => self.history_store.load_messages(conv_id)?,
-        };
+        tokio::task::spawn_blocking(move || {
+            let summary = store.load_summary(&cid)?;
 
-        // Build turns from stored messages (group by turn_id).
-        let mut turns: Vec<Turn> = Vec::new();
-        let mut summary_overhead = 0usize;
+            let messages = match &summary {
+                Some(s) => store.load_messages_after(&cid, s.compacted_up_to)?,
+                None => store.load_messages(&cid)?,
+            };
 
-        // If we have a summary, create a synthetic turn for it.
-        if let Some(ref s) = summary {
-            turns.push(Turn {
-                turn_id: "__summary__".to_string(),
-                messages: vec![ChatMessage::system(format!(
-                    "## Conversation Summary\n\n{}",
-                    s.summary_text
-                ))],
-                total_tokens: s.token_estimate,
-            });
-            summary_overhead = s.token_estimate;
-        }
+            // Build turns from stored messages (group by turn_id).
+            let mut turns: Vec<Turn> = Vec::new();
+            let mut summary_overhead = 0usize;
 
-        // Group messages by turn_id.
-        let mut current_turn_id: Option<String> = None;
-        let mut current_messages: Vec<ChatMessage> = Vec::new();
-        let mut current_tokens: usize = 0;
-
-        for stored in &messages {
-            if current_turn_id.as_deref() != Some(&stored.turn_id) {
-                // Flush previous turn.
-                if let Some(tid) = current_turn_id.take() {
-                    turns.push(Turn {
-                        turn_id: tid,
-                        messages: std::mem::take(&mut current_messages),
-                        total_tokens: current_tokens,
-                    });
-                    current_tokens = 0;
-                }
-                current_turn_id = Some(stored.turn_id.clone());
+            // If we have a summary, create a synthetic turn for it.
+            if let Some(ref s) = summary {
+                turns.push(Turn {
+                    turn_id: "__summary__".to_string(),
+                    messages: vec![ChatMessage::system(format!(
+                        "## Conversation Summary\n\n{}",
+                        s.summary_text
+                    ))],
+                    total_tokens: s.token_estimate,
+                });
+                summary_overhead = s.token_estimate;
             }
-            current_messages.push(stored.to_chat_message());
-            current_tokens += stored.token_estimate;
-        }
 
-        // Flush last turn.
-        if let Some(tid) = current_turn_id {
-            turns.push(Turn {
-                turn_id: tid,
-                messages: current_messages,
-                total_tokens: current_tokens,
-            });
-        }
+            // Group messages by turn_id.
+            let mut current_turn_id: Option<String> = None;
+            let mut current_messages: Vec<ChatMessage> = Vec::new();
+            let mut current_tokens: usize = 0;
 
-        Ok((turns, summary_overhead))
+            for stored in &messages {
+                if current_turn_id.as_deref() != Some(&stored.turn_id) {
+                    // Flush previous turn.
+                    if let Some(tid) = current_turn_id.take() {
+                        turns.push(Turn {
+                            turn_id: tid,
+                            messages: std::mem::take(&mut current_messages),
+                            total_tokens: current_tokens,
+                        });
+                        current_tokens = 0;
+                    }
+                    current_turn_id = Some(stored.turn_id.clone());
+                }
+                current_messages.push(stored.to_chat_message());
+                current_tokens += stored.token_estimate;
+            }
+
+            // Flush last turn.
+            if let Some(tid) = current_turn_id {
+                turns.push(Turn {
+                    turn_id: tid,
+                    messages: current_messages,
+                    total_tokens: current_tokens,
+                });
+            }
+
+            Ok((turns, summary_overhead))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("task join error: {e}"))?
     }
 
     /// Search memory for notes relevant to the user's message.
-    fn retrieve_memories(&self, query: &str) -> Vec<String> {
-        match self.memory_store.search_notes(query, 5) {
-            Ok(notes) => notes
+    ///
+    /// Runs on the blocking thread pool since `Memory::search_notes` does SQLite I/O.
+    async fn retrieve_memories(&self, query: &str) -> Vec<String> {
+        let mem = Arc::clone(&self.memory_store);
+        let q = query.to_owned();
+        let result = tokio::task::spawn_blocking(move || mem.search_notes(&q, 5)).await;
+        match result {
+            Ok(Ok(notes)) => notes
                 .into_iter()
                 .map(|n: crate::memory::Note| format!("**{}**: {}", n.title, n.content))
                 .collect(),
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(error = %e, "memory retrieval failed, continuing without memories");
+                vec![]
+            }
+            Err(e) => {
+                warn!(error = %e, "memory retrieval task panicked, continuing without memories");
                 vec![]
             }
         }

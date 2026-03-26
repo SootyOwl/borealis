@@ -321,6 +321,7 @@ mod tests {
                 channel_id: "cli".into(),
                 reply_to: None,
             },
+            tool_groups: None,
         }
     }
 
@@ -331,7 +332,6 @@ mod tests {
                     target: event.source.clone(),
                     channel_id: event.context.channel_id.clone(),
                     text: Some(event.message.text.clone()),
-                    directives: vec![],
                     reply_to: None,
                 })
             })
@@ -430,7 +430,6 @@ mod tests {
                     target: event.source.clone(),
                     channel_id: event.context.channel_id.clone(),
                     text: Some(event.message.text.clone()),
-                    directives: vec![],
                     reply_to: None,
                 })
             })

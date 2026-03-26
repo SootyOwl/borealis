@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::config::CompactionConfig;
-use crate::core::directive::parse_directives;
 use crate::core::event::{InEvent, OutEvent};
 use crate::history::budget::{ContextBudget, Turn};
 use crate::history::compaction::{CompactionService, CompactionState};
@@ -164,7 +163,19 @@ impl<P: Provider + 'static> Pipeline<P> {
         // Build the context budget.
         let system_tokens = estimate_tokens(&self.system_prompt);
         let persona_tokens = estimate_tokens(&self.core_persona);
-        let tool_defs = self.tool_registry.definitions();
+        let tool_defs = if let Some(ref group_names) = event.tool_groups {
+            let groups: Vec<crate::tools::ToolGroup> = group_names
+                .iter()
+                .filter_map(|name| crate::tools::ToolGroup::from_str_opt(name))
+                .collect();
+            if groups.is_empty() {
+                self.tool_registry.definitions()
+            } else {
+                self.tool_registry.definitions_for_groups(&groups)
+            }
+        } else {
+            self.tool_registry.definitions()
+        };
         let tool_defs_json = serde_json::to_string(&tool_defs).unwrap_or_default();
         let tool_def_tokens = estimate_tokens(&tool_defs_json) + summary_token_overhead;
 
@@ -410,24 +421,10 @@ impl<P: Provider + 'static> Pipeline<P> {
         event: &InEvent,
         response: crate::providers::LlmResponse,
     ) -> Result<OutEvent> {
-        let text = response.text.clone();
-
-        // Parse directives from the response text.
-        let directives = if let Some(ref text) = text {
-            let parsed = parse_directives(text);
-            if !parsed.is_empty() {
-                debug!(count = parsed.len(), "directives parsed from response");
-            }
-            parsed
-        } else {
-            vec![]
-        };
-
         Ok(OutEvent {
             target: event.source.clone(),
             channel_id: event.context.channel_id.clone(),
-            text,
-            directives,
+            text: response.text.clone(),
             reply_to: Some(event.message.id.clone()),
         })
     }

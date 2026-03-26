@@ -10,8 +10,7 @@ use tracing::{debug, info};
 use crate::channels::{Channel, ChannelRegistry};
 use crate::config::Settings;
 use crate::core::event::{
-    Author, ChannelSource, ConversationId, Directive, DirectiveKind, FileKind, InEvent, Message,
-    MessageContext, MessageId, OutEvent,
+    Author, ChannelSource, ConversationId, InEvent, Message, MessageContext, MessageId, OutEvent,
 };
 use crate::core::pipeline::PipelineRunner;
 
@@ -67,6 +66,7 @@ impl CliAdapter {
                 channel_id: "cli".into(),
                 reply_to: None,
             },
+            tool_groups: None,
         }
     }
 }
@@ -122,52 +122,17 @@ impl Channel for CliAdapter {
         let mut stdout = tokio::io::stdout();
 
         while let Some(event) = rx.recv().await {
+            // Empty text = no reply (REQ-11 convention replacing NoReply directive)
             if let Some(text) = &event.text {
-                let output = format!("{}: {}\n", self.bot_name, text);
-                stdout.write_all(output.as_bytes()).await?;
-                stdout.flush().await?;
-            }
-
-            for directive in &event.directives {
-                match directive {
-                    Directive::NoReply => {
-                        debug!("CLI: NoReply directive (suppressing response)");
-                    }
-                    Directive::React { emoji, .. } => {
-                        let output = format!("  [{emoji}]\n");
-                        stdout.write_all(output.as_bytes()).await?;
-                        stdout.flush().await?;
-                    }
-                    Directive::Send { chat, text, .. } => {
-                        let output = format!("  [-> {chat}]: {text}\n");
-                        stdout.write_all(output.as_bytes()).await?;
-                        stdout.flush().await?;
-                    }
-                    Directive::Voice { text } => {
-                        let output = format!("  [voice]: {text}\n");
-                        stdout.write_all(output.as_bytes()).await?;
-                        stdout.flush().await?;
-                    }
-                    Directive::SendFile { path, kind } => {
-                        let kind_str = match kind {
-                            FileKind::Image => "image",
-                            FileKind::Audio => "audio",
-                            FileKind::Video => "video",
-                            FileKind::Document => "document",
-                        };
-                        let output = format!("  [file:{kind_str}]: {}\n", path.display());
-                        stdout.write_all(output.as_bytes()).await?;
-                        stdout.flush().await?;
-                    }
+                if !text.is_empty() {
+                    let output = format!("{}: {}\n", self.bot_name, text);
+                    stdout.write_all(output.as_bytes()).await?;
+                    stdout.flush().await?;
                 }
             }
         }
 
         info!("CLI adapter outbound finished");
         Ok(())
-    }
-
-    fn supported_directives(&self) -> Vec<DirectiveKind> {
-        vec![DirectiveKind::NoReply, DirectiveKind::React]
     }
 }

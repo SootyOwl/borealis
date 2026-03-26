@@ -226,6 +226,7 @@ mod tests {
                 channel_id: group_id.into(),
                 reply_to: None,
             },
+            tool_groups: None,
         }
     }
 

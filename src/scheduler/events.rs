@@ -300,6 +300,7 @@ impl ScheduledEventRunner {
                 channel_id: format!("scheduler:{name}"),
                 reply_to: None,
             },
+            tool_groups: self.config.tools.clone(),
         };
 
         if let Err(e) = self.event_tx.send(event).await {

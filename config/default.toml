@@ -116,6 +116,7 @@ type = "recurring"
 interval = "30m"
 jitter = "5m"
 active_hours = "06:00-23:00"
+tools = ["memory", "computer", "web"]   # optional, omit for all enabled tools
 prompt = """
 TRIGGER: Scheduled heartbeat
 TIME: {time} ({timezone})
@@ -135,6 +136,7 @@ name = "daily_reflection"
 type = "cron"
 schedule = "0 22 * * *"
 jitter = "15m"
+tools = ["memory"]                       # reflection only gets memory tools
 prompt = """
 TRIGGER: Daily reflection
 TIME: {time}

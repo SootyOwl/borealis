@@ -1,9 +1,11 @@
+mod channel_tools;
 mod computer_tools;
 mod history_tools;
 mod memory_tools;
 mod web_tools;
 
 // Re-export individual registration functions for tests and direct use.
+pub use channel_tools::register_channel_tools;
 pub use computer_tools::register_computer_tools;
 pub use history_tools::register_history_tools;
 pub use memory_tools::register_memory_tools;
@@ -44,14 +46,20 @@ pub(crate) fn get_string_array(args: &serde_json::Value, field: &str) -> Vec<Str
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default()
 }
+use poise::serenity_prelude as serenity;
+
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
+
+/// Shared handle for the Discord HTTP client, populated after the bot connects.
+pub type DiscordHttpHandle = Arc<tokio::sync::OnceCell<Arc<serenity::Http>>>;
 
 /// Runtime dependencies available to tool registration functions.
 pub struct ToolDeps<'a> {
     pub settings: &'a Settings,
     pub memory_store: Arc<dyn Memory>,
     pub history_store: Arc<HistoryStore>,
+    pub discord_http: DiscordHttpHandle,
 }
 
 /// A self-registering tool group. Modules submit these via `inventory::submit!`.
@@ -71,11 +79,13 @@ pub fn register_all(
     settings: &Settings,
     memory_store: Arc<dyn Memory>,
     history_store: Arc<HistoryStore>,
+    discord_http: DiscordHttpHandle,
 ) -> ToolRegistry {
     let deps = ToolDeps {
         settings,
         memory_store,
         history_store,
+        discord_http,
     };
     let mut registry = ToolRegistry::new();
     for reg in inventory::iter::<ToolRegistration> {

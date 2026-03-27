@@ -17,12 +17,14 @@ use crate::core::event::{
 };
 use crate::core::pipeline::PipelineRunner;
 
+use crate::tools::DiscordHttpHandle;
+
 // Auto-registration via inventory
 inventory::submit! {
     ChannelRegistration {
         name: "discord",
         register_fn: |registry, deps| {
-            register(registry, deps.settings, deps.pipeline.clone(), deps.cancel.clone());
+            register(registry, deps.settings, deps.pipeline.clone(), deps.cancel.clone(), deps.security.clone(), Arc::clone(&deps.discord_http));
         },
     }
 }
@@ -33,6 +35,8 @@ pub fn register(
     settings: &Settings,
     pipeline: Arc<dyn PipelineRunner>,
     cancel: CancellationToken,
+    security: Arc<crate::security::Security>,
+    discord_http: DiscordHttpHandle,
 ) {
     let config = match &settings.channels.discord {
         Some(c) if c.enabled => c.clone(),
@@ -59,8 +63,9 @@ pub fn register(
         config,
         mode_router,
         settings.bot.name.clone(),
+        discord_http,
     ));
-    registry.register(discord, pipeline, cancel);
+    registry.register(discord, pipeline, cancel, Some(security));
 }
 
 /// Shared state available inside poise's event handler.
@@ -85,7 +90,8 @@ pub struct DiscordAdapter {
     #[allow(dead_code)] // Used for mention detection in future enhancements
     bot_name: String,
     /// Serenity HTTP client, set after the framework connects.
-    http: Arc<tokio::sync::OnceCell<Arc<serenity::Http>>>,
+    /// Shared with channel tools so they can call Discord API directly.
+    http: DiscordHttpHandle,
     /// Cache, set after the framework connects.
     cache: Arc<tokio::sync::OnceCell<Arc<serenity::Cache>>>,
 }
@@ -95,12 +101,13 @@ impl DiscordAdapter {
         config: DiscordChannelConfig,
         mode_router: Arc<ModeRouter>,
         bot_name: String,
+        discord_http: DiscordHttpHandle,
     ) -> Self {
         Self {
             config,
             mode_router,
             bot_name,
-            http: Arc::new(tokio::sync::OnceCell::new()),
+            http: discord_http,
             cache: Arc::new(tokio::sync::OnceCell::new()),
         }
     }

@@ -13,6 +13,9 @@ pub enum SandboxError {
 
     #[error("path resolution failed for {path}: {reason}")]
     ResolutionFailed { path: String, reason: String },
+
+    #[error("access to memory directory blocked: {path} — use memory_* tools instead")]
+    MemoryDirBlocked { path: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -26,12 +29,24 @@ pub enum SandboxError {
 /// authorization — the sandbox doesn't need to know about memory paths.
 pub struct Sandbox {
     root: PathBuf,
+    memory_dir: Option<PathBuf>,
 }
 
 impl Sandbox {
     /// Create a new sandbox rooted at the given directory.
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            memory_dir: None,
+        }
+    }
+
+    /// Create a sandbox that also blocks access to a memory directory.
+    pub fn with_memory_dir(root: PathBuf, memory_dir: PathBuf) -> Self {
+        Self {
+            root,
+            memory_dir: Some(memory_dir),
+        }
     }
 
     /// Validate that `path` (relative to the sandbox root) stays within bounds.
@@ -74,12 +89,35 @@ impl Sandbox {
             });
         }
 
+        // Check: must not be within the memory directory
+        if let Some(ref memory_dir) = self.memory_dir {
+            let in_memory = if let Ok(canonical_memory) = memory_dir.canonicalize() {
+                canonical.starts_with(&canonical_memory)
+            } else {
+                // Directory doesn't exist yet — fall back to component matching
+                // against the canonical root + memory subdir name.
+                let memory_suffix = memory_dir.strip_prefix(&self.root).unwrap_or(memory_dir);
+                let fallback = canonical_root.join(memory_suffix);
+                canonical.starts_with(&fallback)
+            };
+            if in_memory {
+                return Err(SandboxError::MemoryDirBlocked {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+
         Ok(canonical)
     }
 
     /// Returns the sandbox root path.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Returns the memory directory path, if configured.
+    pub fn memory_dir(&self) -> Option<&Path> {
+        self.memory_dir.as_deref()
     }
 }
 
@@ -98,6 +136,17 @@ mod tests {
         fs::write(tmp.path().join("allowed.txt"), "ok").expect("write allowed.txt");
 
         let sandbox = Sandbox::new(tmp.path().to_path_buf());
+        (tmp, sandbox)
+    }
+
+    fn setup_sandbox_with_memory() -> (tempfile::TempDir, Sandbox) {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        fs::write(tmp.path().join("allowed.txt"), "ok").expect("write allowed.txt");
+        fs::create_dir_all(tmp.path().join("memory")).expect("mkdir memory");
+        fs::write(tmp.path().join("memory/core.md"), "persona").expect("write core.md");
+
+        let memory_dir = tmp.path().join("memory");
+        let sandbox = Sandbox::with_memory_dir(tmp.path().to_path_buf(), memory_dir);
         (tmp, sandbox)
     }
 
@@ -120,5 +169,19 @@ mod tests {
         let (_tmp, sandbox) = setup_sandbox();
         let result = sandbox.validate_path(Path::new("does_not_exist.txt"));
         assert!(matches!(result, Err(SandboxError::ResolutionFailed { .. })));
+    }
+
+    #[test]
+    fn rejects_memory_dir_access() {
+        let (_tmp, sandbox) = setup_sandbox_with_memory();
+        let result = sandbox.validate_path(Path::new("memory/core.md"));
+        assert!(matches!(result, Err(SandboxError::MemoryDirBlocked { .. })));
+    }
+
+    #[test]
+    fn allows_non_memory_path_with_memory_dir_set() {
+        let (_tmp, sandbox) = setup_sandbox_with_memory();
+        let result = sandbox.validate_path(Path::new("allowed.txt"));
+        assert!(result.is_ok());
     }
 }

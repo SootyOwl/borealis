@@ -93,11 +93,17 @@ async fn main() -> anyhow::Result<()> {
     let security = Arc::new(security);
     info!("security module initialized");
 
+    // Shared Discord HTTP handle — populated by the Discord adapter on connect,
+    // consumed by channel tools for sending messages/reactions/files.
+    let discord_http: borealis::tools::DiscordHttpHandle =
+        Arc::new(tokio::sync::OnceCell::new());
+
     // Register all tool groups based on config.
     let tool_registry = Arc::new(borealis::tools::register_all(
         &settings,
         Arc::clone(&memory_store),
         Arc::clone(&history_store),
+        Arc::clone(&discord_http),
     ));
     info!(
         tool_count = tool_registry.tool_count(),
@@ -172,6 +178,8 @@ async fn main() -> anyhow::Result<()> {
         &settings,
         pipeline.clone(),
         cancel.clone(),
+        Arc::clone(&security),
+        discord_http,
     );
 
     if channels.channel_count() > 0 {

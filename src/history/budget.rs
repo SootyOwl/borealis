@@ -153,6 +153,41 @@ impl ContextBudget {
 
         messages
     }
+
+    /// Same as [`assemble`](Self::assemble) but callable without a `ContextBudget` instance.
+    ///
+    /// Used by the 400-recovery path which rebuilds messages without a budget.
+    pub fn assemble_static(
+        system_prompt: &str,
+        core_persona: &str,
+        turns: &[Turn],
+        retrieved_memories: &[String],
+    ) -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+
+        let system_content = if core_persona.is_empty() {
+            system_prompt.to_string()
+        } else {
+            format!("{}\n\n## Core Persona\n\n{}", system_prompt, core_persona)
+        };
+        messages.push(ChatMessage::system(system_content));
+
+        for turn in turns {
+            for msg in &turn.messages {
+                messages.push(msg.clone());
+            }
+        }
+
+        if !retrieved_memories.is_empty() {
+            let memory_content = format!(
+                "## Retrieved Memories\n\n{}",
+                retrieved_memories.join("\n\n")
+            );
+            messages.push(ChatMessage::system(memory_content));
+        }
+
+        messages
+    }
 }
 
 // ---------------------------------------------------------------------------

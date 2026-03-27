@@ -138,7 +138,7 @@ impl Provider for AnthropicProvider {
                 .send()
         })
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(anyhow::Error::from)?;
 
         let response_body: AnthropicResponse = response
             .json()

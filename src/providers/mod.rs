@@ -1,7 +1,7 @@
 pub mod anthropic;
 pub mod openai;
 pub mod registry;
-mod retry;
+pub mod retry;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +16,14 @@ use crate::core::pipeline::{PipelineDeps, PipelineRunner};
 pub use crate::tools::{ToolCall, ToolDef, ToolResult};
 pub use crate::types::{ChatMessage, Role};
 
+/// Factory function that builds a `PipelineRunner` from config and deps.
+pub type BuildPipelineFn = fn(
+    config: ProviderConfig,
+    sys_path: &Path,
+    persona_path: &Path,
+    deps: PipelineDeps,
+) -> Result<Arc<dyn PipelineRunner>>;
+
 /// A self-registering provider factory.
 ///
 /// Each provider module submits one of these via `inventory::submit!`. The
@@ -25,12 +33,7 @@ pub struct ProviderRegistration {
     /// Provider name (must match the config key, e.g. "anthropic", "openai").
     pub name: &'static str,
     /// Build a `PipelineRunner` from resolved provider config and pipeline deps.
-    pub build_pipeline_fn: fn(
-        config: ProviderConfig,
-        sys_path: &Path,
-        persona_path: &Path,
-        deps: PipelineDeps,
-    ) -> Result<Arc<dyn PipelineRunner>>,
+    pub build_pipeline_fn: BuildPipelineFn,
 }
 
 inventory::collect!(ProviderRegistration);

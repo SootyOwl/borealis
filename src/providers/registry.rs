@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use tokio::sync::Semaphore;
 use tracing::info;
 
 use crate::config::{ProviderEntry, Settings};
@@ -151,6 +152,8 @@ pub fn build_pipeline(
         max_response_tokens: Some(1024),
     };
 
+    let llm_semaphore = Arc::new(Semaphore::new(settings.bot.max_concurrent_llm));
+
     let deps = PipelineDeps {
         history_store,
         tool_registry,
@@ -160,6 +163,7 @@ pub fn build_pipeline(
         compaction_config,
         compaction_state,
         pipeline_config,
+        llm_semaphore,
     };
 
     build_pipeline_for_provider(resolved, sys_path, persona_path, deps)
@@ -177,6 +181,7 @@ mod tests {
                 system_prompt_path: "config/system_prompt.md".into(),
                 core_persona_path: "memory/core.md".into(),
                 compaction: CompactionConfig::default(),
+                max_concurrent_llm: 4,
             },
             providers: ProvidersConfig {
                 anthropic: Some(ProviderEntry {

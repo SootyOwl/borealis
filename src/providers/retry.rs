@@ -109,3 +109,13 @@ pub enum RetryError {
     #[error("All retries exhausted")]
     Exhausted,
 }
+
+impl RetryError {
+    /// Returns the HTTP status code if this is an `HttpStatus` error.
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::HttpStatus { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}

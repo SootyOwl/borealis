@@ -19,7 +19,7 @@ inventory::submit! {
     ChannelRegistration {
         name: "cli",
         register_fn: |registry, deps| {
-            register(registry, deps.settings, deps.pipeline.clone(), deps.cancel.clone());
+            register(registry, deps.settings, deps.pipeline.clone(), deps.cancel.clone(), deps.security.clone());
         },
     }
 }
@@ -30,6 +30,7 @@ pub fn register(
     settings: &Settings,
     pipeline: Arc<dyn PipelineRunner>,
     cancel: CancellationToken,
+    security: Arc<crate::security::Security>,
 ) {
     let enabled = settings.channels.cli.as_ref().is_some_and(|c| c.enabled);
     if !enabled {
@@ -37,7 +38,7 @@ pub fn register(
     }
 
     let cli = Arc::new(CliAdapter::new(settings.bot.name.clone()));
-    registry.register(cli, pipeline, cancel);
+    registry.register(cli, pipeline, cancel, Some(security));
 }
 
 /// CLI adapter for development — reads lines from stdin, prints responses to stdout.

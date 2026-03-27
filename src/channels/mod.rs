@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod discord;
+pub mod dispatcher;
 pub mod modes;
 
 use std::sync::Arc;
@@ -11,14 +12,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::config::Settings;
-use crate::core::event::{InEvent, OutEvent};
+use crate::core::event::{ChannelSource, InEvent, OutEvent};
 use crate::core::pipeline::PipelineRunner;
+use crate::security::Security;
+use crate::tools::DiscordHttpHandle;
+
+use self::dispatcher::ConversationDispatcher;
 
 /// Runtime dependencies available to channel registration functions.
 pub struct ChannelDeps<'a> {
     pub settings: &'a Settings,
     pub pipeline: Arc<dyn PipelineRunner>,
     pub cancel: CancellationToken,
+    pub security: Arc<Security>,
+    pub discord_http: DiscordHttpHandle,
 }
 
 /// A self-registering channel adapter.
@@ -40,11 +47,15 @@ pub fn register_all_channels(
     settings: &Settings,
     pipeline: Arc<dyn PipelineRunner>,
     cancel: CancellationToken,
+    security: Arc<Security>,
+    discord_http: DiscordHttpHandle,
 ) -> ChannelRegistry {
     let deps = ChannelDeps {
         settings,
         pipeline,
         cancel,
+        security,
+        discord_http,
     };
     let mut registry = ChannelRegistry::new();
     for reg in inventory::iter::<ChannelRegistration> {
@@ -101,6 +112,7 @@ impl ChannelRegistry {
         channel: Arc<C>,
         pipeline: Arc<dyn PipelineRunner>,
         cancel: CancellationToken,
+        security: Option<Arc<Security>>,
     ) {
         let name = channel.name().to_string();
         let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<InEvent>(CHANNEL_BUFFER);
@@ -144,35 +156,38 @@ impl ChannelRegistry {
             })
         };
 
-        // Spawn the message processing loop.
+        // Spawn the dispatcher loop that routes events to per-conversation workers.
         let processing_handle = {
             let name = name.clone();
             let cancel = cancel.clone();
+            let dispatcher =
+                ConversationDispatcher::new(pipeline, out_tx, cancel.clone(), name.clone());
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         Some(event) = in_rx.recv() => {
-                            match pipeline.process(&event).await {
-                                Ok(out_event) => {
-                                    if out_tx.send(out_event).await.is_err() {
-                                        tracing::debug!(channel = %name, "outbound channel closed");
-                                        break;
+                            // Scheduler events bypass rate limiting.
+                            if event.source != ChannelSource::Scheduler {
+                                if let Some(ref sec) = security {
+                                    let result = sec.rate_limiter.check(
+                                        &event.message.author.id,
+                                        None,
+                                    );
+                                    if result != crate::security::RateLimitResult::Allowed {
+                                        tracing::warn!(
+                                            channel = %name,
+                                            user_id = %event.message.author.id,
+                                            result = ?result,
+                                            "message rate-limited, dropping"
+                                        );
+                                        continue;
                                     }
                                 }
-                                Err(e) => {
-                                    error!(channel = %name, "pipeline error: {e}");
-                                    let err_event = crate::core::event::OutEvent {
-                                        target: event.source.clone(),
-                                        channel_id: event.context.channel_id.clone(),
-                                        text: Some("I'm having trouble thinking right now, try again in a moment.".into()),
-                                        reply_to: Some(event.message.id.clone()),
-                                    };
-                                    let _ = out_tx.send(err_event).await;
-                                }
                             }
+                            dispatcher.dispatch(event).await;
                         }
                         _ = cancel.cancelled() => {
-                            tracing::debug!(channel = %name, "processing loop cancelled");
+                            tracing::debug!(channel = %name, "dispatcher loop cancelled");
                             break;
                         }
                     }
@@ -284,6 +299,171 @@ mod tests {
         }
     }
 
+    /// Helper to create a Security instance with a tight rate limit for testing.
+    fn make_test_security(capacity: u32) -> Arc<Security> {
+        let config = crate::config::RateLimitConfig {
+            per_user: crate::config::TokenBucketConfig {
+                capacity,
+                refill_secs: 60,
+            },
+            global: crate::config::GlobalTokenBucketConfig {
+                capacity: 100,
+                refill_secs: 60,
+            },
+            allowed_users: vec!["allowed-user".into()],
+            allowed_guilds: vec![],
+        };
+        let tmp = std::env::temp_dir().join("borealis_test_ratelimit");
+        let _ = std::fs::create_dir_all(&tmp);
+        Arc::new(Security::new(&config, tmp, std::iter::empty::<String>()))
+    }
+
+    fn make_test_event(user_id: &str, source: crate::core::event::ChannelSource) -> InEvent {
+        InEvent {
+            source: source.clone(),
+            message: crate::core::event::Message {
+                id: crate::core::event::MessageId("test-msg".into()),
+                author: crate::core::event::Author {
+                    id: user_id.into(),
+                    display_name: "Test".into(),
+                },
+                text: "hello".into(),
+                timestamp: chrono::Utc::now(),
+                mentions_bot: false,
+            },
+            context: crate::core::event::MessageContext {
+                conversation_id: crate::core::event::ConversationId::Dm {
+                    channel_type: source,
+                    user_id: user_id.into(),
+                },
+                channel_id: "test".into(),
+                reply_to: None,
+            },
+            tool_groups: None,
+            completion_flag: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_user_messages_dropped() {
+        let cancel = CancellationToken::new();
+        let pipeline: Arc<dyn PipelineRunner> = Arc::new(EchoPipeline);
+        let security = make_test_security(2); // capacity=2
+
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<InEvent>(64);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<OutEvent>(64);
+
+        let sec = Some(security);
+        let dispatcher = ConversationDispatcher::new(
+            pipeline,
+            out_tx,
+            cancel.clone(),
+            "test".into(),
+        );
+
+        // Simulate the dispatcher loop inline.
+        let handle = tokio::spawn(async move {
+            while let Some(event) = in_rx.recv().await {
+                if event.source != ChannelSource::Scheduler {
+                    if let Some(ref s) = sec {
+                        let result = s.rate_limiter.check(&event.message.author.id, None);
+                        if result != crate::security::RateLimitResult::Allowed {
+                            continue;
+                        }
+                    }
+                }
+                dispatcher.dispatch(event).await;
+            }
+        });
+
+        // Send 4 messages — only first 2 should pass (capacity=2).
+        for _ in 0..4 {
+            in_tx
+                .send(make_test_event("ratelimited-user", ChannelSource::Cli))
+                .await
+                .unwrap();
+        }
+
+        // Collect results with a timeout.
+        let mut received = 0;
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                out_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(_)) => received += 1,
+                _ => break,
+            }
+        }
+
+        assert_eq!(received, 2, "only 2 of 4 messages should pass rate limit");
+
+        drop(in_tx);
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_events_bypass_rate_limit() {
+        let cancel = CancellationToken::new();
+        let pipeline: Arc<dyn PipelineRunner> = Arc::new(EchoPipeline);
+        let security = make_test_security(1); // capacity=1
+
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<InEvent>(64);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<OutEvent>(64);
+
+        let sec = Some(security);
+        let dispatcher = ConversationDispatcher::new(
+            pipeline,
+            out_tx,
+            cancel.clone(),
+            "test".into(),
+        );
+
+        let handle = tokio::spawn(async move {
+            while let Some(event) = in_rx.recv().await {
+                if event.source != ChannelSource::Scheduler {
+                    if let Some(ref s) = sec {
+                        let result = s.rate_limiter.check(&event.message.author.id, None);
+                        if result != crate::security::RateLimitResult::Allowed {
+                            continue;
+                        }
+                    }
+                }
+                dispatcher.dispatch(event).await;
+            }
+        });
+
+        // Send 3 scheduler events — all should bypass rate limiting.
+        for _ in 0..3 {
+            in_tx
+                .send(make_test_event("system", ChannelSource::Scheduler))
+                .await
+                .unwrap();
+        }
+
+        let mut received = 0;
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                out_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(_)) => received += 1,
+                _ => break,
+            }
+        }
+
+        assert_eq!(received, 3, "all scheduler events should bypass rate limit");
+
+        drop(in_tx);
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
     #[tokio::test]
     async fn test_register_and_channel_count() {
         let cancel = CancellationToken::new();
@@ -296,6 +476,7 @@ mod tests {
             }),
             pipeline.clone(),
             cancel.clone(),
+            None,
         );
         registry.register(
             Arc::new(MockChannel {
@@ -303,6 +484,7 @@ mod tests {
             }),
             pipeline,
             cancel.clone(),
+            None,
         );
 
         assert_eq!(registry.channel_count(), 2);

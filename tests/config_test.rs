@@ -27,6 +27,7 @@ struct TestProviders {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TestProvider {
     base_url: String,
     model: String,

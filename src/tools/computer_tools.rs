@@ -15,9 +15,9 @@ fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
     if !deps.settings.tools.computer_use.enabled {
         return;
     }
-    let sandbox = Arc::new(Sandbox::new(
-        deps.settings.tools.computer_use.sandbox_root.clone(),
-    ));
+    let root = deps.settings.tools.computer_use.sandbox_root.clone();
+    let memory_dir = root.join("memory");
+    let sandbox = Arc::new(Sandbox::with_memory_dir(root, memory_dir));
     register_computer_tools(registry, sandbox, &deps.settings.tools.computer_use);
 }
 
@@ -342,6 +342,29 @@ impl Tool for FileWrite {
             );
         }
 
+        // Check: must not be within the memory directory
+        if let Some(memory_dir) = self.sandbox.memory_dir() {
+            let in_memory = if let Ok(canonical_memory) = memory_dir.canonicalize() {
+                canonical_target.starts_with(&canonical_memory)
+            } else {
+                // Directory doesn't exist yet — fall back to component matching.
+                let memory_suffix = memory_dir
+                    .strip_prefix(self.sandbox.root())
+                    .unwrap_or(memory_dir);
+                let fallback = canonical_root.join(memory_suffix);
+                canonical_target.starts_with(&fallback)
+            };
+            if in_memory {
+                return error_result(
+                    call_id,
+                    &format!(
+                        "access to memory directory blocked: {} — use memory_* tools instead",
+                        path_str
+                    ),
+                );
+            }
+        }
+
         // Create parent directories AFTER validation (use canonical path)
         if let Some(parent) = canonical_target.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -523,7 +546,8 @@ mod tests {
         fs::create_dir_all(tmp.path().join("subdir")).expect("mkdir subdir");
         fs::write(tmp.path().join("subdir/nested.txt"), "nested").expect("write nested");
 
-        let sandbox = Arc::new(Sandbox::new(tmp.path().to_path_buf()));
+        let memory_dir = tmp.path().join("memory");
+        let sandbox = Arc::new(Sandbox::with_memory_dir(tmp.path().to_path_buf(), memory_dir));
         (tmp, sandbox)
     }
 
@@ -660,6 +684,23 @@ mod tests {
         assert!(result.is_error);
     }
 
+    #[tokio::test]
+    async fn file_read_rejects_memory_dir() {
+        let (_tmp, sandbox) = setup_sandbox();
+        let tool = FileRead { sandbox };
+
+        let result = tool
+            .execute(serde_json::json!({"path": "memory/core.md"}), &test_ctx())
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("memory directory blocked")
+        );
+    }
+
     // -- file_write tests --
 
     #[tokio::test]
@@ -711,6 +752,50 @@ mod tests {
         assert!(result.is_error);
     }
 
+    #[tokio::test]
+    async fn file_write_rejects_memory_dir() {
+        let (_tmp, sandbox) = setup_sandbox();
+        let tool = FileWrite { sandbox };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"path": "memory/evil.md", "content": "bad"}),
+                &test_ctx(),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("memory directory blocked")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_memory_dir_when_dir_missing() {
+        // Memory dir doesn't exist on disk — fallback component matching should still block.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Intentionally do NOT create the memory/ directory.
+        let memory_dir = tmp.path().join("memory");
+        let sandbox = Arc::new(Sandbox::with_memory_dir(tmp.path().to_path_buf(), memory_dir));
+        let tool = FileWrite { sandbox };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"path": "memory/sneaky.md", "content": "bad"}),
+                &test_ctx(),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("memory directory blocked")
+        );
+    }
+
     // -- file_list tests --
 
     #[tokio::test]
@@ -751,7 +836,8 @@ mod tests {
     #[test]
     fn register_computer_tools_adds_four() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let sandbox = Arc::new(Sandbox::new(tmp.path().to_path_buf()));
+        let memory_dir = tmp.path().join("memory");
+        let sandbox = Arc::new(Sandbox::with_memory_dir(tmp.path().to_path_buf(), memory_dir));
         let config = ComputerUseConfig::default();
         let mut registry = ToolRegistry::new();
 

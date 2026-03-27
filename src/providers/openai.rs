@@ -131,7 +131,7 @@ impl Provider for OpenAiProvider {
             req.json(&body).send()
         })
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(anyhow::Error::from)?;
 
         let response_body: OpenAiResponse = response
             .json()

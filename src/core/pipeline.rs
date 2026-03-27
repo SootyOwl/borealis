@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::config::CompactionConfig;
@@ -14,6 +15,7 @@ use crate::history::budget::{ContextBudget, Turn};
 use crate::history::compaction::{CompactionService, CompactionState};
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
+use crate::providers::retry::RetryError;
 use crate::providers::{Provider, RequestConfig};
 use crate::security::{AuthorizationResult, Security};
 use crate::tools::{ToolContext, ToolRegistry, ToolResult};
@@ -39,7 +41,7 @@ pub struct PipelineConfig {
     /// Tokens reserved for the model's response.
     pub response_reserve: usize,
     /// Sampling temperature sent to the provider.
-    pub temperature: Option<f64>,
+    pub temperature: Option<f32>,
     /// Maximum tokens the model may generate per response.
     pub max_response_tokens: Option<usize>,
 }
@@ -65,6 +67,7 @@ pub struct PipelineDeps {
     pub compaction_config: CompactionConfig,
     pub compaction_state: Arc<CompactionState>,
     pub pipeline_config: PipelineConfig,
+    pub llm_semaphore: Arc<Semaphore>,
 }
 
 /// The message processing pipeline.
@@ -83,6 +86,7 @@ pub struct Pipeline<P: Provider + 'static> {
     observers: Arc<ObserverRegistry>,
     compaction_service: CompactionService<P>,
     pipeline_config: PipelineConfig,
+    llm_semaphore: Arc<Semaphore>,
 }
 
 impl<P: Provider + 'static> Pipeline<P> {
@@ -151,6 +155,7 @@ impl<P: Provider + 'static> Pipeline<P> {
             observers: deps.observers,
             compaction_service,
             pipeline_config: deps.pipeline_config,
+            llm_semaphore: deps.llm_semaphore,
         })
     }
 
@@ -250,7 +255,7 @@ impl<P: Provider + 'static> Pipeline<P> {
         }
 
         let config = RequestConfig {
-            temperature: self.pipeline_config.temperature.map(|t| t as f32),
+            temperature: self.pipeline_config.temperature,
             max_tokens: self.pipeline_config.max_response_tokens.map(|n| n as u32),
             ..Default::default()
         };
@@ -271,20 +276,16 @@ impl<P: Provider + 'static> Pipeline<P> {
             self.observers
                 .notify_llm_request(&provider_messages, &tool_defs);
 
-            let llm_start = Instant::now();
-            let response = self
-                .provider
-                .chat(provider_messages.clone(), &tool_defs, &config)
-                .await;
-            let llm_duration = llm_start.elapsed();
-
-            let response = match response {
-                Ok(r) => r,
-                Err(e) => {
-                    self.observers.notify_error(&e);
-                    return Err(e);
-                }
-            };
+            let (response, llm_duration) = self
+                .call_llm_with_400_recovery(
+                    &mut provider_messages,
+                    &tool_defs,
+                    &config,
+                    &included_turns,
+                    &retrieved_memories,
+                    &channel_context,
+                )
+                .await?;
 
             // Observer: LLM response
             self.observers
@@ -450,6 +451,145 @@ impl<P: Provider + 'static> Pipeline<P> {
             .maybe_trigger(&conv_id, history_tokens, history_budget);
 
         self.build_out_event(event, response)
+    }
+
+    /// Call the LLM provider with 400-status recovery.
+    ///
+    /// On HTTP 400 (context too large, invalid request, etc.):
+    /// - First retry: evict oldest half of non-fixed turns and retry.
+    /// - Second failure: fall back to system prompt + core persona + current message only.
+    async fn call_llm_with_400_recovery(
+        &self,
+        provider_messages: &mut Vec<ChatMessage>,
+        tool_defs: &[crate::tools::ToolDef],
+        config: &RequestConfig,
+        included_turns: &[Turn],
+        retrieved_memories: &[String],
+        channel_context: &str,
+    ) -> Result<(crate::providers::LlmResponse, std::time::Duration)> {
+        let _permit = self
+            .llm_semaphore
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("LLM semaphore closed"))?;
+
+        let llm_start = Instant::now();
+        let response = self
+            .provider
+            .chat(provider_messages.clone(), tool_defs, config)
+            .await;
+        let llm_duration = llm_start.elapsed();
+
+        drop(_permit);
+
+        match response {
+            Ok(r) => return Ok((r, llm_duration)),
+            Err(e) if Self::is_http_400(&e) => {
+                warn!("LLM returned HTTP 400, retrying with fewer messages");
+            }
+            Err(e) => {
+                self.observers.notify_error(&e);
+                return Err(e);
+            }
+        }
+
+        // --- First retry: evict oldest half of non-fixed turns ---
+        let half = included_turns.len() / 2;
+        let reduced_turns = if half > 0 {
+            &included_turns[half..]
+        } else {
+            // Only one turn or empty — skip to minimal fallback.
+            &included_turns[included_turns.len().saturating_sub(1)..]
+        };
+
+        let mut retry_messages = ContextBudget::assemble_static(
+            &self.system_prompt,
+            &self.core_persona,
+            reduced_turns,
+            retrieved_memories,
+        );
+        if let Some(first) = retry_messages.first_mut() {
+            first.content.push_str(channel_context);
+        }
+
+        let _permit = self
+            .llm_semaphore
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("LLM semaphore closed"))?;
+
+        let llm_start = Instant::now();
+        let response = self
+            .provider
+            .chat(retry_messages.clone(), tool_defs, config)
+            .await;
+        let llm_duration = llm_start.elapsed();
+
+        drop(_permit);
+
+        match response {
+            Ok(r) => {
+                *provider_messages = retry_messages;
+                return Ok((r, llm_duration));
+            }
+            Err(e) if Self::is_http_400(&e) => {
+                warn!("LLM returned HTTP 400 again, falling back to minimal context");
+            }
+            Err(e) => {
+                self.observers.notify_error(&e);
+                return Err(e);
+            }
+        }
+
+        // --- Second retry: system prompt + core persona + current message only ---
+        let last_turn = included_turns.last();
+        let minimal_turns = match last_turn {
+            Some(t) => std::slice::from_ref(t),
+            None => &[],
+        };
+
+        let mut minimal_messages = ContextBudget::assemble_static(
+            &self.system_prompt,
+            &self.core_persona,
+            minimal_turns,
+            &[], // no memories
+        );
+        if let Some(first) = minimal_messages.first_mut() {
+            first.content.push_str(channel_context);
+        }
+
+        let _permit = self
+            .llm_semaphore
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("LLM semaphore closed"))?;
+
+        let llm_start = Instant::now();
+        let response = self
+            .provider
+            .chat(minimal_messages.clone(), tool_defs, config)
+            .await;
+        let llm_duration = llm_start.elapsed();
+
+        drop(_permit);
+
+        match response {
+            Ok(r) => {
+                *provider_messages = minimal_messages;
+                Ok((r, llm_duration))
+            }
+            Err(e) => {
+                self.observers.notify_error(&e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Check if an error is an HTTP 400 from the provider.
+    fn is_http_400(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<RetryError>()
+            .and_then(|re| re.status_code())
+            .is_some_and(|s| s == 400)
     }
 
     /// Load conversation history as turns, incorporating any compaction summary.
@@ -703,6 +843,7 @@ mod tests {
             compaction_config: crate::config::CompactionConfig::default(),
             compaction_state: Arc::new(crate::history::compaction::CompactionState::new()),
             pipeline_config: PipelineConfig::default(),
+            llm_semaphore: Arc::new(Semaphore::new(4)),
         };
 
         let sys_path = std::path::Path::new("/nonexistent/system_prompt.md");
@@ -817,5 +958,291 @@ mod tests {
 
         let result = pipeline.process_impl(&event).await.unwrap();
         assert_eq!(result.text, Some("System done.".into()));
+    }
+
+    /// A mock provider that tracks peak concurrency via an atomic counter.
+    struct ConcurrencyTrackingProvider {
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConcurrencyTrackingProvider {
+        fn new() -> Self {
+            Self {
+                active: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::providers::Provider for ConcurrencyTrackingProvider {
+        fn name(&self) -> &str {
+            "concurrency-mock"
+        }
+
+        async fn chat(
+            &self,
+            _messages: Vec<ChatMessage>,
+            _tools: &[ToolDef],
+            _config: &crate::providers::RequestConfig,
+        ) -> anyhow::Result<LlmResponse> {
+            let prev = self.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let current = prev + 1;
+            // Update peak if this is a new high water mark.
+            self.peak.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+
+            // Hold the "slot" for a bit so concurrent calls overlap.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            self.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+            Ok(LlmResponse {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+                usage: TokenUsage::default(),
+            })
+        }
+
+        fn estimate_tokens(&self, text: &str) -> usize {
+            text.len() / 4
+        }
+    }
+
+    fn make_semaphore_test_pipeline(
+        provider: Arc<ConcurrencyTrackingProvider>,
+        permits: usize,
+    ) -> Pipeline<ConcurrencyTrackingProvider> {
+        let db = Arc::new(Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;",
+            )
+            .unwrap();
+        }
+        crate::history::schema::initialize(&db.lock().unwrap()).unwrap();
+        let history_store = Arc::new(crate::history::store::HistoryStore::new(Arc::clone(&db)));
+
+        let tmp_persona = std::env::temp_dir().join("borealis_test_sem_core.md");
+        std::fs::write(&tmp_persona, "test persona").unwrap();
+        let memory_store: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(Arc::clone(&db), tmp_persona.clone()).unwrap());
+
+        let tool_registry = Arc::new(crate::tools::ToolRegistry::new());
+        let observers = Arc::new(ObserverRegistry::new());
+        let security = make_test_security();
+
+        let deps = PipelineDeps {
+            history_store,
+            tool_registry,
+            memory_store,
+            security,
+            observers,
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction_state: Arc::new(crate::history::compaction::CompactionState::new()),
+            pipeline_config: PipelineConfig::default(),
+            llm_semaphore: Arc::new(Semaphore::new(permits)),
+        };
+
+        let sys_path = std::path::Path::new("/nonexistent/system_prompt.md");
+        let persona_path = &tmp_persona;
+
+        Pipeline::new(provider, sys_path, persona_path, deps).unwrap()
+    }
+
+    #[tokio::test]
+    async fn semaphore_limits_concurrent_llm_calls() {
+        let provider = Arc::new(ConcurrencyTrackingProvider::new());
+        let pipeline = Arc::new(make_semaphore_test_pipeline(Arc::clone(&provider), 2));
+
+        // Spawn 3 concurrent pipeline calls with permits=2.
+        // Each call uses a unique conversation id to avoid history conflicts.
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let p = Arc::clone(&pipeline);
+            handles.push(tokio::spawn(async move {
+                let event = InEvent {
+                    source: ChannelSource::Cli,
+                    message: Message {
+                        id: MessageId(format!("msg-sem-{i}")),
+                        author: Author {
+                            id: format!("user-{i}"),
+                            display_name: "Tester".into(),
+                        },
+                        text: "hello".into(),
+                        timestamp: chrono::Utc::now(),
+                        mentions_bot: false,
+                    },
+                    context: MessageContext {
+                        conversation_id: ConversationId::Dm {
+                            channel_type: ChannelSource::Cli,
+                            user_id: format!("user-{i}"),
+                        },
+                        channel_id: format!("chan-{i}"),
+                        reply_to: None,
+                    },
+                    tool_groups: None,
+                    completion_flag: None,
+                };
+                p.process_impl(&event).await.unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Peak concurrency should be at most 2 (the semaphore limit).
+        assert!(
+            provider.peak() <= 2,
+            "expected peak concurrency <= 2, got {}",
+            provider.peak()
+        );
+    }
+
+    /// A mock provider that returns HTTP 400 a configurable number of times,
+    /// then succeeds. Also records the message count of each call.
+    struct Http400MockProvider {
+        failures_remaining: Mutex<usize>,
+        call_message_counts: Mutex<Vec<usize>>,
+    }
+
+    impl Http400MockProvider {
+        fn new(fail_count: usize) -> Self {
+            Self {
+                failures_remaining: Mutex::new(fail_count),
+                call_message_counts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn message_counts(&self) -> Vec<usize> {
+            self.call_message_counts.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::providers::Provider for Http400MockProvider {
+        fn name(&self) -> &str {
+            "http400-mock"
+        }
+
+        async fn chat(
+            &self,
+            messages: Vec<ChatMessage>,
+            _tools: &[ToolDef],
+            _config: &crate::providers::RequestConfig,
+        ) -> anyhow::Result<LlmResponse> {
+            self.call_message_counts.lock().unwrap().push(messages.len());
+
+            let mut remaining = self.failures_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                drop(remaining);
+                return Err(crate::providers::retry::RetryError::HttpStatus {
+                    status: 400,
+                    body: "context too large".into(),
+                }.into());
+            }
+
+            Ok(LlmResponse {
+                text: Some("recovered".into()),
+                tool_calls: vec![],
+                usage: TokenUsage::default(),
+            })
+        }
+
+        fn estimate_tokens(&self, text: &str) -> usize {
+            text.len() / 4
+        }
+    }
+
+    fn make_400_test_pipeline(
+        provider: Arc<Http400MockProvider>,
+    ) -> Pipeline<Http400MockProvider> {
+        let db = Arc::new(Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;",
+            )
+            .unwrap();
+        }
+        crate::history::schema::initialize(&db.lock().unwrap()).unwrap();
+        let history_store = Arc::new(crate::history::store::HistoryStore::new(Arc::clone(&db)));
+
+        let tmp_persona = std::env::temp_dir().join("borealis_test_400_core.md");
+        std::fs::write(&tmp_persona, "test persona").unwrap();
+        let memory_store: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(Arc::clone(&db), tmp_persona.clone()).unwrap());
+
+        let tool_registry = Arc::new(crate::tools::ToolRegistry::new());
+        let observers = Arc::new(ObserverRegistry::new());
+        let security = make_test_security();
+
+        let deps = PipelineDeps {
+            history_store,
+            tool_registry,
+            memory_store,
+            security,
+            observers,
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction_state: Arc::new(crate::history::compaction::CompactionState::new()),
+            pipeline_config: PipelineConfig::default(),
+            llm_semaphore: Arc::new(Semaphore::new(4)),
+        };
+
+        let sys_path = std::path::Path::new("/nonexistent/system_prompt.md");
+        let persona_path = &tmp_persona;
+
+        Pipeline::new(provider, sys_path, persona_path, deps).unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_400_recovery_retries_with_fewer_messages() {
+        // Provider fails once with 400, then succeeds on retry with fewer messages.
+        let provider = Arc::new(Http400MockProvider::new(1));
+        let pipeline = make_400_test_pipeline(Arc::clone(&provider));
+        let event = make_test_event(ChannelSource::Cli, "user1");
+
+        let result = pipeline.process_impl(&event).await.unwrap();
+        assert_eq!(result.text, Some("recovered".into()));
+
+        let counts = provider.message_counts();
+        assert_eq!(counts.len(), 2, "expected 2 LLM calls (original + retry)");
+        // The retry should have fewer or equal messages.
+        assert!(
+            counts[1] <= counts[0],
+            "retry should have <= messages: first={}, second={}",
+            counts[0],
+            counts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_400_recovery_falls_back_to_minimal() {
+        // Provider fails twice with 400, then succeeds on minimal fallback.
+        let provider = Arc::new(Http400MockProvider::new(2));
+        let pipeline = make_400_test_pipeline(Arc::clone(&provider));
+        let event = make_test_event(ChannelSource::Cli, "user2");
+
+        let result = pipeline.process_impl(&event).await.unwrap();
+        assert_eq!(result.text, Some("recovered".into()));
+
+        let counts = provider.message_counts();
+        assert_eq!(counts.len(), 3, "expected 3 LLM calls (original + retry + minimal)");
+        // The minimal fallback should have the fewest messages.
+        assert!(
+            counts[2] <= counts[1],
+            "minimal should have <= messages than retry: retry={}, minimal={}",
+            counts[1],
+            counts[2]
+        );
     }
 }

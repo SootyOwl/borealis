@@ -62,6 +62,13 @@ pub struct BotConfig {
     pub core_persona_path: PathBuf,
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Maximum number of concurrent LLM API calls (default: 4).
+    #[serde(default = "default_max_concurrent_llm")]
+    pub max_concurrent_llm: usize,
+}
+
+fn default_max_concurrent_llm() -> usize {
+    4
 }
 
 fn default_system_prompt_path() -> PathBuf {
@@ -458,6 +465,11 @@ impl Settings {
                 resolve_env_var("tools.web.jina_api_key_env", key_env)?;
             }
         }
+        if self.bot.max_concurrent_llm == 0 {
+            return Err(ConfigError::Validation(
+                "bot.max_concurrent_llm must be > 0".into(),
+            ));
+        }
         if self.rate_limit.per_user.refill_secs == 0 {
             return Err(ConfigError::Validation(
                 "rate_limit.per_user.refill_secs must be > 0".into(),
@@ -466,6 +478,16 @@ impl Settings {
         if self.rate_limit.global.refill_secs == 0 {
             return Err(ConfigError::Validation(
                 "rate_limit.global.refill_secs must be > 0".into(),
+            ));
+        }
+        if self.rate_limit.per_user.capacity == 0 {
+            return Err(ConfigError::Validation(
+                "rate_limit.per_user.capacity must be > 0".into(),
+            ));
+        }
+        if self.rate_limit.global.capacity == 0 {
+            return Err(ConfigError::Validation(
+                "rate_limit.global.capacity must be > 0".into(),
             ));
         }
         Ok(())

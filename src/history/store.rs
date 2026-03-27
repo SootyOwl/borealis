@@ -835,7 +835,7 @@ mod tests {
         // RFC-3339 timestamps differ.  (sub-second precision means we insert
         // them quickly without sleeping — the ORDER BY is what we really care
         // about; we just verify the contents come back in insertion order.)
-        let msgs = vec![
+        let msgs = [
             ChatMessage::user("first"),
             ChatMessage::assistant("second"),
             ChatMessage::user("third"),

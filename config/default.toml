@@ -122,7 +122,7 @@ command_timeout_secs = 30                      # kill commands that run longer t
 
 [tools.web]
 enabled = true
-# jina_api_key_env = "JINA_API_KEY"            # optional — env var holding Jina API key
+jina_api_key_env = "JINA_API_KEY"              # env var holding Jina API key
 max_fetch_bytes = 51200                        # 50 KiB max response size (prevents context blowup)
 
 # ---------------------------------------------------------------------------

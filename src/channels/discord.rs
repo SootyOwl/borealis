@@ -265,6 +265,12 @@ impl Channel for DiscordAdapter {
                         Ok(())
                     })
                 },
+                // Disable poise's built-in command prefix handling — we use
+                // the event_handler for all message routing, not poise commands.
+                prefix_options: poise::PrefixFrameworkOptions {
+                    mention_as_prefix: false,
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .build();

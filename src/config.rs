@@ -350,7 +350,7 @@ impl Default for WebToolsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            jina_api_key_env: None,
+            jina_api_key_env: Some("JINA_API_KEY".to_string()),
             max_fetch_bytes: default_max_fetch_bytes(),
         }
     }

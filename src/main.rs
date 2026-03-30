@@ -8,6 +8,9 @@ use borealis::core::pipeline::PipelineRunner;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env file if present (silently ignored if missing).
+    dotenvy::dotenv().ok();
+
     // Initialize tracing (respects RUST_LOG env var).
     tracing_subscriber::fmt()
         .with_env_filter(

@@ -151,11 +151,18 @@ max_fetch_bytes = 51200                        # 50 KiB max response size (preve
 #
 # Options:
 #   - jitter: random delay added to prevent thundering herd (e.g. "5m")
-#   - active_hours: only fire during this window (e.g. "06:00-23:00")
+#   - active_hours: only fire during this window (e.g. "06:00-23:00",
+#                   supports overnight ranges like "22:00-06:00")
+#                   Recurring events skip silently when outside the window.
+#                   Cron events skip the specific fire time if outside.
 #   - tools: which tool groups are available (default: all enabled groups)
 #            valid groups: "memory", "computer", "web"
 #   - channels: which channels Aurora can reach via send_message tool
 #               (default: none — output is private)
+#
+# Note: per-event model override is not yet supported — all events use
+# the primary provider. A future `model` field will allow using a cheaper
+# model for background tasks like memory consolidation.
 
 [scheduler]
 timezone = "UTC"
@@ -195,3 +202,34 @@ TIME: {time}
 Today is ending. Reflect on your conversations and experiences today.
 YOUR TEXT OUTPUT IS PRIVATE - only you can see it.
 """
+
+# Memory consolidation — Aurora's "subconscious" maintenance loop.
+# Reviews all notes, merges duplicates, removes contradictions,
+# converts vague references to specific ones, prunes stale info.
+# Uses cron to run at a consistent time rather than recurring interval.
+#
+# [[scheduler.events]]
+# name = "memory_consolidation"
+# type = "cron"
+# schedule = "0 4 * * *"                          # 4am daily
+# jitter = "30m"
+# tools = ["memory"]
+# prompt = """
+# TRIGGER: Memory consolidation
+# TIME: {time}
+# YOUR TEXT OUTPUT IS PRIVATE - only you can see it.
+#
+# Review your memory. Search for all notes and read through them.
+# For each note, consider:
+# - Can this be merged with another note on the same topic?
+# - Does this contradict something you know more recently?
+# - Are there vague references ("yesterday", "recently") that should
+#   be converted to specific dates or details?
+# - Is this still relevant, or has it become stale?
+# - Is this derivable from something else (e.g. facts about a codebase
+#   that could be re-read)?
+#
+# Be aggressive about pruning. Fewer, higher-quality notes are better
+# than many fuzzy ones. Edit notes in place rather than creating new ones.
+# Update your core.md if your self-understanding has evolved.
+# """

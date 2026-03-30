@@ -195,6 +195,21 @@ pub struct DiscordGroupConfig {
     pub digest_interval_min: Option<u64>,
     #[serde(default)]
     pub digest_debounce_min: Option<u64>,
+    /// Per-channel overrides within this guild. Channels not listed here
+    /// inherit the guild-level settings above.
+    #[serde(default)]
+    pub channels: Vec<DiscordPerChannelConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscordPerChannelConfig {
+    pub channel_id: String,
+    #[serde(default)]
+    pub response_mode: Option<String>,
+    #[serde(default)]
+    pub digest_interval_min: Option<u64>,
+    #[serde(default)]
+    pub digest_debounce_min: Option<u64>,
 }
 
 fn default_response_mode() -> String {

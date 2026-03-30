@@ -65,15 +65,29 @@ enabled = true                                 # stdin/stdout dev adapter
 # Response modes: "always" (reply to everything), "mention-only" (only when
 # @mentioned), "digest" (batch messages and summarize periodically).
 #
+# Guild-level settings apply to all channels in that guild. Per-channel
+# overrides inherit from the guild and only override fields you specify.
+#
 # [channels.discord]
 # enabled = true
 # token_env = "DISCORD_BOT_TOKEN"              # env var holding the bot token
 #
 # [[channels.discord.groups]]
 # guild_id = "123456789"
-# response_mode = "mention-only"               # "always", "mention-only", or "digest"
-# digest_interval_min = 30                     # digest mode: max interval between summaries
-# digest_debounce_min = 5                      # digest mode: quiet period before triggering
+# response_mode = "mention-only"               # guild default mode
+# digest_interval_min = 30                     # digest mode: max minutes between summaries
+# digest_debounce_min = 5                      # digest mode: quiet minutes before triggering
+#
+# # Per-channel overrides within this guild:
+# [[channels.discord.groups.channels]]
+# channel_id = "987654321"
+# response_mode = "always"                     # this channel overrides the guild default
+#
+# [[channels.discord.groups.channels]]
+# channel_id = "111222333"
+# response_mode = "digest"
+# digest_interval_min = 2                      # faster digest for this channel
+# digest_debounce_min = 1
 
 # ---------------------------------------------------------------------------
 # Database

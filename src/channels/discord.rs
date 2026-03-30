@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -9,7 +8,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::channels::modes::{AlwaysMode, DigestMode, MentionOnlyMode, ModeRouter, ResponseMode};
+use crate::channels::modes::{ConfigModeFactory, ModeFactory, ModeRouter, ResponseMode};
 use crate::channels::{Channel, ChannelRegistration, ChannelRegistry};
 use crate::config::{DiscordChannelConfig, Settings};
 use crate::core::event::{
@@ -43,21 +42,39 @@ pub fn register(
         _ => return,
     };
 
-    // Build mode router from config groups.
-    let mut modes: HashMap<String, Arc<dyn ResponseMode>> = HashMap::new();
+    // Build mode router from config groups + per-channel overrides.
+    // Guild factories create per-channel mode instances on the fly.
+    let mut channel_modes: HashMap<String, Arc<dyn ResponseMode>> = HashMap::new();
+    let mut guild_factories: HashMap<String, Arc<dyn ModeFactory>> = HashMap::new();
     for group in &config.groups {
-        let mode: Arc<dyn ResponseMode> = match group.response_mode.as_str() {
-            "mention-only" => Arc::new(MentionOnlyMode),
-            "digest" => {
-                let interval = Duration::from_secs(group.digest_interval_min.unwrap_or(5) * 60);
-                let debounce = Duration::from_secs(group.digest_debounce_min.unwrap_or(2) * 60);
-                Arc::new(DigestMode::new(interval, debounce))
-            }
-            _ => Arc::new(AlwaysMode),
-        };
-        modes.insert(group.guild_id.clone(), mode);
+        // Guild factory — used to create modes for channels not explicitly configured.
+        let factory = Arc::new(ConfigModeFactory::new(
+            &group.response_mode,
+            group.digest_interval_min,
+            group.digest_debounce_min,
+        ));
+        debug!(guild = %group.guild_id, mode = %group.response_mode, "registered guild mode");
+        guild_factories.insert(group.guild_id.clone(), factory as Arc<dyn ModeFactory>);
+
+        // Per-channel overrides — each gets its own mode instance.
+        for ch in &group.channels {
+            let mode_name = ch.response_mode.as_deref().unwrap_or(&group.response_mode);
+            let ch_factory = ConfigModeFactory::new(
+                mode_name,
+                ch.digest_interval_min.or(group.digest_interval_min),
+                ch.digest_debounce_min.or(group.digest_debounce_min),
+            );
+            debug!(
+                guild = %group.guild_id,
+                channel = %ch.channel_id,
+                mode = mode_name,
+                "registered channel mode override"
+            );
+            channel_modes.insert(ch.channel_id.clone(), ch_factory.create());
+        }
     }
-    let mode_router = Arc::new(ModeRouter::new(modes, Arc::new(AlwaysMode)));
+    let default_factory = Arc::new(ConfigModeFactory::new("mention-only", None, None));
+    let mode_router = Arc::new(ModeRouter::new(channel_modes, guild_factories, default_factory));
 
     let discord = Arc::new(DiscordAdapter::new(
         config,
@@ -248,11 +265,14 @@ impl Channel for DiscordAdapter {
                             let _ = ctx; // available if needed for fetching member info etc.
                             let in_event =
                                 serenity_message_to_in_event(new_message, data.bot_user_id);
-                            let group_id = group_id_for_message(new_message);
+                            let channel_id = new_message.channel_id.to_string();
+                            let guild_id = group_id_for_message(new_message);
 
-                            // Route through mode
-                            let dispatch_events =
-                                data.mode_router.on_message(&group_id, in_event).await;
+                            // Route through mode (channel override → guild default → global default)
+                            let dispatch_events = data
+                                .mode_router
+                                .on_message(&channel_id, &guild_id, in_event)
+                                .await;
 
                             for event in dispatch_events {
                                 if data.event_tx.send(event).await.is_err() {

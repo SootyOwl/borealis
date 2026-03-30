@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
@@ -155,44 +156,112 @@ impl ResponseMode for DigestMode {
     }
 }
 
-/// Routes messages to the appropriate `ResponseMode` based on group ID.
+/// Factory that creates a `ResponseMode` instance. Used by `ModeRouter` to
+/// lazily create per-channel mode instances from guild defaults.
+pub trait ModeFactory: Send + Sync {
+    fn create(&self) -> Arc<dyn ResponseMode>;
+}
+
+/// A factory that always creates the same kind of mode from stored config.
+pub struct ConfigModeFactory {
+    mode_name: String,
+    digest_interval: Duration,
+    digest_debounce: Duration,
+}
+
+impl ConfigModeFactory {
+    pub fn new(mode_name: &str, interval_min: Option<u64>, debounce_min: Option<u64>) -> Self {
+        Self {
+            mode_name: mode_name.to_string(),
+            digest_interval: Duration::from_secs(interval_min.unwrap_or(5) * 60),
+            digest_debounce: Duration::from_secs(debounce_min.unwrap_or(2) * 60),
+        }
+    }
+}
+
+impl ModeFactory for ConfigModeFactory {
+    fn create(&self) -> Arc<dyn ResponseMode> {
+        match self.mode_name.as_str() {
+            "mention-only" => Arc::new(MentionOnlyMode),
+            "digest" => Arc::new(DigestMode::new(self.digest_interval, self.digest_debounce)),
+            _ => Arc::new(AlwaysMode),
+        }
+    }
+}
+
+/// Routes messages to the appropriate `ResponseMode` based on channel/guild ID.
 ///
-/// Each adapter gets one `ModeRouter`. It maps group IDs to mode instances.
-/// A wildcard `"*"` entry serves as the default for unconfigured groups.
+/// Lookup order: channel_id → guild_id → global default.
+///
+/// Channels not explicitly configured get a lazily-created mode instance
+/// from their guild's factory, ensuring each channel has its own independent
+/// mode state (important for DigestMode's per-channel buffers).
 pub struct ModeRouter {
-    modes: HashMap<String, Arc<dyn ResponseMode>>,
-    default_mode: Arc<dyn ResponseMode>,
+    /// Explicitly configured modes (channel overrides + guild defaults used
+    /// as templates for the factory only).
+    channel_modes: DashMap<String, Arc<dyn ResponseMode>>,
+    /// Factories keyed by guild_id, used to create per-channel modes on the fly.
+    guild_factories: HashMap<String, Arc<dyn ModeFactory>>,
+    /// Global default factory for channels in unconfigured guilds.
+    default_factory: Arc<dyn ModeFactory>,
 }
 
 impl ModeRouter {
     pub fn new(
-        modes: HashMap<String, Arc<dyn ResponseMode>>,
-        default_mode: Arc<dyn ResponseMode>,
+        channel_modes: HashMap<String, Arc<dyn ResponseMode>>,
+        guild_factories: HashMap<String, Arc<dyn ModeFactory>>,
+        default_factory: Arc<dyn ModeFactory>,
     ) -> Self {
         Self {
-            modes,
-            default_mode,
+            channel_modes: channel_modes.into_iter().collect(),
+            guild_factories,
+            default_factory,
         }
     }
 
-    /// Get the mode for a given group ID, falling back to the default.
-    fn mode_for(&self, group_id: &str) -> &Arc<dyn ResponseMode> {
-        self.modes.get(group_id).unwrap_or(&self.default_mode)
+    /// Get or create the mode for a channel.
+    fn mode_for(&self, channel_id: &str, guild_id: &str) -> Arc<dyn ResponseMode> {
+        // Check if this channel already has a mode (explicit or previously created).
+        if let Some(mode) = self.channel_modes.get(channel_id) {
+            return Arc::clone(mode.value());
+        }
+
+        // Create a new mode from the guild factory (or global default).
+        let factory = self
+            .guild_factories
+            .get(guild_id)
+            .unwrap_or(&self.default_factory);
+        let mode = factory.create();
+        self.channel_modes
+            .insert(channel_id.to_string(), Arc::clone(&mode));
+        debug!(channel = channel_id, guild = guild_id, "created mode for new channel");
+        mode
     }
 
-    /// Route a message through its group's mode.
-    pub async fn on_message(&self, group_id: &str, event: InEvent) -> Vec<InEvent> {
-        self.mode_for(group_id).on_message(event).await
+    /// Route a message through its mode. Checks channel_id first, then
+    /// creates from guild factory if needed.
+    pub async fn on_message(
+        &self,
+        channel_id: &str,
+        guild_id: &str,
+        event: InEvent,
+    ) -> Vec<InEvent> {
+        self.mode_for(channel_id, guild_id).on_message(event).await
     }
 
-    /// Tick all modes, collecting any ready events.
+    /// Tick all active modes, collecting any ready events.
     pub async fn on_tick(&self) -> Vec<InEvent> {
+        // Snapshot the mode Arcs to avoid holding DashMap locks across .await.
+        let modes: Vec<Arc<dyn ResponseMode>> = self
+            .channel_modes
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+
         let mut events = Vec::new();
-        for mode in self.modes.values() {
+        for mode in &modes {
             events.extend(mode.on_tick().await);
         }
-        // Also tick the default mode (it may have buffered messages for unconfigured groups)
-        events.extend(self.default_mode.on_tick().await);
         events
     }
 }
@@ -325,19 +394,102 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 
+    /// Helper: build a simple factory for tests.
+    struct FixedModeFactory(Arc<dyn ResponseMode>);
+    impl ModeFactory for FixedModeFactory {
+        fn create(&self) -> Arc<dyn ResponseMode> {
+            // For stateless modes we can clone the Arc; for DigestMode tests
+            // each call should create a new instance.
+            Arc::clone(&self.0)
+        }
+    }
+
+    fn fixed_factory(mode: impl ResponseMode + 'static) -> Arc<dyn ModeFactory> {
+        Arc::new(FixedModeFactory(Arc::new(mode)))
+    }
+
     #[tokio::test]
     async fn mode_router_routes_to_correct_mode() {
-        let mut modes: HashMap<String, Arc<dyn ResponseMode>> = HashMap::new();
-        modes.insert("quiet".into(), Arc::new(MentionOnlyMode));
+        // Guild "quiet" uses mention-only
+        let mut guild_factories: HashMap<String, Arc<dyn ModeFactory>> = HashMap::new();
+        guild_factories.insert("quiet".into(), fixed_factory(MentionOnlyMode));
 
-        let router = ModeRouter::new(modes, Arc::new(AlwaysMode));
+        let router = ModeRouter::new(
+            HashMap::new(),
+            guild_factories,
+            fixed_factory(AlwaysMode),
+        );
 
-        // "quiet" group uses mention-only: non-mention dropped
-        let events = router.on_message("quiet", make_event(false, "quiet")).await;
+        // Channel in "quiet" guild: mention-only (non-mention dropped)
+        let events = router
+            .on_message("chan1", "quiet", make_event(false, "quiet"))
+            .await;
         assert!(events.is_empty());
 
-        // Unknown group uses default (always): dispatched
-        let events = router.on_message("other", make_event(false, "other")).await;
+        // Channel in unknown guild: default (always, dispatched)
+        let events = router
+            .on_message("chan2", "other", make_event(false, "other"))
+            .await;
         assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mode_router_channel_override_takes_priority() {
+        // Guild default: mention-only
+        let mut guild_factories: HashMap<String, Arc<dyn ModeFactory>> = HashMap::new();
+        guild_factories.insert("guild1".into(), fixed_factory(MentionOnlyMode));
+
+        // Channel override: always
+        let mut channel_modes: HashMap<String, Arc<dyn ResponseMode>> = HashMap::new();
+        channel_modes.insert("chan-override".into(), Arc::new(AlwaysMode));
+
+        let router = ModeRouter::new(
+            channel_modes,
+            guild_factories,
+            fixed_factory(MentionOnlyMode),
+        );
+
+        // Overridden channel: dispatched (always mode wins)
+        let events = router
+            .on_message("chan-override", "guild1", make_event(false, "chan-override"))
+            .await;
+        assert_eq!(events.len(), 1);
+
+        // Non-overridden channel: lazily created from guild factory (mention-only, dropped)
+        let events = router
+            .on_message("chan-other", "guild1", make_event(false, "chan-other"))
+            .await;
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mode_router_creates_independent_digest_per_channel() {
+        // Guild uses digest mode — each channel should get its own buffer
+        let mut guild_factories: HashMap<String, Arc<dyn ModeFactory>> = HashMap::new();
+        guild_factories.insert(
+            "guild1".into(),
+            Arc::new(ConfigModeFactory::new("digest", Some(60), Some(5))),
+        );
+
+        let router = ModeRouter::new(
+            HashMap::new(),
+            guild_factories,
+            fixed_factory(AlwaysMode),
+        );
+
+        // Send message to chan-a
+        let events = router
+            .on_message("chan-a", "guild1", make_event(false, "chan-a"))
+            .await;
+        assert!(events.is_empty()); // buffered
+
+        // Send message to chan-b
+        let events = router
+            .on_message("chan-b", "guild1", make_event(false, "chan-b"))
+            .await;
+        assert!(events.is_empty()); // buffered in separate instance
+
+        // Verify they have independent modes (2 entries in channel_modes)
+        assert_eq!(router.channel_modes.len(), 2);
     }
 }

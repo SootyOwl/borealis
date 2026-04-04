@@ -542,7 +542,7 @@ pub fn get_secret(env_var: &str) -> String {
 // Memory Lifecycle
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
     #[serde(default = "default_salience_threshold")]
     pub salience_threshold: f64,

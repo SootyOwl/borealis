@@ -44,6 +44,9 @@ pub struct Note {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
+    pub salience: f64,
+    pub score: f64,
+    pub pinned: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -111,6 +114,9 @@ impl SqliteMemory {
                  id          TEXT PRIMARY KEY,
                  title       TEXT NOT NULL,
                  content     TEXT NOT NULL,
+                 salience    REAL NOT NULL DEFAULT 0.0,
+                 score       REAL NOT NULL DEFAULT 0.0,
+                 pinned      INTEGER NOT NULL DEFAULT 0,
                  created_at  TEXT NOT NULL,
                  updated_at  TEXT NOT NULL,
                  deleted_at  TEXT
@@ -181,6 +187,9 @@ impl SqliteMemory {
             content,
             tags: vec!["persona".to_string()],
             links: Vec::new(),
+            salience: 1.0,
+            score: 1.0,
+            pinned: true,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -246,7 +255,7 @@ impl Memory for SqliteMemory {
         let conn = self.lock_conn()?;
 
         conn.execute(
-            "INSERT INTO notes (id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO notes (id, title, content, salience, score, pinned, created_at, updated_at) VALUES (?1, ?2, ?3, 0.0, 0.0, 0, ?4, ?5)",
             params![id, title, content, now, now],
         )?;
 
@@ -263,6 +272,9 @@ impl Memory for SqliteMemory {
             content: content.to_string(),
             tags: tags.to_vec(),
             links: Vec::new(),
+            salience: 0.0,
+            score: 0.0,
+            pinned: false,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -276,7 +288,7 @@ impl Memory for SqliteMemory {
         let conn = self.lock_conn()?;
         let note = conn
             .query_row(
-                "SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT id, title, content, salience, score, pinned, created_at, updated_at FROM notes WHERE id = ?1 AND deleted_at IS NULL",
                 params![id],
                 |row| {
                     Ok(Note {
@@ -285,8 +297,11 @@ impl Memory for SqliteMemory {
                         content: row.get(2)?,
                         tags: Vec::new(),
                         links: Vec::new(),
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
+                        salience: row.get(3)?,
+                        score: row.get(4)?,
+                        pinned: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                     })
                 },
             )
@@ -351,7 +366,7 @@ impl Memory for SqliteMemory {
         let pattern = format!("%{escaped}%");
 
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT n.id, n.title, n.content, n.created_at, n.updated_at
+            "SELECT DISTINCT n.id, n.title, n.content, n.salience, n.score, n.pinned, n.created_at, n.updated_at
              FROM notes n
              LEFT JOIN tags t ON n.id = t.note_id
              WHERE n.deleted_at IS NULL
@@ -368,8 +383,11 @@ impl Memory for SqliteMemory {
                     content: row.get(2)?,
                     tags: Vec::new(),
                     links: Vec::new(),
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
+                    salience: row.get(3)?,
+                    score: row.get(4)?,
+                    pinned: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -389,7 +407,7 @@ impl Memory for SqliteMemory {
 
         let notes = if let Some(tag) = tag_filter {
             let mut stmt = conn.prepare(
-                "SELECT n.id, n.title, n.content, n.created_at, n.updated_at
+                "SELECT n.id, n.title, n.content, n.salience, n.score, n.pinned, n.created_at, n.updated_at
                  FROM notes n
                  JOIN tags t ON n.id = t.note_id
                  WHERE n.deleted_at IS NULL AND t.tag = ?1
@@ -402,14 +420,17 @@ impl Memory for SqliteMemory {
                     content: row.get(2)?,
                     tags: Vec::new(),
                     links: Vec::new(),
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
+                    salience: row.get(3)?,
+                    score: row.get(4)?,
+                    pinned: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, title, content, created_at, updated_at
+                "SELECT id, title, content, salience, score, pinned, created_at, updated_at
                  FROM notes
                  WHERE deleted_at IS NULL
                  ORDER BY updated_at DESC",
@@ -421,8 +442,11 @@ impl Memory for SqliteMemory {
                     content: row.get(2)?,
                     tags: Vec::new(),
                     links: Vec::new(),
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
+                    salience: row.get(3)?,
+                    score: row.get(4)?,
+                    pinned: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
@@ -760,6 +784,9 @@ mod tests {
                 content: content.to_string(),
                 tags: tags.to_vec(),
                 links: Vec::new(),
+                salience: 0.0,
+                score: 0.0,
+                pinned: false,
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
             };

@@ -1,3 +1,6 @@
+mod lifecycle;
+
+pub use lifecycle::MemoryLifecycle;
 mod store;
 
 use std::sync::{Arc, Mutex};

@@ -35,6 +35,8 @@ pub enum ConfigError {
 
 #[derive(Debug, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    pub memory: MemoryConfig,
     pub bot: BotConfig,
     pub providers: ProvidersConfig,
     #[serde(default)]
@@ -534,4 +536,40 @@ pub fn get_secret(env_var: &str) -> String {
              this is a programming error"
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// Memory Lifecycle
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryConfig {
+    #[serde(default = "default_salience_threshold")]
+    pub salience_threshold: f64,
+    #[serde(default = "default_sweep_interval_mins")]
+    pub sweep_interval_mins: u64,
+    #[serde(default = "default_dreaming_cron")]
+    pub dreaming_cron: String,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            salience_threshold: default_salience_threshold(),
+            sweep_interval_mins: default_sweep_interval_mins(),
+            dreaming_cron: default_dreaming_cron(),
+        }
+    }
+}
+
+fn default_salience_threshold() -> f64 {
+    0.5
+}
+
+fn default_sweep_interval_mins() -> u64 {
+    60
+}
+
+fn default_dreaming_cron() -> String {
+    "0 3 * * *".into() // default 3 AM
 }

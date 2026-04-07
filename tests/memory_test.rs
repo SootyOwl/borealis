@@ -171,13 +171,16 @@ async fn ac7_search() {
         .await;
     assert_eq!(result.content.as_array().unwrap().len(), 1);
 
-    // Search by tag
+    // Search with tag filter — FTS5 searches title+content; use the `tag`
+    // parameter to scope by tag.  Both "Rust Guide" and "Python Intro" are
+    // tagged "code".  A wildcard prefix query matches all indexed terms, and
+    // the tag filter narrows to the "code" namespace.
     let result = registry
         .execute(
             &ToolCall {
                 id: "s3".into(),
                 name: "memory_search".into(),
-                arguments: serde_json::json!({ "query": "code" }),
+                arguments: serde_json::json!({ "query": "programming OR language", "tag": "code" }),
             },
             &ctx,
         )
@@ -871,5 +874,209 @@ async fn memory_list_tool_pagination_and_exact_filter() {
         result.content["offset"].as_u64().unwrap(),
         1,
         "offset field in envelope should echo 1"
+    );
+}
+
+/// T9: `memory_search` respects `tag_exact` — parent tag must not pull in child-tagged notes.
+#[tokio::test]
+async fn memory_search_tool_tag_exact_filter() {
+    let (_store, registry) = setup();
+    let ctx = test_ctx();
+
+    // Create a note tagged with the bare parent tag.
+    let r1 = registry
+        .execute(
+            &ToolCall {
+                id: "s1".into(),
+                name: "memory_create".into(),
+                arguments: serde_json::json!({
+                    "title": "Recipes Index",
+                    "content": "top level recipe index entry",
+                    "tags": ["recipes"]
+                }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!r1.is_error, "create failed: {:?}", r1.content);
+
+    // Create a note tagged with a child tag.
+    let r2 = registry
+        .execute(
+            &ToolCall {
+                id: "s2".into(),
+                name: "memory_create".into(),
+                arguments: serde_json::json!({
+                    "title": "Italian Pasta",
+                    "content": "top level recipe for italian pasta",
+                    "tags": ["recipes/italian"]
+                }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!r2.is_error, "create failed: {:?}", r2.content);
+
+    // tag_exact: true — only the note tagged exactly "recipes" should be returned.
+    let result = registry
+        .execute(
+            &ToolCall {
+                id: "s3".into(),
+                name: "memory_search".into(),
+                arguments: serde_json::json!({
+                    "query": "recipe",
+                    "tag": "recipes",
+                    "tag_exact": true
+                }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!result.is_error, "search failed: {:?}", result.content);
+    let notes = result.content.as_array().unwrap();
+    assert_eq!(notes.len(), 1, "tag_exact=true must match only the exact-tagged note");
+    assert_eq!(
+        notes[0]["title"].as_str().unwrap(),
+        "Recipes Index",
+        "only the note tagged exactly 'recipes' should be returned"
+    );
+
+    // tag_exact: false (default prefix) — both notes should be returned.
+    let result_prefix = registry
+        .execute(
+            &ToolCall {
+                id: "s4".into(),
+                name: "memory_search".into(),
+                arguments: serde_json::json!({
+                    "query": "recipe",
+                    "tag": "recipes",
+                    "tag_exact": false
+                }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!result_prefix.is_error, "search failed: {:?}", result_prefix.content);
+    let notes_prefix = result_prefix.content.as_array().unwrap();
+    assert_eq!(
+        notes_prefix.len(),
+        2,
+        "tag_exact=false must return both notes (prefix match)"
+    );
+}
+
+/// memory_search clamps `limit` at MEMORY_SEARCH_MAX_LIMIT (100). Boundary
+/// tests at exactly 100 (passes), exactly 101 (clamps), and far above
+/// (clamps). Mirrors the memory_list cap test from Phase 2.
+#[tokio::test]
+async fn memory_search_caps_limit_at_max() {
+    let (_store, registry) = setup();
+    let ctx = test_ctx();
+
+    // Seed one note so the search has something to return.
+    let _ = registry
+        .execute(
+            &ToolCall {
+                id: "c1".into(),
+                name: "memory_create".into(),
+                arguments: serde_json::json!({
+                    "title": "Seed",
+                    "content": "alpha beta gamma"
+                }),
+            },
+            &ctx,
+        )
+        .await;
+
+    // Far above the cap — must succeed (no error) and search runs at the cap.
+    let far_over = registry
+        .execute(
+            &ToolCall {
+                id: "s_far".into(),
+                name: "memory_search".into(),
+                arguments: serde_json::json!({ "query": "alpha", "limit": 99999 }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        !far_over.is_error,
+        "limit=99999 should succeed (clamps silently): {:?}",
+        far_over.content
+    );
+
+    // Boundary: exactly at the cap should pass through unchanged.
+    let at_cap = registry
+        .execute(
+            &ToolCall {
+                id: "s_at_cap".into(),
+                name: "memory_search".into(),
+                arguments: serde_json::json!({ "query": "alpha", "limit": 100 }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!at_cap.is_error, "limit=100 should succeed: {:?}", at_cap.content);
+
+    // Boundary: one above should clamp (no error, response identical to at-cap).
+    let just_over = registry
+        .execute(
+            &ToolCall {
+                id: "s_over".into(),
+                name: "memory_search".into(),
+                arguments: serde_json::json!({ "query": "alpha", "limit": 101 }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        !just_over.is_error,
+        "limit=101 should succeed (clamps to 100): {:?}",
+        just_over.content
+    );
+}
+
+/// memory_search rejects queries longer than MEMORY_SEARCH_MAX_QUERY_LEN
+/// (1024 bytes). Boundary tests at exactly 1024 (passes) and exactly 1025
+/// (rejects with an error).
+#[tokio::test]
+async fn memory_search_rejects_overlong_query() {
+    let (_store, registry) = setup();
+    let ctx = test_ctx();
+
+    // Exactly at the cap — should NOT be rejected.
+    let at_cap_query = "a".repeat(1024);
+    let at_cap = registry
+        .execute(
+            &ToolCall {
+                id: "q_at_cap".into(),
+                name: "memory_search".into(),
+                arguments: serde_json::json!({ "query": at_cap_query }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        !at_cap.is_error,
+        "query at exactly 1024 bytes should be accepted: {:?}",
+        at_cap.content
+    );
+
+    // One byte over — should be rejected with an error result.
+    let over_cap_query = "a".repeat(1025);
+    let over_cap = registry
+        .execute(
+            &ToolCall {
+                id: "q_over_cap".into(),
+                name: "memory_search".into(),
+                arguments: serde_json::json!({ "query": over_cap_query }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        over_cap.is_error,
+        "query at 1025 bytes should be rejected: {:?}",
+        over_cap.content
     );
 }

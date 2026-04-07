@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -157,7 +157,13 @@ pub trait Memory: Send + Sync {
     fn read_note(&self, id: &str) -> MemoryResult<Note>;
     fn update_note(&self, id: &str, content: &str) -> MemoryResult<Note>;
     fn forget_note(&self, id: &str) -> MemoryResult<()>;
-    fn search_notes(&self, query: &str, limit: usize) -> MemoryResult<Vec<Note>>;
+    fn search_notes(
+        &self,
+        query: &str,
+        limit: usize,
+        tag_filter: Option<&str>,
+        tag_exact: bool,
+    ) -> MemoryResult<Vec<Note>>;
     fn list_notes(&self, tag_filter: Option<&str>) -> MemoryResult<Vec<Note>>;
     fn link_notes(&self, from_id: &str, to_id: &str, relation: &str) -> MemoryResult<Link>;
     fn get_links_for_note(&self, id: &str) -> MemoryResult<Vec<Link>>;
@@ -201,6 +207,8 @@ impl SqliteMemory {
 
     fn init_schema(&self) -> MemoryResult<()> {
         let conn = self.lock_conn()?;
+
+        // Step 1: create base tables and index.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
@@ -231,14 +239,14 @@ impl SqliteMemory {
              CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);",
         )?;
 
-        // One-time backfill: upgrade legacy second-precision timestamps
+        // Step 2: one-time backfill of legacy second-precision timestamps
         // (`...:SSZ`) to millisecond format (`...:SS.000Z`).
         //
-        // Why this matters: the new `now_iso()` produces RFC 3339 with millis,
-        // and lex-sort ordering of mixed-format timestamps would invert
-        // chronologically (because '.' = 0x2E < 'Z' = 0x5A, so legacy timestamps
-        // sort AFTER any millisecond timestamp from the same second). The
-        // backfill normalizes everything to a single comparable format.
+        // This MUST run BEFORE the FTS5 triggers are created.  The UPDATE
+        // statements here would fire `notes_au` if the trigger existed, causing
+        // FTS5 to try to delete rows it has never indexed — which raises
+        // SQLITE_CORRUPT_VTAB on the empty external-content table.  Doing the
+        // timestamp backfill first avoids that.
         //
         // Idempotent: filtered to rows that don't already contain a `.`.
         conn.execute_batch(
@@ -249,6 +257,77 @@ impl SqliteMemory {
              UPDATE notes SET deleted_at = REPLACE(deleted_at, 'Z', '.000Z')
                  WHERE deleted_at IS NOT NULL AND deleted_at NOT LIKE '%.%';",
         )?;
+
+        // Step 3: create the FTS5 virtual table and sync triggers.
+        //
+        // These are created AFTER the timestamp backfill so that the backfill
+        // UPDATEs don't fire `notes_au` against an empty (uninitialized) FTS5
+        // index.
+        //
+        // We use a regular (full-content) FTS5 table rather than an
+        // external-content table (`content='notes'`).  External-content tables
+        // "pass through" SELECT COUNT(*) to the source table, which makes the
+        // standard `EXISTS(SELECT 1 FROM notes_fts LIMIT 1)` backfill check
+        // unreliable — it always returns true even when the FTS index is empty.
+        // Storing the indexed text directly in notes_fts is simpler, idempotent,
+        // and the storage overhead is acceptable given the note sizes in practice.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+                 title,
+                 content,
+                 tokenize='porter unicode61'
+             );
+
+             CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+                 INSERT INTO notes_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+                 DELETE FROM notes_fts WHERE rowid = old.rowid;
+             END;
+
+             -- Normal update: re-index only when the note is still live.
+             CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes
+             WHEN new.deleted_at IS NULL
+             BEGIN
+                 DELETE FROM notes_fts WHERE rowid = old.rowid;
+                 INSERT INTO notes_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
+             END;
+
+             -- Soft-delete: remove from the FTS index when the note transitions from live to deleted.
+             CREATE TRIGGER IF NOT EXISTS notes_soft_delete AFTER UPDATE ON notes
+             WHEN new.deleted_at IS NOT NULL AND old.deleted_at IS NULL
+             BEGIN
+                 DELETE FROM notes_fts WHERE rowid = new.rowid;
+             END;",
+        )?;
+
+        // Step 4: idempotent FTS5 backfill.
+        //
+        // Populate the index from existing notes if the index is empty but the
+        // notes table is not.  For a regular (full-content) FTS5 table,
+        // `EXISTS(SELECT 1 FROM notes_fts LIMIT 1)` correctly detects whether
+        // any notes have been indexed.  Cheap on subsequent boots — the SELECT
+        // returns immediately when the index is already populated.
+        let fts_populated: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM notes_fts LIMIT 1)", [], |row| {
+                row.get(0)
+            })?;
+        let notes_present: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM notes LIMIT 1)", [], |row| {
+                row.get(0)
+            })?;
+        if !fts_populated && notes_present {
+            // Soft-deleted notes are excluded from the backfill: they would pollute
+            // bm25 corpus statistics for content that is no longer accessible, and
+            // the soft-delete trigger (notes_soft_delete) ensures they are removed
+            // from the index going forward anyway.
+            conn.execute(
+                "INSERT INTO notes_fts(rowid, title, content)
+                 SELECT rowid, title, content FROM notes WHERE deleted_at IS NULL",
+                [],
+            )?;
+        }
 
         Ok(())
     }
@@ -346,6 +425,151 @@ impl SqliteMemory {
             return Err(MemoryError::NotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    /// Execute the FTS5 MATCH query for `search_notes`.
+    ///
+    /// On a FTS5 syntax error (e.g. stray `:` in the query string), this
+    /// retries once with the query wrapped in double-quotes as a literal phrase.
+    /// That way Aurora can search for `"foo:bar"` without knowing FTS5 grammar.
+    ///
+    /// FTS5 parse errors arrive as `rusqlite::Error::SqliteFailure` with
+    /// `ffi::ErrorCode::Unknown` (SQLITE_ERROR, code 1).
+    ///
+    /// Safety argument: `execute_fts_query` issues a single, static FTS5 MATCH
+    /// statement (`SELECT rowid FROM notes_fts WHERE notes_fts MATCH ?1 ...`).
+    /// There is zero schema variability in that statement — the only input is the
+    /// FTS5 query string bound as a parameter.  Therefore any `Unknown`-coded
+    /// `SqliteFailure` returned from running it must originate from the FTS5 query
+    /// parser, not from a structural DB problem (missing tables, corrupt schema,
+    /// etc.).  Genuine structural errors would return different error codes
+    /// (`CannotOpen`, `NotFound`, `Corrupt`, …) and are not masked here.
+    fn run_fts_query(
+        &self,
+        conn: &Connection,
+        query: &str,
+        normalized_tag: &Option<String>,
+        tag_exact: bool,
+        limit: usize,
+    ) -> MemoryResult<Vec<Note>> {
+        match self.execute_fts_query(conn, query, normalized_tag, tag_exact, limit) {
+            Ok(notes) => Ok(notes),
+            Err(MemoryError::Database(rusqlite::Error::SqliteFailure(err, _)))
+                if err.code == rusqlite::ffi::ErrorCode::Unknown =>
+            {
+                // FTS5 query parse error — retry as a literal phrase.  The FTS5 MATCH
+                // statement above has no schema variability, so any Unknown-coded SQL
+                // error from running it must originate from the FTS5 query parser.
+                let phrase_query = format!("\"{}\"", query.replace('"', "\"\""));
+                self.execute_fts_query(conn, &phrase_query, normalized_tag, tag_exact, limit)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The actual SQL execution for `run_fts_query`.  Separated so the
+    /// phrase-fallback can call it cleanly without recursion risk.
+    ///
+    /// `bm25()` can only be used in the `ORDER BY` of a query that has the FTS5
+    /// table directly in `FROM` (not in a `JOIN`).  To get bm25 ordering while
+    /// also filtering by tag, we use a two-step approach:
+    ///
+    /// 1. Run the FTS5 MATCH query to collect (rowid, bm25_score) pairs ordered
+    ///    by relevance, up to a generous multiplier of the requested limit.
+    /// 2. In Rust, look up each rowid in `notes` + `tags` and apply the tag filter.
+    ///    Stop once we have `limit` matching notes.
+    ///
+    /// This avoids needing bm25() inside a JOIN while preserving relevance ordering.
+    /// The overfetch multiplier (10×, minimum 50) is the only approximation: in the
+    /// rare case where every result is tag-filtered out, we may return fewer than
+    /// `limit` notes.  For typical queries this is a non-issue.
+    ///
+    /// The GLOB pattern `tag || '/*'` is used (not LIKE) for consistency with
+    /// `list_notes` and `list_notes_paginated` — `_` is an allowed tag char and a
+    /// LIKE wildcard; GLOB metacharacters (`*`, `?`, `[`) are all rejected by
+    /// `normalize_tag`, so GLOB is safe.
+    fn execute_fts_query(
+        &self,
+        conn: &Connection,
+        fts_query: &str,
+        normalized_tag: &Option<String>,
+        tag_exact: bool,
+        limit: usize,
+    ) -> MemoryResult<Vec<Note>> {
+        // Step 1: FTS5 match — get rowids in bm25 order.
+        // Overfetch so post-filtering doesn't starve the result set.
+        let overfetch = (limit * 10).max(50);
+        let mut fts_stmt = conn.prepare(
+            "SELECT rowid FROM notes_fts WHERE notes_fts MATCH ?1 ORDER BY bm25(notes_fts) LIMIT ?2",
+        )?;
+        let rowids: Vec<i64> = fts_stmt
+            .query_map(params![fts_query, overfetch as i64], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if rowids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Step 2: For each rowid (in relevance order), look up the note and
+        // apply the tag filter.  Stop when we reach `limit` notes.
+        let mut result = Vec::with_capacity(limit.min(rowids.len()));
+
+        for rowid in rowids {
+            if result.len() >= limit {
+                break;
+            }
+
+            // Fetch the note by rowid, filtering soft-deleted.
+            let note_opt: Option<Note> = conn
+                .query_row(
+                    "SELECT id, title, content, created_at, updated_at
+                     FROM notes WHERE rowid = ?1 AND deleted_at IS NULL",
+                    params![rowid],
+                    |row| {
+                        Ok(Note {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            content: row.get(2)?,
+                            tags: Vec::new(),
+                            links: Vec::new(),
+                            created_at: row.get(3)?,
+                            updated_at: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(MemoryError::Database)?;
+
+            let note = match note_opt {
+                Some(n) => n,
+                None => continue, // soft-deleted or missing
+            };
+
+            // Apply tag filter if present.
+            if let Some(tag) = normalized_tag {
+                let tag_match: bool = if tag_exact {
+                    conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tags WHERE note_id = ?1 AND tag = ?2)",
+                        params![note.id, tag],
+                        |row| row.get(0),
+                    )?
+                } else {
+                    let glob_prefix = format!("{tag}/*");
+                    conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tags WHERE note_id = ?1 AND (tag = ?2 OR tag GLOB ?3))",
+                        params![note.id, tag, glob_prefix],
+                        |row| row.get(0),
+                    )?
+                };
+                if !tag_match {
+                    continue;
+                }
+            }
+
+            result.push(note);
+        }
+
+        Ok(result)
     }
 }
 
@@ -458,36 +682,37 @@ impl Memory for SqliteMemory {
         Ok(())
     }
 
-    fn search_notes(&self, query: &str, limit: usize) -> MemoryResult<Vec<Note>> {
+    fn search_notes(
+        &self,
+        query: &str,
+        limit: usize,
+        tag_filter: Option<&str>,
+        tag_exact: bool,
+    ) -> MemoryResult<Vec<Note>> {
+        // Normalize the tag filter if provided.
+        let normalized_tag: Option<String> = match tag_filter {
+            Some(tag) => Some(normalize_tag(tag)?),
+            None => None,
+        };
+
+        // An empty or whitespace-only query has no meaningful results.  Returning
+        // an empty vec is correct: it avoids the FTS5 phrase fallback synthesizing
+        // `""`, which would match every document in the index.
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // No point running the FTS query + overfetch loop when the caller wants zero results.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let conn = self.lock_conn()?;
-        let escaped = query.replace('%', "\\%").replace('_', "\\_");
-        let pattern = format!("%{escaped}%");
 
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT n.id, n.title, n.content, n.created_at, n.updated_at
-             FROM notes n
-             LEFT JOIN tags t ON n.id = t.note_id
-             WHERE n.deleted_at IS NULL
-               AND (n.title LIKE ?1 ESCAPE '\\' OR n.content LIKE ?1 ESCAPE '\\' OR t.tag LIKE ?1 ESCAPE '\\')
-             ORDER BY n.updated_at DESC
-             LIMIT ?2",
-        )?;
+        // Run the FTS5 query, falling back to a phrase-wrapped query on parse error.
+        let notes = self.run_fts_query(&conn, query, &normalized_tag, tag_exact, limit)?;
 
-        let notes: Vec<Note> = stmt
-            .query_map(params![pattern, limit as i64], |row| {
-                Ok(Note {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    content: row.get(2)?,
-                    tags: Vec::new(),
-                    links: Vec::new(),
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Populate tags and links for each note
+        // Populate tags and links for each result.
         let mut result = Vec::with_capacity(notes.len());
         for note in notes {
             let tags = self.get_tags_for_note_locked(&conn, &note.id)?;
@@ -861,7 +1086,7 @@ mod tests {
 
         store.forget_note(&note.id).unwrap();
 
-        let results = store.search_notes("Forgettable", 10).unwrap();
+        let results = store.search_notes("Forgettable", 10, None, false).unwrap();
         assert!(results.is_empty());
 
         let err = store.read_note(&note.id).unwrap_err();
@@ -869,7 +1094,8 @@ mod tests {
     }
 
     #[test]
-    fn search_by_title_content_tag() {
+    fn search_by_title_and_content() {
+        // FTS5 indexes title and content; tags are not in the FTS5 index.
         let (_tmp, store) = test_store();
         store
             .create_note("Rust Programming", "Systems language", &["code".into()])
@@ -882,18 +1108,20 @@ mod tests {
             .unwrap();
 
         // Search by title
-        let results = store.search_notes("Rust", 10).unwrap();
+        let results = store.search_notes("Rust", 10, None, false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Rust Programming");
 
         // Search by content
-        let results = store.search_notes("carbonara", 10).unwrap();
+        let results = store.search_notes("carbonara", 10, None, false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Cooking Recipe");
 
-        // Search by tag
-        let results = store.search_notes("code", 10).unwrap();
-        assert_eq!(results.len(), 2);
+        // FTS5 searches title and content only (not tags directly),
+        // so "code" won't match via tag search.  Search by content keyword instead.
+        let results = store.search_notes("Systems", 10, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Rust Programming");
     }
 
     #[test]
@@ -1310,11 +1538,48 @@ mod tests {
             Ok(())
         }
 
-        fn search_notes(&self, query: &str, limit: usize) -> MemoryResult<Vec<Note>> {
+        fn search_notes(
+            &self,
+            query: &str,
+            limit: usize,
+            tag_filter: Option<&str>,
+            tag_exact: bool,
+        ) -> MemoryResult<Vec<Note>> {
+            // Normalize the tag filter if provided — propagates InvalidTag errors.
+            let normalized_tag: Option<String> = match tag_filter {
+                Some(tag) => Some(normalize_tag(tag)?),
+                None => None,
+            };
+
+            // Parity with SqliteMemory: empty/whitespace query returns nothing.
+            if query.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Short-circuit: limit == 0 means caller wants nothing.
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+
             let notes = self.notes.lock().unwrap();
             Ok(notes
                 .iter()
-                .filter(|n| n.title.contains(query) || n.content.contains(query))
+                .filter(|n| {
+                    // Substring match on title + content.
+                    let text_match = n.title.contains(query) || n.content.contains(query);
+                    if !text_match {
+                        return false;
+                    }
+                    // Apply tag filter.
+                    match &normalized_tag {
+                        None => true,
+                        Some(tag) if tag_exact => n.tags.iter().any(|t| t == tag),
+                        Some(tag) => {
+                            let prefix = format!("{tag}/");
+                            n.tags.iter().any(|t| t == tag || t.starts_with(&prefix))
+                        }
+                    }
+                })
                 .take(limit)
                 .cloned()
                 .collect())
@@ -1852,6 +2117,318 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // FTS5 search tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_finds_stemmed_forms() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Park note", "running through the park", &[])
+            .unwrap();
+        // "run" should match "running" via the porter stemmer.
+        let results = store.search_notes("run", 10, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Park note");
+    }
+
+    #[test]
+    fn search_phrase_query() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("A", "oauth refresh token flow", &[])
+            .unwrap();
+        store
+            .create_note("B", "refresh oauth process", &[])
+            .unwrap();
+        // Phrase query — only the first note has "oauth" immediately followed by "refresh".
+        let results = store
+            .search_notes("\"oauth refresh\"", 10, None, false)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "A");
+    }
+
+    #[test]
+    fn search_boolean_query() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Both", "oauth and token present", &[])
+            .unwrap();
+        store
+            .create_note("Only oauth", "oauth only here", &[])
+            .unwrap();
+        store
+            .create_note("Only token", "token only here", &[])
+            .unwrap();
+        // Boolean AND — only note with both terms should be returned.
+        let results = store
+            .search_notes("oauth AND token", 10, None, false)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Both");
+    }
+
+    #[test]
+    fn search_excludes_soft_deleted() {
+        let (_tmp, store) = test_store();
+        let note = store
+            .create_note("Deletable", "unique content xyzzy", &[])
+            .unwrap();
+        let results = store.search_notes("xyzzy", 10, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+
+        store.forget_note(&note.id).unwrap();
+        let results = store.search_notes("xyzzy", 10, None, false).unwrap();
+        assert!(results.is_empty(), "soft-deleted note must not appear in search");
+    }
+
+    #[test]
+    fn search_with_prefix_tag_filter() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Italian", "pasta carbonara recipe", &["recipes/italian".into()])
+            .unwrap();
+        store
+            .create_note("French", "ratatouille recipe", &["recipes/french".into()])
+            .unwrap();
+        store
+            .create_note("Other", "recipe unrelated", &["other".into()])
+            .unwrap();
+
+        // Prefix match on "recipes" should return both Italian and French.
+        let results = store
+            .search_notes("recipe", 10, Some("recipes"), false)
+            .unwrap();
+        let titles: Vec<&str> = results.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(results.len(), 2);
+        assert!(titles.contains(&"Italian"));
+        assert!(titles.contains(&"French"));
+
+        // Narrower prefix — only Italian.
+        let results = store
+            .search_notes("recipe", 10, Some("recipes/italian"), false)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Italian");
+    }
+
+    #[test]
+    fn search_with_exact_tag_filter() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Italian", "pasta carbonara recipe", &["recipes/italian".into()])
+            .unwrap();
+        store
+            .create_note("French", "ratatouille recipe", &["recipes/french".into()])
+            .unwrap();
+
+        // Exact match on parent tag must NOT pull in children.
+        let results = store
+            .search_notes("recipe", 10, Some("recipes"), true)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "exact 'recipes' must not match 'recipes/italian' or 'recipes/french'"
+        );
+
+        // Exact match on a leaf tag works.
+        let results = store
+            .search_notes("recipe", 10, Some("recipes/italian"), true)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Italian");
+    }
+
+    #[test]
+    fn search_limit_honored() {
+        let (_tmp, store) = test_store();
+        for i in 0..5 {
+            store
+                .create_note(&format!("Note {i}"), "common keyword here", &[])
+                .unwrap();
+        }
+        let results = store.search_notes("common", 3, None, false).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn search_falls_back_to_phrase_on_malformed_query() {
+        let (_tmp, store) = test_store();
+        // A colon in the query triggers an FTS5 parse error.
+        store
+            .create_note("Colon note", "foo:bar baz content", &[])
+            .unwrap();
+        // This must not error — it should fall back to a phrase search.
+        let results = store.search_notes("foo:bar", 10, None, false).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "phrase fallback must find the note containing 'foo:bar'"
+        );
+        assert_eq!(results[0].title, "Colon note");
+    }
+
+    #[test]
+    fn search_propagates_invalid_tag_filter() {
+        let (_tmp, store) = test_store();
+        let err = store
+            .search_notes("anything", 10, Some("bad tag"), false)
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidTag(_)));
+    }
+
+    #[test]
+    fn search_returns_empty_for_empty_query() {
+        // Empty and whitespace-only queries must short-circuit at the entry
+        // and return Ok(empty) — never reach the FTS5 layer where they could
+        // synthesize a match-all phrase.
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Real note", "some real content", &[])
+            .unwrap();
+
+        // Empty string.
+        let r = store.search_notes("", 10, None, false).unwrap();
+        assert!(r.is_empty(), "empty query must return no results");
+
+        // Whitespace only — spaces, tabs, newlines.
+        let r = store.search_notes("   ", 10, None, false).unwrap();
+        assert!(r.is_empty(), "all-spaces query must return no results");
+
+        let r = store.search_notes("\t\n", 10, None, false).unwrap();
+        assert!(r.is_empty(), "tab+newline query must return no results");
+
+        // The mock impl must agree (parity).
+        let mock = MockMemory::new();
+        mock.create_note("Mock", "content", &[]).unwrap();
+        let r = mock.search_notes("", 10, None, false).unwrap();
+        assert!(r.is_empty(), "mock empty query must also return no results");
+        let r = mock.search_notes("   ", 10, None, false).unwrap();
+        assert!(r.is_empty(), "mock whitespace query must also return no results");
+    }
+
+    #[test]
+    fn search_reflects_insert_update_delete() {
+        let (_tmp, store) = test_store();
+        let note = store
+            .create_note("Trigger test", "unique phrase qwerty", &[])
+            .unwrap();
+
+        // Should be found after insert (notes_ai trigger).
+        let results = store.search_notes("qwerty", 10, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Update content so the term no longer matches (notes_au trigger).
+        store.update_note(&note.id, "completely different content").unwrap();
+        let results = store.search_notes("qwerty", 10, None, false).unwrap();
+        assert!(
+            results.is_empty(),
+            "FTS index must reflect the content update"
+        );
+
+        // The new term should now be findable.
+        let results = store.search_notes("completely", 10, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn fts_index_backfilled_on_first_open() {
+        // Simulate a legacy database that has notes but no FTS table/triggers.
+        // Opening via SqliteMemory::new should backfill the index.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT
+            );
+            CREATE TABLE tags (
+                note_id TEXT NOT NULL REFERENCES notes(id),
+                tag TEXT NOT NULL,
+                PRIMARY KEY (note_id, tag)
+            );
+            CREATE TABLE links (
+                from_id TEXT NOT NULL REFERENCES notes(id),
+                to_id TEXT NOT NULL REFERENCES notes(id),
+                relation TEXT NOT NULL,
+                PRIMARY KEY (from_id, to_id)
+            );
+            INSERT INTO notes (id, title, content, created_at, updated_at)
+            VALUES ('legacy_note_1', 'Legacy Title', 'legacy content zulu', '2025-01-15T12:00:00.000Z', '2025-01-15T12:00:00.000Z');",
+        )
+        .unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "# core").unwrap();
+        let store = SqliteMemory::new(
+            Arc::new(Mutex::new(conn)),
+            tmp.path().to_path_buf(),
+        )
+        .unwrap();
+
+        // The backfill must have indexed the pre-existing note.
+        let results = store.search_notes("zulu", 10, None, false).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "FTS backfill must index pre-existing notes on first open"
+        );
+        assert_eq!(results[0].title, "Legacy Title");
+    }
+
+    // -----------------------------------------------------------------------
+    // MockMemory search test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mock_memory_search_with_tag_filter() {
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory::new());
+
+        memory
+            .create_note("Italian recipe", "pasta carbonara", &["recipes/italian".into()])
+            .unwrap();
+        memory
+            .create_note("French recipe", "ratatouille", &["recipes/french".into()])
+            .unwrap();
+        memory
+            .create_note("Unrelated", "something else entirely", &["other".into()])
+            .unwrap();
+
+        // Substring match only (no tag filter).
+        let results = memory.search_notes("recipe", 10, None, false).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Prefix tag filter: "recipes" matches both recipe notes.
+        let results = memory
+            .search_notes("recipe", 10, Some("recipes"), false)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Narrower prefix filter: only Italian.
+        let results = memory
+            .search_notes("recipe", 10, Some("recipes/italian"), false)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Italian recipe");
+
+        // Exact tag filter on parent must NOT pull in children.
+        let results = memory
+            .search_notes("recipe", 10, Some("recipes"), true)
+            .unwrap();
+        assert!(results.is_empty());
+
+        // Invalid tag filter propagates error.
+        let err = memory
+            .search_notes("recipe", 10, Some("bad!tag"), false)
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidTag(_)));
+    }
+
+    // -----------------------------------------------------------------------
     // MockMemory new-method test
     // -----------------------------------------------------------------------
 
@@ -1959,7 +2536,7 @@ mod tests {
         let updated = memory.update_note(&note.id, "New content").unwrap();
         assert_eq!(updated.content, "New content");
 
-        let found = memory.search_notes("New", 10).unwrap();
+        let found = memory.search_notes("New", 10, None, false).unwrap();
         assert_eq!(found.len(), 1);
 
         let listed = memory.list_notes(Some("tag1")).unwrap();
@@ -1975,5 +2552,249 @@ mod tests {
 
         memory.forget_note(&note.id).unwrap();
         assert!(memory.read_note(&note.id).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // T1. Additional phrase fallback cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_fallback_unmatched_quote() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Quote note", "unclosed phrase content here", &[])
+            .unwrap();
+        // An unclosed quote triggers an FTS5 parse error; fallback must find the note.
+        let results = store
+            .search_notes("unclosed \"phrase", 10, None, false)
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "phrase fallback must find note for unmatched-quote query"
+        );
+        assert_eq!(results[0].title, "Quote note");
+    }
+
+    #[test]
+    fn search_fallback_trailing_boolean_operator() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Trailing AND note", "rust AND trailing content", &[])
+            .unwrap();
+        // A trailing boolean operator is a parse error; fallback should find the note.
+        let results = store.search_notes("rust AND", 10, None, false).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "phrase fallback must find note for trailing-AND query"
+        );
+        assert_eq!(results[0].title, "Trailing AND note");
+    }
+
+    #[test]
+    fn search_fallback_bare_not_operator() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("NOT alone note", "NOT alone bare content", &[])
+            .unwrap();
+        // A bare unary NOT without an operand is a parse error; fallback should fire.
+        let results = store.search_notes("NOT alone", 10, None, false).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "phrase fallback must find note for bare-NOT query"
+        );
+        assert_eq!(results[0].title, "NOT alone note");
+    }
+
+    // -----------------------------------------------------------------------
+    // T2. bm25 ordering verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_bm25_ordering() {
+        let (_tmp, store) = test_store();
+        // Note A has "rust" three times in the title — higher term frequency.
+        store
+            .create_note("Rust Rust Rust", "about programming", &[])
+            .unwrap();
+        // Note B has one mention in content only.
+        store
+            .create_note("Programming", "a single mention of rust", &[])
+            .unwrap();
+
+        let results = store.search_notes("rust", 10, None, false).unwrap();
+        assert_eq!(results.len(), 2, "both notes should be returned");
+        assert_eq!(
+            results[0].title, "Rust Rust Rust",
+            "the note with higher rust term frequency must rank first"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T3. Overfetch under tag-filter pressure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_overfetch_under_tag_filter_pressure() {
+        let (_tmp, store) = test_store();
+
+        // 30 notes with common keyword; only 2 have the "target/exact" tag.
+        let mut tagged_titles = Vec::new();
+        for i in 0..30 {
+            let tags: Vec<String> = if i < 2 {
+                vec!["target/exact".to_string()]
+            } else {
+                vec!["other".to_string()]
+            };
+            let title = format!("Note {i}");
+            if i < 2 {
+                tagged_titles.push(title.clone());
+            }
+            store
+                .create_note(&title, "common keyword here", &tags)
+                .unwrap();
+        }
+
+        // limit=10, tag prefix "target" — overfetch is (10*10).max(50) = 100 > 30.
+        let results = store
+            .search_notes("common", 10, Some("target"), false)
+            .unwrap();
+        assert_eq!(results.len(), 2, "only the 2 tagged notes should be returned");
+        let result_titles: Vec<&str> = results.iter().map(|n| n.title.as_str()).collect();
+        for expected in &tagged_titles {
+            assert!(
+                result_titles.contains(&expected.as_str()),
+                "expected note '{expected}' not found in results"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // T4. Soft-delete removes from FTS index (new trigger)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn soft_delete_removes_from_fts_index() {
+        let (_tmp, store) = test_store();
+        let note = store
+            .create_note("FTS trigger test", "unique_fts_term_xyzzy", &[])
+            .unwrap();
+
+        // Note: porter stemmer may or may not match the underscored form with a hyphen
+        // variant; we verify the trigger via direct SQL below rather than search count.
+
+        // Soft-delete the note.
+        store.forget_note(&note.id).unwrap();
+
+        // After soft-delete, searching should not return the note.
+        let results = store
+            .search_notes("unique_fts_term_xyzzy", 10, None, false)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "soft-deleted note must not appear in search"
+        );
+
+        // Verify directly: the FTS row must be gone.
+        let conn = store.lock_conn().unwrap();
+        let fts_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?1)",
+                params![note.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fts_count, 0,
+            "soft-delete should remove the note from notes_fts"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T5. Backfill excludes soft-deleted notes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fts_backfill_excludes_soft_deleted() {
+        // Simulate a legacy database with a live note AND a soft-deleted note.
+        // The backfill (fix #5) must only index the live one.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT
+            );
+            CREATE TABLE tags (
+                note_id TEXT NOT NULL REFERENCES notes(id),
+                tag TEXT NOT NULL,
+                PRIMARY KEY (note_id, tag)
+            );
+            CREATE TABLE links (
+                from_id TEXT NOT NULL REFERENCES notes(id),
+                to_id TEXT NOT NULL REFERENCES notes(id),
+                relation TEXT NOT NULL,
+                PRIMARY KEY (from_id, to_id)
+            );
+            INSERT INTO notes (id, title, content, created_at, updated_at, deleted_at)
+            VALUES
+                ('live_1', 'Live Title', 'live content alpha', '2025-01-15T12:00:00.000Z', '2025-01-15T12:00:00.000Z', NULL),
+                ('dead_1', 'Deleted Title', 'deleted content beta', '2025-01-15T12:00:00.000Z', '2025-01-15T12:00:01.000Z', '2025-01-15T12:00:02.000Z');",
+        )
+        .unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "# core").unwrap();
+        let store = SqliteMemory::new(Arc::new(Mutex::new(conn)), tmp.path().to_path_buf()).unwrap();
+
+        // The live note must be indexed.
+        let live_results = store.search_notes("alpha", 10, None, false).unwrap();
+        assert_eq!(
+            live_results.len(),
+            1,
+            "live note must be found after backfill"
+        );
+        assert_eq!(live_results[0].title, "Live Title");
+
+        // The soft-deleted note must NOT be indexed.
+        let dead_results = store.search_notes("beta", 10, None, false).unwrap();
+        assert!(
+            dead_results.is_empty(),
+            "soft-deleted note must not be backfilled into the FTS index"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T8. FTS5 prefix query syntax
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_fts5_prefix_syntax() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Auth note", "authentication flow", &[])
+            .unwrap();
+        store
+            .create_note("Authz note", "authorize access grant", &[])
+            .unwrap();
+        store
+            .create_note("Unrelated", "completely different content", &[])
+            .unwrap();
+
+        // FTS5 prefix query — `auth*` must match "authentication" and "authorize".
+        let results = store.search_notes("auth*", 10, None, false).unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "prefix query auth* must match both 'authentication' and 'authorize'"
+        );
+        let titles: Vec<&str> = results.iter().map(|n| n.title.as_str()).collect();
+        assert!(titles.contains(&"Auth note"));
+        assert!(titles.contains(&"Authz note"));
     }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::memory::Memory;
+use crate::memory::{MEMORY_SEARCH_MAX_QUERY_LEN, Memory};
 use crate::tools::{
     Tool, ToolContext, ToolDef, ToolDeps, ToolGroup, ToolRegistry, ToolResult,
     error_result, get_str, get_string_array, ok_result,
@@ -8,6 +8,9 @@ use crate::tools::{
 
 /// Maximum number of notes returned per `memory_list` page.
 const MEMORY_LIST_MAX_LIMIT: usize = 100;
+
+/// Maximum number of notes returned by `memory_search` per call.
+const MEMORY_SEARCH_MAX_LIMIT: usize = 100;
 
 fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
     register_memory_tools(registry, Arc::clone(&deps.memory_store));
@@ -110,17 +113,28 @@ impl Tool for MemorySearch {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "memory_search".to_string(),
-            description: "Search memory notes by title, content, or tags.".to_string(),
+            description: "Search memory notes using FTS5 full-text search. Supports prefix queries (`auth*`), phrase queries (`\"oauth refresh\"`), and boolean operators (`oauth AND token`). Results are ordered by bm25 relevance. The optional `tag` filter is a PREFIX match by default: `recipes` matches `recipes`, `recipes/italian`, and all descendants. Set `tag_exact: true` to match only the exact tag.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query to match against title, content, and tags"
+                        "description": "FTS5 search query. Supports prefix (`auth*`), phrase (`\"oauth refresh\"`), and boolean (`oauth AND token`) syntax. Literal strings with special characters are handled automatically.",
+                        "maxLength": 1024
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of results (default: 10)"
+                        "description": "Maximum number of results (default: 10). Silently clamped to 100.",
+                        "minimum": 0,
+                        "maximum": 100
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Optional tag filter. Prefix-match by default (matches the tag and all descendants). Slash-delimited nested path; lowercase `[a-z0-9._-]` per segment."
+                    },
+                    "tag_exact": {
+                        "type": "boolean",
+                        "description": "If true, `tag` must match exactly — no prefix expansion. Default: false."
                     }
                 },
                 "required": ["query"]
@@ -134,10 +148,23 @@ impl Tool for MemorySearch {
             Some(q) => q.to_string(),
             None => return error_result(call_id, "missing required field: query"),
         };
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+        if query.len() > MEMORY_SEARCH_MAX_QUERY_LEN {
+            return error_result(call_id, "query too long: max 1024 bytes");
+        }
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .min(MEMORY_SEARCH_MAX_LIMIT as u64) as usize;
+        let tag = get_str(&args, "tag").map(String::from);
+        let tag_exact = args.get("tag_exact").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let store = self.0.clone();
-        match tokio::task::spawn_blocking(move || store.search_notes(&query, limit)).await {
+        match tokio::task::spawn_blocking(move || {
+            store.search_notes(&query, limit, tag.as_deref(), tag_exact)
+        })
+        .await
+        {
             Ok(Ok(notes)) => ok_result(call_id, match serde_json::to_value(&notes) {
                     Ok(v) => v,
                     Err(e) => return error_result(call_id, &format!("serialization error: {e}")),

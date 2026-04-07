@@ -664,10 +664,24 @@ impl<P: Provider + 'static> Pipeline<P> {
     /// Search memory for notes relevant to the user's message.
     ///
     /// Runs on the blocking thread pool since `Memory::search_notes` does SQLite I/O.
+    ///
+    /// The user message is sanitized for FTS5: metacharacters are stripped and
+    /// bare operator keywords are dropped, but the surviving tokens are passed
+    /// through so FTS5's tokenizer + Porter stemmer can do their normal work.
+    /// This preserves recall (a multi-word user message matches notes containing
+    /// any of those words via implicit AND) while preventing user text from
+    /// being misinterpreted as FTS5 syntax. See `crate::memory::sanitize_for_fts`
+    /// for the exact rules.
     async fn retrieve_memories(&self, query: &str) -> Vec<String> {
+        let sanitized = crate::memory::sanitize_for_fts(query);
+        if sanitized.is_empty() {
+            // Nothing salvageable from the user message — skip retrieval rather
+            // than handing FTS5 an empty query that would match-all.
+            return vec![];
+        }
         let mem = Arc::clone(&self.memory_store);
-        let q = query.to_owned();
-        let result = tokio::task::spawn_blocking(move || mem.search_notes(&q, 5)).await;
+        let result =
+            tokio::task::spawn_blocking(move || mem.search_notes(&sanitized, 5, None, false)).await;
         match result {
             Ok(Ok(notes)) => notes
                 .into_iter()

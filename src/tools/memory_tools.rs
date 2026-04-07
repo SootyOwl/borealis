@@ -322,7 +322,7 @@ impl Tool for MemoryTag {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "memory_tag".to_string(),
-            description: "Update the tags on a note (replaces existing tags).".to_string(),
+            description: "Replace the tags on a note. Pass an empty array `[]` to clear all tags from the note.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -347,10 +347,16 @@ impl Tool for MemoryTag {
             Some(i) => i.to_string(),
             None => return error_result(call_id, "missing required field: id"),
         };
-        let tags = get_string_array(&args, "tags");
-        if tags.is_empty() {
-            return error_result(call_id, "tags must be a non-empty array");
+        // The `tags` field is required (the schema marks it so) but its value
+        // may be an empty array — that's the documented way to clear all tags
+        // from a note. Distinguish "missing field" from "field present, empty".
+        if !args.get("tags").is_some_and(|v| v.is_array()) {
+            return error_result(
+                call_id,
+                "missing required field: tags (must be an array; pass [] to clear)",
+            );
         }
+        let tags = get_string_array(&args, "tags");
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.tag_note(&id, &tags)).await {

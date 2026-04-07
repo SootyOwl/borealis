@@ -502,6 +502,65 @@ async fn tag_tool_replaces() {
     assert_eq!(tags, vec!["new_tag_1", "new_tag_2"]);
 }
 
+/// memory_tag with `tags: []` clears all tags from a note (documented behaviour).
+#[tokio::test]
+async fn tag_tool_empty_array_clears_tags() {
+    let (_store, registry) = setup();
+    let ctx = test_ctx();
+
+    // Create a note with two tags.
+    let create = registry
+        .execute(
+            &ToolCall {
+                id: "c1".into(),
+                name: "memory_create".into(),
+                arguments: serde_json::json!({
+                    "title": "Tagged",
+                    "content": "Content",
+                    "tags": ["foo", "bar"]
+                }),
+            },
+            &ctx,
+        )
+        .await;
+    let note_id = create.content["id"].as_str().unwrap().to_string();
+
+    // Pass an empty tags array — this should succeed and clear all tags.
+    let cleared = registry
+        .execute(
+            &ToolCall {
+                id: "t1".into(),
+                name: "memory_tag".into(),
+                arguments: serde_json::json!({
+                    "id": note_id,
+                    "tags": []
+                }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        !cleared.is_error,
+        "memory_tag with [] should succeed: {:?}",
+        cleared.content
+    );
+    let tags = cleared.content["tags"].as_array().unwrap();
+    assert!(tags.is_empty(), "tags should be empty after clear");
+
+    // A missing `tags` field is still an error (distinguished from empty array).
+    let missing = registry
+        .execute(
+            &ToolCall {
+                id: "t2".into(),
+                name: "memory_tag".into(),
+                arguments: serde_json::json!({ "id": note_id }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(missing.is_error, "missing `tags` field should error");
+}
+
 /// Fix B — memory_list clamps limit to MEMORY_LIST_MAX_LIMIT (100) silently.
 #[tokio::test]
 async fn memory_list_caps_limit_at_max() {

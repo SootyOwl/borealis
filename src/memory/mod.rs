@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::config::Settings;
 
 pub use store::{Link, Memory, MemoryError, MemoryResult, Note, SqliteMemory};
+pub(crate) use store::normalize_tag;
 
 // ---------------------------------------------------------------------------
 // Inventory-based memory backend registration

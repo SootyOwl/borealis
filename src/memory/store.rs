@@ -26,6 +26,8 @@ pub enum MemoryError {
     NotFound(String),
     #[error("cannot use reserved ID 'core' for note operations")]
     ReservedId,
+    #[error("invalid tag: {0}")]
+    InvalidTag(String),
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("core.md I/O error: {0}")]
@@ -35,6 +37,71 @@ pub enum MemoryError {
 }
 
 pub type MemoryResult<T> = Result<T, MemoryError>;
+
+/// Maximum depth (number of slash-separated segments) for a nested tag.
+const MAX_TAG_DEPTH: usize = 8;
+
+/// Normalize a tag string into Borealis's canonical nested-tag form.
+///
+/// Rules (see `docs/superpowers/specs/2026-04-07-fts5-and-nested-tags.md`):
+/// - Slash-delimited path segments: `parent/child/leaf`.
+/// - Lowercased silently — `Recipes/Italian` becomes `recipes/italian`.
+/// - Leading and trailing slashes stripped.
+/// - Empty segments (`a//b`) are rejected.
+/// - Allowed segment chars: `[a-z0-9._-]`.
+/// - Maximum depth: [`MAX_TAG_DEPTH`] segments.
+///
+/// Returns the normalized tag, or [`MemoryError::InvalidTag`] with a human-readable reason.
+pub(crate) fn normalize_tag(input: &str) -> MemoryResult<String> {
+    let lowered = input.to_lowercase();
+    let trimmed = lowered.trim_matches('/');
+    if trimmed.is_empty() || trimmed.chars().all(char::is_whitespace) {
+        return Err(MemoryError::InvalidTag(format!(
+            "empty or whitespace-only tag: {input:?}"
+        )));
+    }
+
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    if segments.len() > MAX_TAG_DEPTH {
+        return Err(MemoryError::InvalidTag(format!(
+            "tag exceeds max depth of {MAX_TAG_DEPTH} segments: {input:?}"
+        )));
+    }
+
+    for seg in &segments {
+        if seg.is_empty() {
+            return Err(MemoryError::InvalidTag(format!(
+                "empty segment in tag: {input:?}"
+            )));
+        }
+        if !seg
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(MemoryError::InvalidTag(format!(
+                "invalid character in tag segment {seg:?} (allowed: a-z 0-9 . _ -)"
+            )));
+        }
+    }
+
+    Ok(segments.join("/"))
+}
+
+/// Normalize and deduplicate a slice of tags, returning the first error encountered.
+///
+/// Deduplication preserves first-occurrence order, so the returned `Vec` is a
+/// faithful description of what will actually land in the `tags` table — callers
+/// who inspect `Note.tags` after `create_note`/`tag_note` see exactly what was stored.
+fn normalize_tags(tags: &[String]) -> MemoryResult<Vec<String>> {
+    let mut out = Vec::with_capacity(tags.len());
+    for raw in tags {
+        let norm = normalize_tag(raw)?;
+        if !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    Ok(out)
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Note {
@@ -106,6 +173,7 @@ impl SqliteMemory {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
+             PRAGMA foreign_keys = ON;
 
              CREATE TABLE IF NOT EXISTS notes (
                  id          TEXT PRIMARY KEY,
@@ -127,7 +195,9 @@ impl SqliteMemory {
                  to_id       TEXT NOT NULL REFERENCES notes(id),
                  relation    TEXT NOT NULL,
                  PRIMARY KEY (from_id, to_id)
-             );",
+             );
+
+             CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);",
         )?;
         Ok(())
     }
@@ -241,27 +311,30 @@ impl SqliteMemory {
 
 impl Memory for SqliteMemory {
     fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
+        let normalized = normalize_tags(tags)?;
         let id = self.generate_id()?;
         let now = Self::now_iso();
         let conn = self.lock_conn()?;
 
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO notes (id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, title, content, now, now],
         )?;
 
-        for tag in tags {
-            conn.execute(
-                "INSERT INTO tags (note_id, tag) VALUES (?1, ?2)",
+        for tag in &normalized {
+            tx.execute(
+                "INSERT OR IGNORE INTO tags (note_id, tag) VALUES (?1, ?2)",
                 params![id, tag],
             )?;
         }
+        tx.commit()?;
 
         Ok(Note {
             id,
             title: title.to_string(),
             content: content.to_string(),
-            tags: tags.to_vec(),
+            tags: normalized,
             links: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
@@ -374,11 +447,12 @@ impl Memory for SqliteMemory {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Populate tags for each note
+        // Populate tags and links for each note
         let mut result = Vec::with_capacity(notes.len());
         for note in notes {
             let tags = self.get_tags_for_note_locked(&conn, &note.id)?;
-            result.push(Note { tags, ..note });
+            let links = self.get_links_for_note_locked(&conn, &note.id)?;
+            result.push(Note { tags, links, ..note });
         }
 
         Ok(result)
@@ -388,14 +462,26 @@ impl Memory for SqliteMemory {
         let conn = self.lock_conn()?;
 
         let notes = if let Some(tag) = tag_filter {
+            let normalized = normalize_tag(tag)?;
+            // Prefix match: `recipes` matches `recipes`, `recipes/italian`, etc.
+            // The `|| '/*'` ensures `recipe` does NOT match `recipes`.
+            //
+            // GLOB (not LIKE) is deliberate: GLOB metacharacters are `*`, `?`, `[`,
+            // none of which can appear in a tag normalized through `normalize_tag`
+            // (allowlist is `[a-z0-9._-]` per segment + `/` separator). LIKE would
+            // require escaping `_`, which IS in the allowlist.
+            //
+            // DISTINCT collapses multi-tag joins so a note with both `recipes` and
+            // `recipes/italian` doesn't appear twice when filtered by `recipes`.
             let mut stmt = conn.prepare(
-                "SELECT n.id, n.title, n.content, n.created_at, n.updated_at
+                "SELECT DISTINCT n.id, n.title, n.content, n.created_at, n.updated_at
                  FROM notes n
                  JOIN tags t ON n.id = t.note_id
-                 WHERE n.deleted_at IS NULL AND t.tag = ?1
+                 WHERE n.deleted_at IS NULL
+                   AND (t.tag = ?1 OR t.tag GLOB ?1 || '/*')
                  ORDER BY n.updated_at DESC",
             )?;
-            stmt.query_map(params![tag], |row| {
+            stmt.query_map(params![normalized], |row| {
                 Ok(Note {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -431,7 +517,8 @@ impl Memory for SqliteMemory {
         let mut result = Vec::with_capacity(notes.len());
         for note in notes {
             let tags = self.get_tags_for_note_locked(&conn, &note.id)?;
-            result.push(Note { tags, ..note });
+            let links = self.get_links_for_note_locked(&conn, &note.id)?;
+            result.push(Note { tags, links, ..note });
         }
 
         Ok(result)
@@ -487,23 +574,26 @@ impl Memory for SqliteMemory {
             return Err(MemoryError::ReservedId);
         }
 
+        let normalized = normalize_tags(tags)?;
         let conn = self.lock_conn()?;
         self.assert_note_exists_locked(&conn, id)?;
 
-        // Replace all tags
-        conn.execute("DELETE FROM tags WHERE note_id = ?1", params![id])?;
-        for tag in tags {
-            conn.execute(
-                "INSERT INTO tags (note_id, tag) VALUES (?1, ?2)",
+        // Replace all tags atomically
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM tags WHERE note_id = ?1", params![id])?;
+        for tag in &normalized {
+            tx.execute(
+                "INSERT OR IGNORE INTO tags (note_id, tag) VALUES (?1, ?2)",
                 params![id, tag],
             )?;
         }
 
         let now = Self::now_iso();
-        conn.execute(
+        tx.execute(
             "UPDATE notes SET updated_at = ?1 WHERE id = ?2",
             params![now, id],
         )?;
+        tx.commit()?;
 
         drop(conn);
         self.read_note(id)
@@ -662,6 +752,237 @@ mod tests {
     }
 
     #[test]
+    fn normalize_tag_lowercases_silently() {
+        assert_eq!(normalize_tag("Recipes").unwrap(), "recipes");
+        assert_eq!(
+            normalize_tag("Recipes/Italian/CARBONARA").unwrap(),
+            "recipes/italian/carbonara"
+        );
+    }
+
+    #[test]
+    fn normalize_tag_strips_outer_slashes() {
+        assert_eq!(normalize_tag("/recipes/").unwrap(), "recipes");
+        assert_eq!(
+            normalize_tag("///recipes/italian///").unwrap(),
+            "recipes/italian"
+        );
+    }
+
+    #[test]
+    fn normalize_tag_rejects_empty_segments() {
+        assert!(matches!(
+            normalize_tag("a//b"),
+            Err(MemoryError::InvalidTag(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_tag_rejects_empty_input() {
+        assert!(matches!(normalize_tag(""), Err(MemoryError::InvalidTag(_))));
+        assert!(matches!(
+            normalize_tag("///"),
+            Err(MemoryError::InvalidTag(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_tag_rejects_bad_characters() {
+        for bad in ["has space", "has!bang", "has:colon", "has?q", "ümlaut"] {
+            assert!(
+                matches!(normalize_tag(bad), Err(MemoryError::InvalidTag(_))),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_tag_allows_dots_underscores_dashes_digits() {
+        assert_eq!(normalize_tag("v1.2.3").unwrap(), "v1.2.3");
+        assert_eq!(normalize_tag("snake_case").unwrap(), "snake_case");
+        assert_eq!(normalize_tag("kebab-case").unwrap(), "kebab-case");
+        assert_eq!(normalize_tag("2026-04-07").unwrap(), "2026-04-07");
+    }
+
+    #[test]
+    fn normalize_tag_enforces_max_depth() {
+        // 8 segments is OK.
+        let ok = (1..=8).map(|i| i.to_string()).collect::<Vec<_>>().join("/");
+        assert!(normalize_tag(&ok).is_ok());
+        // 9 segments is not.
+        let bad = (1..=9).map(|i| i.to_string()).collect::<Vec<_>>().join("/");
+        assert!(matches!(
+            normalize_tag(&bad),
+            Err(MemoryError::InvalidTag(_))
+        ));
+    }
+
+    #[test]
+    fn create_note_normalizes_tags_silently() {
+        let (_tmp, store) = test_store();
+        let note = store
+            .create_note("T", "C", &["Recipes/Italian".into(), "PERSON".into()])
+            .unwrap();
+        assert_eq!(note.tags, vec!["recipes/italian", "person"]);
+    }
+
+    #[test]
+    fn create_note_rejects_invalid_tag() {
+        let (_tmp, store) = test_store();
+        let err = store
+            .create_note("T", "C", &["bad tag".into()])
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidTag(_)));
+    }
+
+    #[test]
+    fn list_notes_prefix_match() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Carbonara", "X", &["recipes/italian/carbonara".into()])
+            .unwrap();
+        store
+            .create_note("Ratatouille", "X", &["recipes/french/ratatouille".into()])
+            .unwrap();
+        store
+            .create_note("Recipes index", "X", &["recipes".into()])
+            .unwrap();
+        store
+            .create_note("Unrelated", "X", &["recipe".into()])
+            .unwrap();
+
+        // `recipes` matches itself, italian/*, french/*. NOT `recipe` (different word).
+        let hits = store.list_notes(Some("recipes")).unwrap();
+        let titles: std::collections::HashSet<&str> =
+            hits.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(hits.len(), 3);
+        assert!(titles.contains("Carbonara"));
+        assert!(titles.contains("Ratatouille"));
+        assert!(titles.contains("Recipes index"));
+        assert!(!titles.contains("Unrelated"));
+
+        // Drilling down narrows the result.
+        let italian = store.list_notes(Some("recipes/italian")).unwrap();
+        assert_eq!(italian.len(), 1);
+        assert_eq!(italian[0].title, "Carbonara");
+
+        // Tag filter is normalized too — uppercase input still works.
+        let hits = store.list_notes(Some("Recipes")).unwrap();
+        let titles: std::collections::HashSet<&str> =
+            hits.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(hits.len(), 3);
+        assert!(titles.contains("Carbonara"));
+        assert!(!titles.contains("Unrelated"));
+    }
+
+    #[test]
+    fn list_notes_prefix_distinct_collapses_multi_tag_match() {
+        // A note tagged with BOTH a parent and child of the filter must
+        // appear exactly once, not twice. The `SELECT DISTINCT` in the
+        // production query is the only thing keeping this honest.
+        let (_tmp, store) = test_store();
+        store
+            .create_note(
+                "Recipe with redundant tags",
+                "X",
+                &["recipes".into(), "recipes/italian".into()],
+            )
+            .unwrap();
+        store
+            .create_note("Other italian", "X", &["recipes/italian".into()])
+            .unwrap();
+
+        let hits = store.list_notes(Some("recipes")).unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "expected DISTINCT to dedupe the multi-tag note"
+        );
+    }
+
+    #[test]
+    fn list_notes_prefix_does_not_treat_underscore_as_wildcard() {
+        // Regression: underscores are allowed in tag segments AND are LIKE
+        // wildcards. The query must use GLOB (or escaped LIKE) so that
+        // `foo_bar` matches only `foo_bar/...`, not `fooXbar/...`.
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Real", "X", &["foo_bar/child".into()])
+            .unwrap();
+        store
+            .create_note("Wildcard impostor", "X", &["fooxbar/child".into()])
+            .unwrap();
+
+        let hits = store.list_notes(Some("foo_bar")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Real");
+    }
+
+    #[test]
+    fn list_notes_propagates_invalid_tag_filter() {
+        let (_tmp, store) = test_store();
+        let err = store.list_notes(Some("bad tag")).unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidTag(_)));
+    }
+
+    #[test]
+    fn create_note_deduplicates_normalized_tags() {
+        let (_tmp, store) = test_store();
+        // Both inputs normalize to "recipes/italian" — the returned Note
+        // must reflect what's actually in the DB (one row), not what was passed in.
+        let note = store
+            .create_note(
+                "T",
+                "C",
+                &["Recipes/Italian".into(), "recipes/italian".into()],
+            )
+            .unwrap();
+        assert_eq!(note.tags, vec!["recipes/italian"]);
+
+        let read = store.read_note(&note.id).unwrap();
+        assert_eq!(read.tags, note.tags);
+    }
+
+    #[test]
+    fn tag_note_rejects_invalid_tag_and_preserves_existing_tags() {
+        let (_tmp, store) = test_store();
+        let note = store
+            .create_note("T", "C", &["original".into()])
+            .unwrap();
+
+        let err = store
+            .tag_note(&note.id, &["valid".into(), "bad tag".into()])
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidTag(_)));
+
+        // Validation must run BEFORE the DELETE, so the original tags survive.
+        let read = store.read_note(&note.id).unwrap();
+        assert_eq!(read.tags, vec!["original"]);
+    }
+
+    #[test]
+    fn tag_note_rejects_core() {
+        let (_tmp, store) = test_store();
+        let err = store.tag_note("core", &["x".into()]).unwrap_err();
+        assert!(matches!(err, MemoryError::ReservedId));
+    }
+
+    #[test]
+    fn list_notes_prefix_does_not_match_unrelated_word() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Singular", "X", &["recipe".into()])
+            .unwrap();
+        store
+            .create_note("Plural", "X", &["recipes".into()])
+            .unwrap();
+        // `recipe` should NOT match `recipes`.
+        let hits = store.list_notes(Some("recipe")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Singular");
+    }
+
+    #[test]
     fn list_with_tag_filter() {
         let (_tmp, store) = test_store();
         store
@@ -742,23 +1063,26 @@ mod tests {
     /// and can be used as `Arc<dyn Memory>`.
     struct MockMemory {
         notes: std::sync::Mutex<Vec<Note>>,
+        links: std::sync::Mutex<Vec<Link>>,
     }
 
     impl MockMemory {
         fn new() -> Self {
             Self {
                 notes: std::sync::Mutex::new(Vec::new()),
+                links: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
 
     impl Memory for MockMemory {
         fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
+            let normalized = normalize_tags(tags)?;
             let note = Note {
                 id: format!("mock_{}", self.notes.lock().unwrap().len()),
                 title: title.to_string(),
                 content: content.to_string(),
-                tags: tags.to_vec(),
+                tags: normalized,
                 links: Vec::new(),
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -788,6 +1112,9 @@ mod tests {
         }
 
         fn forget_note(&self, id: &str) -> MemoryResult<()> {
+            if id == "core" {
+                return Err(MemoryError::ReservedId);
+            }
             let mut notes = self.notes.lock().unwrap();
             let pos = notes
                 .iter()
@@ -810,35 +1137,78 @@ mod tests {
         fn list_notes(&self, tag_filter: Option<&str>) -> MemoryResult<Vec<Note>> {
             let notes = self.notes.lock().unwrap();
             Ok(match tag_filter {
-                Some(tag) => notes
-                    .iter()
-                    .filter(|n| n.tags.iter().any(|t| t == tag))
-                    .cloned()
-                    .collect(),
+                Some(tag) => {
+                    let needle = normalize_tag(tag)?;
+                    let prefix = format!("{needle}/");
+                    notes
+                        .iter()
+                        .filter(|n| {
+                            n.tags
+                                .iter()
+                                .any(|t| t == &needle || t.starts_with(&prefix))
+                        })
+                        .cloned()
+                        .collect()
+                }
                 None => notes.clone(),
             })
         }
 
         fn link_notes(&self, from_id: &str, to_id: &str, relation: &str) -> MemoryResult<Link> {
-            Ok(Link {
+            if from_id == "core" || to_id == "core" {
+                return Err(MemoryError::ReservedId);
+            }
+            let notes = self.notes.lock().unwrap();
+            if notes.iter().find(|n| n.id == from_id).is_none() {
+                return Err(MemoryError::NotFound(from_id.to_string()));
+            }
+            if notes.iter().find(|n| n.id == to_id).is_none() {
+                return Err(MemoryError::NotFound(to_id.to_string()));
+            }
+            drop(notes);
+            let link = Link {
                 from_id: from_id.to_string(),
                 to_id: to_id.to_string(),
                 relation: relation.to_string(),
                 direction: None,
-            })
+            };
+            self.links.lock().unwrap().push(link.clone());
+            Ok(link)
         }
 
-        fn get_links_for_note(&self, _id: &str) -> MemoryResult<Vec<Link>> {
-            Ok(Vec::new())
+        fn get_links_for_note(&self, id: &str) -> MemoryResult<Vec<Link>> {
+            let links = self.links.lock().unwrap();
+            Ok(links
+                .iter()
+                .filter_map(|l| {
+                    if l.from_id == id {
+                        Some(Link {
+                            direction: Some("outgoing".to_string()),
+                            ..l.clone()
+                        })
+                    } else if l.to_id == id {
+                        Some(Link {
+                            direction: Some("incoming".to_string()),
+                            ..l.clone()
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect())
         }
 
         fn tag_note(&self, id: &str, tags: &[String]) -> MemoryResult<Note> {
+            if id == "core" {
+                return Err(MemoryError::ReservedId);
+            }
+            let normalized = normalize_tags(tags)?;
             let mut notes = self.notes.lock().unwrap();
             let note = notes
                 .iter_mut()
                 .find(|n| n.id == id)
                 .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
-            note.tags = tags.to_vec();
+            note.tags = normalized;
             Ok(note.clone())
         }
 

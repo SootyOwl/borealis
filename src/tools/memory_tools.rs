@@ -58,7 +58,7 @@ impl Tool for MemoryCreate {
                     "tags": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Tags to categorize the note"
+                        "description": "Tags to categorize the note. Tags are slash-delimited nested paths (e.g. `recipes/italian/carbonara`) and must use only `[a-z0-9._-]` per segment. Inputs are silently lowercased; spaces and other characters are rejected. Maximum depth is 8 segments."
                     }
                 },
                 "required": ["title", "content"]
@@ -257,7 +257,7 @@ impl Tool for MemoryLink {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "memory_link".to_string(),
-            description: "Create a bidirectional link between two notes.".to_string(),
+            description: "Create a directional link from one note to another with a named relation. The link can be retrieved from either side via memory_links, but storage is one-way — call twice with from/to swapped if you want a symmetric relationship.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -329,7 +329,7 @@ impl Tool for MemoryTag {
                     "tags": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "New set of tags for the note"
+                        "description": "New set of tags for the note. Tags are slash-delimited nested paths (e.g. `recipes/italian/carbonara`) and must use only `[a-z0-9._-]` per segment. Inputs are silently lowercased; spaces and other characters are rejected. Maximum depth is 8 segments."
                     }
                 },
                 "required": ["id", "tags"]
@@ -345,7 +345,7 @@ impl Tool for MemoryTag {
         };
         let tags = get_string_array(&args, "tags");
         if tags.is_empty() {
-            return error_result(call_id, "missing required field: tags");
+            return error_result(call_id, "tags must be a non-empty array");
         }
 
         let store = self.0.clone();
@@ -464,13 +464,13 @@ impl Tool for MemoryList {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "memory_list".to_string(),
-            description: "List memory notes, optionally filtered by tag.".to_string(),
+            description: "List memory notes, optionally filtered by tag. The tag filter is a PREFIX match over the nested tag hierarchy: filtering by `recipes` returns notes tagged `recipes`, `recipes/italian`, and `recipes/italian/carbonara`. Filtering by `recipes/italian` narrows to that subtree.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "tag": {
                         "type": "string",
-                        "description": "Optional tag to filter by"
+                        "description": "Optional tag prefix to filter by. Slash-delimited nested path; lowercase `[a-z0-9._-]` per segment. Matches the tag itself and all descendants."
                     }
                 }
             }),

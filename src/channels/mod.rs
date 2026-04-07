@@ -386,16 +386,10 @@ mod tests {
 
         // Collect results with a timeout.
         let mut received = 0;
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                out_rx.recv(),
-            )
-            .await
-            {
-                Ok(Some(_)) => received += 1,
-                _ => break,
-            }
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), out_rx.recv()).await
+        {
+            received += 1;
         }
 
         assert_eq!(received, 2, "only 2 of 4 messages should pass rate limit");
@@ -445,16 +439,10 @@ mod tests {
         }
 
         let mut received = 0;
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                out_rx.recv(),
-            )
-            .await
-            {
-                Ok(Some(_)) => received += 1,
-                _ => break,
-            }
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), out_rx.recv()).await
+        {
+            received += 1;
         }
 
         assert_eq!(received, 3, "all scheduler events should bypass rate limit");

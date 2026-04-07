@@ -230,6 +230,26 @@ impl SqliteMemory {
 
              CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);",
         )?;
+
+        // One-time backfill: upgrade legacy second-precision timestamps
+        // (`...:SSZ`) to millisecond format (`...:SS.000Z`).
+        //
+        // Why this matters: the new `now_iso()` produces RFC 3339 with millis,
+        // and lex-sort ordering of mixed-format timestamps would invert
+        // chronologically (because '.' = 0x2E < 'Z' = 0x5A, so legacy timestamps
+        // sort AFTER any millisecond timestamp from the same second). The
+        // backfill normalizes everything to a single comparable format.
+        //
+        // Idempotent: filtered to rows that don't already contain a `.`.
+        conn.execute_batch(
+            "UPDATE notes SET created_at = REPLACE(created_at, 'Z', '.000Z')
+                 WHERE created_at NOT LIKE '%.%';
+             UPDATE notes SET updated_at = REPLACE(updated_at, 'Z', '.000Z')
+                 WHERE updated_at NOT LIKE '%.%';
+             UPDATE notes SET deleted_at = REPLACE(deleted_at, 'Z', '.000Z')
+                 WHERE deleted_at IS NOT NULL AND deleted_at NOT LIKE '%.%';",
+        )?;
+
         Ok(())
     }
 
@@ -250,27 +270,16 @@ impl SqliteMemory {
         }
     }
 
+    /// Current UTC timestamp in RFC 3339 format with millisecond precision
+    /// (e.g. `2026-04-07T18:42:11.123Z`).
+    ///
+    /// Millisecond precision matters for `ORDER BY updated_at` stability:
+    /// the previous second-resolution format made bulk-creates indistinguishable
+    /// and forced a secondary sort by id everywhere. Format is also chosen to
+    /// lex-sort identically to chronological order, so SQLite's text comparison
+    /// gives correct ordering without any custom collation.
     fn now_iso() -> String {
-        // Simple UTC timestamp without chrono dependency
-        let duration = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before epoch");
-        let secs = duration.as_secs();
-        // Convert to rough ISO 8601 — good enough for ordering and display.
-        // For production, swap to chrono or time crate.
-        let days_since_epoch = secs / 86400;
-        let time_of_day = secs % 86400;
-        let hours = time_of_day / 3600;
-        let minutes = (time_of_day % 3600) / 60;
-        let seconds = time_of_day % 60;
-
-        // Calculate year/month/day from days since epoch (1970-01-01)
-        let (year, month, day) = days_to_ymd(days_since_epoch);
-
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            year, month, day, hours, minutes, seconds
-        )
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 
     fn read_core(&self) -> MemoryResult<Note> {
@@ -795,22 +804,6 @@ impl Memory for SqliteMemory {
 
         Ok(counts)
     }
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from Howard Hinnant's civil_from_days
-    let z = days as i64 + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as u64, m, d)
 }
 
 #[cfg(test)]
@@ -1650,6 +1643,83 @@ mod tests {
             .list_notes_paginated(Some("bad tag"), false, 20, 0)
             .unwrap_err();
         assert!(matches!(err, MemoryError::InvalidTag(_)));
+    }
+
+    #[test]
+    fn now_iso_has_millisecond_precision() {
+        // Format: `YYYY-MM-DDTHH:MM:SS.mmmZ` — exactly 24 chars, with `.` at
+        // position 19. This is what we need for stable lex-sort ordering
+        // across the millisecond boundary.
+        let ts = SqliteMemory::now_iso();
+        assert_eq!(ts.len(), 24, "expected 24-char RFC3339 millis: {ts}");
+        assert_eq!(&ts[19..20], ".", "expected `.` at position 19: {ts}");
+        assert!(ts.ends_with('Z'), "expected trailing Z: {ts}");
+    }
+
+    #[test]
+    fn legacy_second_precision_timestamps_are_backfilled_on_open() {
+        // Simulate a legacy database with second-precision timestamps and
+        // verify init_schema upgrades them to millisecond format on the next
+        // open. The backfill is critical because lex-sort of mixed formats
+        // is inconsistent (`.` < `Z`).
+        let conn = Connection::open_in_memory().unwrap();
+        // Manually create the legacy schema and insert a row with the old format.
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT
+            );
+            CREATE TABLE tags (
+                note_id TEXT NOT NULL REFERENCES notes(id),
+                tag TEXT NOT NULL,
+                PRIMARY KEY (note_id, tag)
+            );
+            CREATE TABLE links (
+                from_id TEXT NOT NULL REFERENCES notes(id),
+                to_id TEXT NOT NULL REFERENCES notes(id),
+                relation TEXT NOT NULL,
+                PRIMARY KEY (from_id, to_id)
+            );
+            INSERT INTO notes (id, title, content, created_at, updated_at, deleted_at)
+            VALUES ('legacy_1', 'Old', 'X', '2025-01-15T12:00:00Z', '2025-01-15T12:00:00Z', NULL),
+                   ('legacy_2', 'Deleted', 'X', '2025-01-15T12:00:00Z', '2025-01-15T12:00:01Z', '2025-01-15T12:00:02Z');",
+        )
+        .unwrap();
+
+        // Now open via SqliteMemory, which runs init_schema and should backfill.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "# core").unwrap();
+        let store = SqliteMemory::new(
+            Arc::new(Mutex::new(conn)),
+            tmp.path().to_path_buf(),
+        )
+        .unwrap();
+
+        let conn = store.lock_conn().unwrap();
+        let (created, updated, deleted): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT created_at, updated_at, deleted_at FROM notes WHERE id = 'legacy_2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(created, "2025-01-15T12:00:00.000Z");
+        assert_eq!(updated, "2025-01-15T12:00:01.000Z");
+        assert_eq!(deleted, Some("2025-01-15T12:00:02.000Z".to_string()));
+
+        // The non-deleted row's deleted_at must remain NULL.
+        let null_deleted: Option<String> = conn
+            .query_row(
+                "SELECT deleted_at FROM notes WHERE id = 'legacy_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_deleted, None);
     }
 
     #[test]

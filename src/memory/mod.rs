@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::Settings;
 
-pub use store::{Link, Memory, MemoryError, MemoryResult, Note, SqliteMemory};
+pub use store::{Link, Memory, MemoryError, MemoryResult, Note, NoteSummary, PaginatedNotes, SqliteMemory, TagCount};
 pub(crate) use store::normalize_tag;
 
 // ---------------------------------------------------------------------------

@@ -104,6 +104,29 @@ fn normalize_tags(tags: &[String]) -> MemoryResult<Vec<String>> {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NoteSummary {
+    pub id: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TagCount {
+    pub tag: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PaginatedNotes {
+    pub notes: Vec<NoteSummary>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Note {
     pub id: String,
     pub title: String,
@@ -140,6 +163,14 @@ pub trait Memory: Send + Sync {
     fn get_links_for_note(&self, id: &str) -> MemoryResult<Vec<Link>>;
     fn tag_note(&self, id: &str, tags: &[String]) -> MemoryResult<Note>;
     fn load_core_persona(&self) -> MemoryResult<String>;
+    fn list_notes_paginated(
+        &self,
+        tag_filter: Option<&str>,
+        tag_exact: bool,
+        limit: usize,
+        offset: usize,
+    ) -> MemoryResult<PaginatedNotes>;
+    fn list_tags(&self, prefix: Option<&str>) -> MemoryResult<Vec<TagCount>>;
 }
 
 /// SQLite-backed memory store for notes, tags, and links.
@@ -601,6 +632,168 @@ impl Memory for SqliteMemory {
 
     fn load_core_persona(&self) -> MemoryResult<String> {
         std::fs::read_to_string(&self.core_md_path).map_err(MemoryError::Io)
+    }
+
+    fn list_notes_paginated(
+        &self,
+        tag_filter: Option<&str>,
+        tag_exact: bool,
+        limit: usize,
+        offset: usize,
+    ) -> MemoryResult<PaginatedNotes> {
+        let conn = self.lock_conn()?;
+
+        // Normalize the tag filter if provided.
+        let normalized = match tag_filter {
+            Some(tag) => Some(normalize_tag(tag)?),
+            None => None,
+        };
+
+        // --- COUNT query ---
+        let total: usize = match &normalized {
+            None => {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? as usize
+            }
+            Some(tag) if tag_exact => {
+                conn.query_row(
+                    "SELECT COUNT(DISTINCT n.id)
+                     FROM notes n
+                     JOIN tags t ON n.id = t.note_id
+                     WHERE n.deleted_at IS NULL
+                       AND t.tag = ?1",
+                    params![tag],
+                    |row| row.get::<_, i64>(0),
+                )? as usize
+            }
+            Some(tag) => {
+                conn.query_row(
+                    "SELECT COUNT(DISTINCT n.id)
+                     FROM notes n
+                     JOIN tags t ON n.id = t.note_id
+                     WHERE n.deleted_at IS NULL
+                       AND (t.tag = ?1 OR t.tag GLOB ?1 || '/*')",
+                    params![tag],
+                    |row| row.get::<_, i64>(0),
+                )? as usize
+            }
+        };
+
+        // --- PAGE query ---
+        let summaries: Vec<NoteSummary> = if limit == 0 {
+            Vec::new()
+        } else {
+            match &normalized {
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, title, created_at, updated_at
+                         FROM notes
+                         WHERE deleted_at IS NULL
+                         ORDER BY updated_at DESC, id ASC
+                         LIMIT ?1 OFFSET ?2",
+                    )?;
+                    stmt.query_map(params![limit as i64, offset as i64], |row| {
+                        Ok(NoteSummary {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            tags: Vec::new(),
+                            created_at: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+                }
+                Some(tag) if tag_exact => {
+                    let mut stmt = conn.prepare(
+                        "SELECT DISTINCT n.id, n.title, n.created_at, n.updated_at
+                         FROM notes n
+                         JOIN tags t ON n.id = t.note_id
+                         WHERE n.deleted_at IS NULL
+                           AND t.tag = ?1
+                         ORDER BY n.updated_at DESC, n.id ASC
+                         LIMIT ?2 OFFSET ?3",
+                    )?;
+                    stmt.query_map(params![tag, limit as i64, offset as i64], |row| {
+                        Ok(NoteSummary {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            tags: Vec::new(),
+                            created_at: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+                }
+                Some(tag) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT DISTINCT n.id, n.title, n.created_at, n.updated_at
+                         FROM notes n
+                         JOIN tags t ON n.id = t.note_id
+                         WHERE n.deleted_at IS NULL
+                           AND (t.tag = ?1 OR t.tag GLOB ?1 || '/*')
+                         ORDER BY n.updated_at DESC, n.id ASC
+                         LIMIT ?2 OFFSET ?3",
+                    )?;
+                    stmt.query_map(params![tag, limit as i64, offset as i64], |row| {
+                        Ok(NoteSummary {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            tags: Vec::new(),
+                            created_at: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+                }
+            }
+        };
+
+        // Populate tags for each summary.
+        let mut notes = Vec::with_capacity(summaries.len());
+        for s in summaries {
+            let tags = self.get_tags_for_note_locked(&conn, &s.id)?;
+            notes.push(NoteSummary { tags, ..s });
+        }
+
+        Ok(PaginatedNotes {
+            notes,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    fn list_tags(&self, prefix: Option<&str>) -> MemoryResult<Vec<TagCount>> {
+        let conn = self.lock_conn()?;
+
+        let normalized: Option<String> = match prefix {
+            Some(p) => Some(normalize_tag(p)?),
+            None => None,
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT t.tag, COUNT(*) AS cnt
+             FROM tags t
+             JOIN notes n ON t.note_id = n.id
+             WHERE n.deleted_at IS NULL
+               AND (?1 IS NULL OR t.tag = ?1 OR t.tag GLOB ?1 || '/*')
+             GROUP BY t.tag
+             ORDER BY cnt DESC, t.tag ASC",
+        )?;
+
+        let counts = stmt
+            .query_map(params![normalized], |row| {
+                Ok(TagCount {
+                    tag: row.get(0)?,
+                    count: row.get::<_, i64>(1)? as usize,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(counts)
     }
 }
 
@@ -1215,6 +1408,467 @@ mod tests {
         fn load_core_persona(&self) -> MemoryResult<String> {
             Ok("Mock persona".to_string())
         }
+
+        fn list_notes_paginated(
+            &self,
+            tag_filter: Option<&str>,
+            tag_exact: bool,
+            limit: usize,
+            offset: usize,
+        ) -> MemoryResult<PaginatedNotes> {
+            let notes = self.notes.lock().unwrap();
+
+            let normalized = match tag_filter {
+                Some(tag) => Some(normalize_tag(tag)?),
+                None => None,
+            };
+
+            let mut filtered: Vec<&Note> = notes
+                .iter()
+                .filter(|n| match &normalized {
+                    None => true,
+                    Some(tag) if tag_exact => n.tags.iter().any(|t| t == tag),
+                    Some(tag) => {
+                        let prefix = format!("{tag}/");
+                        n.tags.iter().any(|t| t == tag || t.starts_with(&prefix))
+                    }
+                })
+                .collect();
+
+            // Stable sort: updated_at DESC, id ASC — mirrors the SQLite ORDER BY.
+            filtered.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then(a.id.cmp(&b.id))
+            });
+
+            let total = filtered.len();
+
+            let page: Vec<NoteSummary> = if limit == 0 {
+                Vec::new()
+            } else {
+                filtered
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|n| NoteSummary {
+                        id: n.id.clone(),
+                        title: n.title.clone(),
+                        tags: n.tags.clone(),
+                        created_at: n.created_at.clone(),
+                        updated_at: n.updated_at.clone(),
+                    })
+                    .collect()
+            };
+
+            Ok(PaginatedNotes {
+                notes: page,
+                total,
+                offset,
+                limit,
+            })
+        }
+
+        fn list_tags(&self, prefix: Option<&str>) -> MemoryResult<Vec<TagCount>> {
+            let notes = self.notes.lock().unwrap();
+
+            let normalized: Option<String> = match prefix {
+                Some(p) => Some(normalize_tag(p)?),
+                None => None,
+            };
+
+            let mut counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+
+            for note in notes.iter() {
+                for tag in &note.tags {
+                    let include = match &normalized {
+                        None => true,
+                        Some(pfx) => {
+                            let child_prefix = format!("{pfx}/");
+                            tag == pfx || tag.starts_with(&child_prefix)
+                        }
+                    };
+                    if include {
+                        *counts.entry(tag.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            let mut result: Vec<TagCount> = counts
+                .into_iter()
+                .map(|(tag, count)| TagCount { tag, count })
+                .collect();
+
+            // Sort: count desc, tag asc (for deterministic tie-breaking).
+            result.sort_by(|a, b| b.count.cmp(&a.count).then(a.tag.cmp(&b.tag)));
+
+            Ok(result)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pagination tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_notes_paginated_returns_summary_projection() {
+        let (_tmp, store) = test_store();
+        let note = store
+            .create_note("My Title", "My content", &["cooking".into()])
+            .unwrap();
+
+        let page = store
+            .list_notes_paginated(None, false, 20, 0)
+            .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.notes.len(), 1);
+        assert_eq!(page.offset, 0, "envelope offset should echo the request");
+        assert_eq!(page.limit, 20, "envelope limit should echo the request");
+        let s = &page.notes[0];
+        assert_eq!(s.id, note.id);
+        assert_eq!(s.title, "My Title");
+        assert_eq!(s.tags, vec!["cooking"]);
+        assert!(!s.created_at.is_empty());
+        assert!(!s.updated_at.is_empty());
+    }
+
+    #[test]
+    fn list_notes_paginated_respects_offset_and_limit() {
+        let (_tmp, store) = test_store();
+        for i in 0..5 {
+            // Sleep 1ms to ensure distinct updated_at ordering on systems
+            // where the clock resolution is coarser than per-note creates.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            store
+                .create_note(&format!("Note {i}"), "Content", &[])
+                .unwrap();
+        }
+
+        let p0 = store.list_notes_paginated(None, false, 2, 0).unwrap();
+        assert_eq!(p0.total, 5);
+        assert_eq!(p0.notes.len(), 2);
+        assert_eq!(p0.offset, 0);
+        assert_eq!(p0.limit, 2);
+
+        let p1 = store.list_notes_paginated(None, false, 2, 2).unwrap();
+        assert_eq!(p1.total, 5);
+        assert_eq!(p1.notes.len(), 2);
+        assert_eq!(p1.offset, 2);
+        assert_eq!(p1.limit, 2);
+
+        let p2 = store.list_notes_paginated(None, false, 2, 4).unwrap();
+        assert_eq!(p2.total, 5);
+        assert_eq!(p2.notes.len(), 1);
+        assert_eq!(p2.offset, 4);
+        assert_eq!(p2.limit, 2);
+
+        // No overlap between pages.
+        let ids_p0: std::collections::HashSet<&str> = p0.notes.iter().map(|n| n.id.as_str()).collect();
+        let ids_p1: std::collections::HashSet<&str> = p1.notes.iter().map(|n| n.id.as_str()).collect();
+        let ids_p2: std::collections::HashSet<&str> = p2.notes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids_p0.is_disjoint(&ids_p1));
+        assert!(ids_p0.is_disjoint(&ids_p2));
+        assert!(ids_p1.is_disjoint(&ids_p2));
+    }
+
+    #[test]
+    fn list_notes_paginated_offset_beyond_total_returns_empty() {
+        let (_tmp, store) = test_store();
+        for i in 0..5 {
+            store.create_note(&format!("N{i}"), "C", &[]).unwrap();
+        }
+
+        let page = store.list_notes_paginated(None, false, 20, 10).unwrap();
+        assert_eq!(page.total, 5);
+        assert!(page.notes.is_empty());
+    }
+
+    #[test]
+    fn list_notes_paginated_limit_zero() {
+        let (_tmp, store) = test_store();
+        store.create_note("N", "C", &[]).unwrap();
+
+        let page = store.list_notes_paginated(None, false, 0, 0).unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.notes.is_empty());
+        assert_eq!(page.limit, 0);
+    }
+
+    #[test]
+    fn list_notes_paginated_with_prefix_filter() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("Carbonara", "X", &["recipes/italian/carbonara".into()])
+            .unwrap();
+        store
+            .create_note("Ratatouille", "X", &["recipes/french".into()])
+            .unwrap();
+        store
+            .create_note("Unrelated", "X", &["recipe".into()])
+            .unwrap();
+
+        // Prefix match — "recipes" matches italian and french subtrees but not "recipe".
+        let page = store
+            .list_notes_paginated(Some("recipes"), false, 20, 0)
+            .unwrap();
+        assert_eq!(page.total, 2);
+
+        // Exact match — only notes tagged exactly "recipes/italian/carbonara".
+        let exact = store
+            .list_notes_paginated(Some("recipes/italian/carbonara"), true, 20, 0)
+            .unwrap();
+        assert_eq!(exact.total, 1);
+        assert_eq!(exact.notes[0].title, "Carbonara");
+
+        // Exact match on parent should not pull in children.
+        let exact_recipes = store
+            .list_notes_paginated(Some("recipes"), true, 20, 0)
+            .unwrap();
+        assert_eq!(exact_recipes.total, 0);
+    }
+
+    #[test]
+    fn list_notes_paginated_total_excludes_soft_deleted() {
+        let (_tmp, store) = test_store();
+        let n1 = store.create_note("Keep", "C", &[]).unwrap();
+        let n2 = store.create_note("Delete", "C", &[]).unwrap();
+        store.forget_note(&n2.id).unwrap();
+        let _ = n1;
+
+        let page = store.list_notes_paginated(None, false, 20, 0).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.notes.len(), 1);
+        assert_eq!(page.notes[0].title, "Keep");
+    }
+
+    #[test]
+    fn list_notes_paginated_propagates_invalid_tag_filter() {
+        let (_tmp, store) = test_store();
+        let err = store
+            .list_notes_paginated(Some("bad tag"), false, 20, 0)
+            .unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidTag(_)));
+    }
+
+    #[test]
+    fn list_notes_paginated_deterministic_order_when_timestamps_tie() {
+        // The tiebreaker `ORDER BY id ASC` is load-bearing because `now_iso()` is
+        // second-resolution: notes created in the same second tie on `updated_at`.
+        // Without the tiebreaker, the ordering is unspecified and rows can appear
+        // on multiple pages or be skipped between LIMIT/OFFSET calls.
+        //
+        // Force the tie deterministically (don't rely on wall-clock granularity)
+        // by overwriting all four notes' `updated_at` to the same exact value.
+        let (_tmp, store) = test_store();
+        for i in 0..4 {
+            store
+                .create_note(&format!("Tie{i}"), "Content", &[])
+                .unwrap();
+        }
+        {
+            let conn = store.lock_conn().unwrap();
+            conn.execute(
+                "UPDATE notes SET updated_at = '2026-04-07T12:00:00Z' WHERE deleted_at IS NULL",
+                [],
+            )
+            .unwrap();
+        }
+
+        let p0 = store.list_notes_paginated(None, false, 2, 0).unwrap();
+        assert_eq!(p0.total, 4);
+        assert_eq!(p0.notes.len(), 2);
+
+        let p1 = store.list_notes_paginated(None, false, 2, 2).unwrap();
+        assert_eq!(p1.total, 4);
+        assert_eq!(p1.notes.len(), 2);
+
+        // Collect all IDs across both pages and verify no duplicates, no gaps.
+        let mut all_ids: Vec<String> = p0
+            .notes
+            .iter()
+            .chain(p1.notes.iter())
+            .map(|n| n.id.clone())
+            .collect();
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), 4, "expected 4 distinct IDs across both pages");
+
+        // Calling the same pages again must return the same content — proves the
+        // ordering is stable, not just non-overlapping by accident.
+        let p0_again = store.list_notes_paginated(None, false, 2, 0).unwrap();
+        let p1_again = store.list_notes_paginated(None, false, 2, 2).unwrap();
+        let p0_ids: Vec<&str> = p0.notes.iter().map(|n| n.id.as_str()).collect();
+        let p0_again_ids: Vec<&str> =
+            p0_again.notes.iter().map(|n| n.id.as_str()).collect();
+        let p1_ids: Vec<&str> = p1.notes.iter().map(|n| n.id.as_str()).collect();
+        let p1_again_ids: Vec<&str> =
+            p1_again.notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(p0_ids, p0_again_ids);
+        assert_eq!(p1_ids, p1_again_ids);
+    }
+
+    // -----------------------------------------------------------------------
+    // list_tags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_tags_returns_counts_sorted_by_count_desc() {
+        let (_tmp, store) = test_store();
+        // "common" appears 3 times, "rare" 1 time, "also-rare" 1 time.
+        for _ in 0..3 {
+            store
+                .create_note("N", "C", &["common".into()])
+                .unwrap();
+        }
+        store.create_note("N", "C", &["rare".into()]).unwrap();
+        store.create_note("N", "C", &["also-rare".into()]).unwrap();
+
+        let tags = store.list_tags(None).unwrap();
+        assert_eq!(tags[0].tag, "common");
+        assert_eq!(tags[0].count, 3);
+        // Ties broken alphabetically: "also-rare" < "rare".
+        assert_eq!(tags[1].tag, "also-rare");
+        assert_eq!(tags[1].count, 1);
+        assert_eq!(tags[2].tag, "rare");
+        assert_eq!(tags[2].count, 1);
+    }
+
+    #[test]
+    fn list_tags_excludes_soft_deleted() {
+        let (_tmp, store) = test_store();
+        let n = store
+            .create_note("N", "C", &["mytag".into()])
+            .unwrap();
+        store.forget_note(&n.id).unwrap();
+
+        let tags = store.list_tags(None).unwrap();
+        assert!(tags.iter().all(|t| t.tag != "mytag"));
+    }
+
+    #[test]
+    fn list_tags_with_prefix() {
+        let (_tmp, store) = test_store();
+        store
+            .create_note("A", "C", &["recipe".into()])
+            .unwrap();
+        store
+            .create_note("B", "C", &["recipes".into()])
+            .unwrap();
+        store
+            .create_note("C", "C", &["recipes/italian".into()])
+            .unwrap();
+
+        let tags = store.list_tags(Some("recipes")).unwrap();
+        let tag_names: Vec<&str> = tags.iter().map(|t| t.tag.as_str()).collect();
+        // "recipe" must NOT appear — `recipes` prefix does not match `recipe`.
+        assert!(!tag_names.contains(&"recipe"));
+        assert!(tag_names.contains(&"recipes"));
+        assert!(tag_names.contains(&"recipes/italian"));
+
+        // Explicit count assertions for each expected tag.
+        let recipes_tc = tags.iter().find(|t| t.tag == "recipes").unwrap();
+        assert_eq!(recipes_tc.count, 1, "recipes should have count 1");
+        let italian_tc = tags.iter().find(|t| t.tag == "recipes/italian").unwrap();
+        assert_eq!(italian_tc.count, 1, "recipes/italian should have count 1");
+    }
+
+    #[test]
+    fn list_tags_propagates_invalid_prefix() {
+        let (_tmp, store) = test_store();
+        let err = store.list_tags(Some("bad tag")).unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidTag(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // MockMemory new-method test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mock_memory_paginated_and_tags_via_arc_dyn() {
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory::new());
+
+        memory
+            .create_note("A", "Ca", &["food/italian".into()])
+            .unwrap();
+        memory
+            .create_note("B", "Cb", &["food/french".into()])
+            .unwrap();
+        memory
+            .create_note("C", "Cc", &["food/italian".into()])
+            .unwrap();
+
+        // Pagination — all notes, page 0.
+        let page = memory
+            .list_notes_paginated(None, false, 10, 0)
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.notes.len(), 3);
+
+        // Pagination — limit 1.
+        let p1 = memory
+            .list_notes_paginated(None, false, 1, 0)
+            .unwrap();
+        assert_eq!(p1.total, 3);
+        assert_eq!(p1.notes.len(), 1);
+
+        // Pagination — offset 1 skips first note and forwards offset via dyn dispatch.
+        let p_offset = memory
+            .list_notes_paginated(None, false, 10, 1)
+            .unwrap();
+        assert_eq!(p_offset.total, 3);
+        assert_eq!(p_offset.notes.len(), 2, "offset=1 should return 2 of 3 notes");
+        // The first note (mock_0) must not appear on this page.
+        assert!(
+            !p_offset.notes.iter().any(|n| n.id == "mock_0"),
+            "offset=1 should skip mock_0"
+        );
+
+        // Prefix filter: "food" matches all three.
+        let pfood = memory
+            .list_notes_paginated(Some("food"), false, 10, 0)
+            .unwrap();
+        assert_eq!(pfood.total, 3);
+
+        // Prefix filter: "food/italian" matches 2.
+        let pita = memory
+            .list_notes_paginated(Some("food/italian"), false, 10, 0)
+            .unwrap();
+        assert_eq!(pita.total, 2);
+
+        // Exact filter: "food/italian" matches 2.
+        let exact = memory
+            .list_notes_paginated(Some("food/italian"), true, 10, 0)
+            .unwrap();
+        assert_eq!(exact.total, 2);
+
+        // Exact filter on parent: "food" must NOT pull in child-only tagged notes.
+        // None of the seeded notes carries an exact "food" tag, so total must be 0.
+        let exact_parent = memory
+            .list_notes_paginated(Some("food"), true, 10, 0)
+            .unwrap();
+        assert_eq!(
+            exact_parent.total, 0,
+            "exact `food` must not match notes tagged only `food/italian` or `food/french`"
+        );
+        assert!(exact_parent.notes.is_empty());
+
+        // list_tags — no prefix.
+        let tags = memory.list_tags(None).unwrap();
+        // "food/italian" has count 2, "food/french" has count 1.
+        assert_eq!(tags[0].tag, "food/italian");
+        assert_eq!(tags[0].count, 2);
+        assert_eq!(tags[1].tag, "food/french");
+        assert_eq!(tags[1].count, 1);
+
+        // list_tags — with prefix.
+        let food_tags = memory.list_tags(Some("food")).unwrap();
+        assert_eq!(food_tags.len(), 2);
+
+        // Invalid prefix.
+        let err = memory.list_tags(Some("bad!tag")).unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidTag(_)));
     }
 
     #[test]

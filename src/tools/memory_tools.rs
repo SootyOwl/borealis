@@ -6,6 +6,9 @@ use crate::tools::{
     error_result, get_str, get_string_array, ok_result,
 };
 
+/// Maximum number of notes returned per `memory_list` page.
+const MEMORY_LIST_MAX_LIMIT: usize = 100;
+
 fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
     register_memory_tools(registry, Arc::clone(&deps.memory_store));
 }
@@ -17,7 +20,7 @@ inventory::submit! {
     }
 }
 
-/// Register all 9 memory tools into the given registry.
+/// Register all 10 memory tools into the given registry.
 pub fn register_memory_tools(registry: &mut ToolRegistry, store: Arc<dyn Memory>) {
     registry.register_with_group(MemoryCreate(Arc::clone(&store)), ToolGroup::Memory);
     registry.register_with_group(MemorySearch(Arc::clone(&store)), ToolGroup::Memory);
@@ -27,7 +30,8 @@ pub fn register_memory_tools(registry: &mut ToolRegistry, store: Arc<dyn Memory>
     registry.register_with_group(MemoryTag(Arc::clone(&store)), ToolGroup::Memory);
     registry.register_with_group(MemoryForget(Arc::clone(&store)), ToolGroup::Memory);
     registry.register_with_group(MemoryLinks(Arc::clone(&store)), ToolGroup::Memory);
-    registry.register_with_group(MemoryList(store), ToolGroup::Memory);
+    registry.register_with_group(MemoryList(Arc::clone(&store)), ToolGroup::Memory);
+    registry.register_with_group(MemoryTags(store), ToolGroup::Memory);
 }
 
 // --- memory_create ---
@@ -464,13 +468,28 @@ impl Tool for MemoryList {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "memory_list".to_string(),
-            description: "List memory notes, optionally filtered by tag. The tag filter is a PREFIX match over the nested tag hierarchy: filtering by `recipes` returns notes tagged `recipes`, `recipes/italian`, and `recipes/italian/carbonara`. Filtering by `recipes/italian` narrows to that subtree.".to_string(),
+            description: "List memory notes as paginated summaries (no content). Use `memory_read(id)` to fetch the full content of a specific note. The `tag` filter is a PREFIX match by default: `recipes` matches `recipes`, `recipes/italian`, and `recipes/italian/carbonara`. Set `tag_exact: true` to match only the exact tag with no descendants.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "tag": {
                         "type": "string",
-                        "description": "Optional tag prefix to filter by. Slash-delimited nested path; lowercase `[a-z0-9._-]` per segment. Matches the tag itself and all descendants."
+                        "description": "Optional tag filter. Prefix-match by default (matches the tag and all descendants). Slash-delimited nested path; lowercase `[a-z0-9._-]` per segment."
+                    },
+                    "tag_exact": {
+                        "type": "boolean",
+                        "description": "If true, `tag` must match exactly — no prefix expansion. Default: false."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Maximum number of notes per page. Default: 20. Values above 100 are clamped silently to 100."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Number of notes to skip (for pagination). Default: 0. Large offsets simply return empty pages."
                     }
                 }
             }),
@@ -480,10 +499,62 @@ impl Tool for MemoryList {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let call_id = &ctx.call_id;
         let tag = get_str(&args, "tag").map(String::from);
+        let tag_exact = args.get("tag_exact").and_then(|v| v.as_bool()).unwrap_or(false);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(MEMORY_LIST_MAX_LIMIT as u64) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
         let store = self.0.clone();
-        match tokio::task::spawn_blocking(move || store.list_notes(tag.as_deref())).await {
-            Ok(Ok(notes)) => ok_result(call_id, match serde_json::to_value(&notes) {
+        match tokio::task::spawn_blocking(move || {
+            store.list_notes_paginated(tag.as_deref(), tag_exact, limit, offset)
+        })
+        .await
+        {
+            Ok(Ok(paginated)) => ok_result(call_id, match serde_json::to_value(&paginated) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
+                }),
+            Ok(Err(e)) => error_result(call_id, &e.to_string()),
+            Err(e) => error_result(call_id, &format!("task join error: {e}")),
+        }
+    }
+}
+
+// --- memory_tags ---
+
+struct MemoryTags(Arc<dyn Memory>);
+
+impl Tool for MemoryTags {
+    fn name(&self) -> &str {
+        "memory_tags"
+    }
+
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "memory_tags".to_string(),
+            description: "List all distinct tags with usage counts. Optionally filter to a tag namespace by passing `prefix`. Counts are per-distinct-tag with no rollup — sum them yourself if you want a namespace total.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prefix": {
+                        "type": "string",
+                        "description": "Optional tag prefix. Returns only tags equal to `prefix` or starting with `prefix/`. Lowercase `[a-z0-9._-]` per segment, slash-delimited."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let call_id = &ctx.call_id;
+        let prefix = get_str(&args, "prefix").map(String::from);
+
+        let store = self.0.clone();
+        match tokio::task::spawn_blocking(move || store.list_tags(prefix.as_deref())).await {
+            Ok(Ok(tags)) => ok_result(call_id, match serde_json::to_value(&tags) {
                     Ok(v) => v,
                     Err(e) => return error_result(call_id, &format!("serialization error: {e}")),
                 }),

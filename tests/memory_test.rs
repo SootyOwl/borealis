@@ -351,8 +351,10 @@ async fn ac8_list_with_tag_filter() {
         )
         .await;
     assert!(!result.is_error);
-    let notes = result.content.as_array().unwrap();
+    // memory_list now returns a PaginatedNotes envelope.
+    let notes = result.content["notes"].as_array().unwrap();
     assert_eq!(notes.len(), 2);
+    assert_eq!(result.content["total"].as_u64().unwrap(), 2);
 
     // List all
     let result = registry
@@ -365,7 +367,8 @@ async fn ac8_list_with_tag_filter() {
             &ctx,
         )
         .await;
-    assert_eq!(result.content.as_array().unwrap().len(), 3);
+    assert_eq!(result.content["notes"].as_array().unwrap().len(), 3);
+    assert_eq!(result.content["total"].as_u64().unwrap(), 3);
 }
 
 /// AC-9: Core persona from memory/core.md is accessible and modifiable
@@ -425,12 +428,12 @@ async fn ac9_core_persona() {
     assert!(persona.contains("Updated persona"));
 }
 
-/// All 8 tools are registered
+/// All 10 tools are registered
 #[tokio::test]
 async fn all_tools_registered() {
     let (_store, registry) = setup();
 
-    assert_eq!(registry.tool_count(), 9);
+    assert_eq!(registry.tool_count(), 10);
     for name in [
         "memory_create",
         "memory_search",
@@ -441,12 +444,13 @@ async fn all_tools_registered() {
         "memory_tag",
         "memory_forget",
         "memory_list",
+        "memory_tags",
     ] {
         assert!(registry.has_tool(name), "missing tool: {name}");
     }
 
     let defs = registry.definitions();
-    assert_eq!(defs.len(), 9);
+    assert_eq!(defs.len(), 10);
     for def in &defs {
         assert!(!def.description.is_empty());
         assert!(def.parameters.is_object());
@@ -496,4 +500,317 @@ async fn tag_tool_replaces() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     assert_eq!(tags, vec!["new_tag_1", "new_tag_2"]);
+}
+
+/// Fix B — memory_list clamps limit to MEMORY_LIST_MAX_LIMIT (100) silently.
+#[tokio::test]
+async fn memory_list_caps_limit_at_max() {
+    let (_store, registry) = setup();
+    let ctx = test_ctx();
+
+    // Seed one note so the response is non-trivial.
+    registry
+        .execute(
+            &ToolCall {
+                id: "c1".into(),
+                name: "memory_create".into(),
+                arguments: serde_json::json!({
+                    "title": "Seed",
+                    "content": "content"
+                }),
+            },
+            &ctx,
+        )
+        .await;
+
+    let result = registry
+        .execute(
+            &ToolCall {
+                id: "l1".into(),
+                name: "memory_list".into(),
+                arguments: serde_json::json!({ "limit": 9999 }),
+            },
+            &ctx,
+        )
+        .await;
+
+    assert!(!result.is_error, "memory_list failed: {:?}", result.content);
+    // The echoed limit must be clamped to 100, not 9999.
+    assert_eq!(
+        result.content["limit"].as_u64().unwrap(),
+        100,
+        "limit field in response should be clamped to 100"
+    );
+
+    // Boundary: limit exactly at the cap should pass through unchanged.
+    let at_cap = registry
+        .execute(
+            &ToolCall {
+                id: "l_at_cap".into(),
+                name: "memory_list".into(),
+                arguments: serde_json::json!({ "limit": 100 }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!at_cap.is_error);
+    assert_eq!(
+        at_cap.content["limit"].as_u64().unwrap(),
+        100,
+        "limit=100 should pass through unchanged (boundary)"
+    );
+
+    // Boundary: one above the cap should clamp to 100, not 101.
+    let just_over = registry
+        .execute(
+            &ToolCall {
+                id: "l_over".into(),
+                name: "memory_list".into(),
+                arguments: serde_json::json!({ "limit": 101 }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!just_over.is_error);
+    assert_eq!(
+        just_over.content["limit"].as_u64().unwrap(),
+        100,
+        "limit=101 should clamp to 100 (off-by-one guard)"
+    );
+}
+
+/// Fix C — memory_tags tool: lists all tags with counts, supports prefix filter,
+/// and returns an error for an invalid prefix.
+#[tokio::test]
+async fn tags_tool_lists_with_counts_and_prefix() {
+    let (_store, registry) = setup();
+    let ctx = test_ctx();
+
+    // Seed notes with overlapping nested tags.
+    for (title, tags) in [
+        ("Italian dish", vec!["recipes", "recipes/italian"]),
+        ("French dish", vec!["recipes", "recipes/french"]),
+        ("Another Italian", vec!["recipes/italian"]),
+        ("Person note", vec!["person"]),
+    ] {
+        registry
+            .execute(
+                &ToolCall {
+                    id: "c".into(),
+                    name: "memory_create".into(),
+                    arguments: serde_json::json!({
+                        "title": title,
+                        "content": "content",
+                        "tags": tags
+                    }),
+                },
+                &ctx,
+            )
+            .await;
+    }
+
+    // --- No prefix: all tags returned ---
+    let result = registry
+        .execute(
+            &ToolCall {
+                id: "t1".into(),
+                name: "memory_tags".into(),
+                arguments: serde_json::json!({}),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!result.is_error, "memory_tags failed: {:?}", result.content);
+    let all_tags = result.content.as_array().unwrap();
+    let find_count = |tag: &str| -> u64 {
+        all_tags
+            .iter()
+            .find(|t| t["tag"] == tag)
+            .and_then(|t| t["count"].as_u64())
+            .unwrap_or(0)
+    };
+    assert_eq!(find_count("recipes"), 2, "recipes should appear on 2 notes");
+    assert_eq!(
+        find_count("recipes/italian"),
+        2,
+        "recipes/italian should appear on 2 notes"
+    );
+    assert_eq!(
+        find_count("recipes/french"),
+        1,
+        "recipes/french should appear on 1 note"
+    );
+    assert_eq!(find_count("person"), 1, "person should appear on 1 note");
+
+    // --- Prefix filter: only recipes/* tags returned ---
+    let result = registry
+        .execute(
+            &ToolCall {
+                id: "t2".into(),
+                name: "memory_tags".into(),
+                arguments: serde_json::json!({ "prefix": "recipes" }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        !result.is_error,
+        "memory_tags with prefix failed: {:?}",
+        result.content
+    );
+    let recipe_tags = result.content.as_array().unwrap();
+    let recipe_tag_names: Vec<&str> = recipe_tags
+        .iter()
+        .map(|t| t["tag"].as_str().unwrap())
+        .collect();
+    assert!(recipe_tag_names.contains(&"recipes"));
+    assert!(recipe_tag_names.contains(&"recipes/italian"));
+    assert!(recipe_tag_names.contains(&"recipes/french"));
+    assert!(
+        !recipe_tag_names.contains(&"person"),
+        "person should not appear under recipes prefix"
+    );
+
+    // --- Invalid prefix returns an error ---
+    let result = registry
+        .execute(
+            &ToolCall {
+                id: "t3".into(),
+                name: "memory_tags".into(),
+                arguments: serde_json::json!({ "prefix": "bad tag" }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        result.is_error,
+        "memory_tags with invalid prefix should return an error"
+    );
+}
+
+/// Fix D + Fix E — memory_list tool exercises tag_exact, limit, offset,
+/// and asserts the envelope fields are echoed correctly.
+#[tokio::test]
+async fn memory_list_tool_pagination_and_exact_filter() {
+    let (_store, registry) = setup();
+    let ctx = test_ctx();
+
+    // Seed: two notes tagged "food", one tagged "food/italian" (child only).
+    for (title, tags) in [
+        ("Food A", vec!["food"]),
+        ("Food B", vec!["food"]),
+        ("Italian only", vec!["food/italian"]),
+    ] {
+        registry
+            .execute(
+                &ToolCall {
+                    id: "c".into(),
+                    name: "memory_create".into(),
+                    arguments: serde_json::json!({
+                        "title": title,
+                        "content": "content",
+                        "tags": tags
+                    }),
+                },
+                &ctx,
+            )
+            .await;
+    }
+
+    // --- tag_exact: true — should match only "food" (exact), not "food/italian" ---
+    let result = registry
+        .execute(
+            &ToolCall {
+                id: "l1".into(),
+                name: "memory_list".into(),
+                arguments: serde_json::json!({ "tag": "food", "tag_exact": true }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!result.is_error);
+    let notes = result.content["notes"].as_array().unwrap();
+    assert_eq!(
+        result.content["total"].as_u64().unwrap(),
+        2,
+        "exact match on 'food' should return 2 notes"
+    );
+    assert_eq!(notes.len(), 2);
+    // "Italian only" (tagged food/italian) must NOT appear.
+    assert!(
+        notes.iter().all(|n| n["title"] != "Italian only"),
+        "tag_exact should exclude notes tagged only with a child tag"
+    );
+
+    // --- limit: 1 — exactly 1 note in response, total > 1 ---
+    let result = registry
+        .execute(
+            &ToolCall {
+                id: "l2".into(),
+                name: "memory_list".into(),
+                arguments: serde_json::json!({ "limit": 1 }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!result.is_error);
+    assert_eq!(
+        result.content["notes"].as_array().unwrap().len(),
+        1,
+        "limit=1 should return exactly 1 note"
+    );
+    assert!(
+        result.content["total"].as_u64().unwrap() > 1,
+        "total should reflect all 3 notes"
+    );
+    // Fix E: envelope echo assertions
+    assert_eq!(
+        result.content["limit"].as_u64().unwrap(),
+        1,
+        "limit field in envelope should echo the requested limit"
+    );
+    assert_eq!(
+        result.content["offset"].as_u64().unwrap(),
+        0,
+        "offset field in envelope should default to 0"
+    );
+
+    // --- offset: 1 — skips the first note ---
+    let result_all = registry
+        .execute(
+            &ToolCall {
+                id: "l3a".into(),
+                name: "memory_list".into(),
+                arguments: serde_json::json!({}),
+            },
+            &ctx,
+        )
+        .await;
+    let first_id = result_all.content["notes"].as_array().unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = registry
+        .execute(
+            &ToolCall {
+                id: "l3b".into(),
+                name: "memory_list".into(),
+                arguments: serde_json::json!({ "offset": 1 }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(!result.is_error);
+    let notes_offset = result.content["notes"].as_array().unwrap();
+    assert!(
+        notes_offset.iter().all(|n| n["id"] != first_id),
+        "offset=1 should skip the first note"
+    );
+    // Fix E: envelope echo for offset
+    assert_eq!(
+        result.content["offset"].as_u64().unwrap(),
+        1,
+        "offset field in envelope should echo 1"
+    );
 }

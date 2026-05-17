@@ -471,18 +471,13 @@ impl SqliteMemory {
     /// phrase-fallback can call it cleanly without recursion risk.
     ///
     /// `bm25()` can only be used in the `ORDER BY` of a query that has the FTS5
-    /// table directly in `FROM` (not in a `JOIN`).  To get bm25 ordering while
-    /// also filtering by tag, we use a two-step approach:
-    ///
-    /// 1. Run the FTS5 MATCH query to collect (rowid, bm25_score) pairs ordered
-    ///    by relevance, up to a generous multiplier of the requested limit.
-    /// 2. In Rust, look up each rowid in `notes` + `tags` and apply the tag filter.
-    ///    Stop once we have `limit` matching notes.
-    ///
-    /// This avoids needing bm25() inside a JOIN while preserving relevance ordering.
-    /// The overfetch multiplier (10×, minimum 50) is the only approximation: in the
-    /// rare case where every result is tag-filtered out, we may return fewer than
-    /// `limit` notes.  For typical queries this is a non-issue.
+    /// table directly in `FROM` (not in a `JOIN`).  Soft-delete and tag filters
+    /// are pushed into a `rowid IN (...)` subquery — SQLite evaluates that as a
+    /// pre-sort filter, so `bm25(notes_fts)` still applies and `LIMIT` is
+    /// honoured exactly.  An earlier version of this function ran an unscoped
+    /// FTS match, overfetched 10× the limit, then post-filtered tags in Rust;
+    /// that silently dropped results when untagged notes ranked ahead of tagged
+    /// matches.
     ///
     /// The GLOB pattern `tag || '/*'` is used (not LIKE) for consistency with
     /// `list_notes` and `list_notes_paginated` — `_` is an allowed tag char and a
@@ -496,34 +491,63 @@ impl SqliteMemory {
         tag_exact: bool,
         limit: usize,
     ) -> MemoryResult<Vec<Note>> {
-        // Step 1: FTS5 match — get rowids in bm25 order.
-        // Overfetch so post-filtering doesn't starve the result set.
-        let overfetch = (limit * 10).max(50);
-        let mut fts_stmt = conn.prepare(
-            "SELECT rowid FROM notes_fts WHERE notes_fts MATCH ?1 ORDER BY bm25(notes_fts) LIMIT ?2",
-        )?;
-        let rowids: Vec<i64> = fts_stmt
-            .query_map(params![fts_query, overfetch as i64], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rowids: Vec<i64> = match normalized_tag {
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid FROM notes_fts
+                     WHERE notes_fts MATCH ?1
+                       AND rowid IN (SELECT rowid FROM notes WHERE deleted_at IS NULL)
+                     ORDER BY bm25(notes_fts) LIMIT ?2",
+                )?;
+                stmt.query_map(params![fts_query, limit as i64], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            Some(tag) if tag_exact => {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid FROM notes_fts
+                     WHERE notes_fts MATCH ?1
+                       AND rowid IN (
+                           SELECT n.rowid FROM notes n
+                           JOIN tags t ON t.note_id = n.id
+                           WHERE n.deleted_at IS NULL AND t.tag = ?2
+                       )
+                     ORDER BY bm25(notes_fts) LIMIT ?3",
+                )?;
+                stmt.query_map(params![fts_query, tag, limit as i64], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            Some(tag) => {
+                let glob_prefix = format!("{tag}/*");
+                let mut stmt = conn.prepare(
+                    "SELECT rowid FROM notes_fts
+                     WHERE notes_fts MATCH ?1
+                       AND rowid IN (
+                           SELECT n.rowid FROM notes n
+                           JOIN tags t ON t.note_id = n.id
+                           WHERE n.deleted_at IS NULL AND (t.tag = ?2 OR t.tag GLOB ?3)
+                       )
+                     ORDER BY bm25(notes_fts) LIMIT ?4",
+                )?;
+                stmt.query_map(
+                    params![fts_query, tag, glob_prefix, limit as i64],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+            }
+        };
 
         if rowids.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Step 2: For each rowid (in relevance order), look up the note and
-        // apply the tag filter.  Stop when we reach `limit` notes.
-        let mut result = Vec::with_capacity(limit.min(rowids.len()));
-
+        // Load each note in bm25 order.  Soft-delete and tag filtering already
+        // happened in the rowid query above; this loop just hydrates.
+        let mut result = Vec::with_capacity(rowids.len());
         for rowid in rowids {
-            if result.len() >= limit {
-                break;
-            }
-
-            // Fetch the note by rowid, filtering soft-deleted.
-            let note_opt: Option<Note> = conn
+            let note: Option<Note> = conn
                 .query_row(
                     "SELECT id, title, content, created_at, updated_at
-                     FROM notes WHERE rowid = ?1 AND deleted_at IS NULL",
+                     FROM notes WHERE rowid = ?1",
                     params![rowid],
                     |row| {
                         Ok(Note {
@@ -539,34 +563,9 @@ impl SqliteMemory {
                 )
                 .optional()
                 .map_err(MemoryError::Database)?;
-
-            let note = match note_opt {
-                Some(n) => n,
-                None => continue, // soft-deleted or missing
-            };
-
-            // Apply tag filter if present.
-            if let Some(tag) = normalized_tag {
-                let tag_match: bool = if tag_exact {
-                    conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM tags WHERE note_id = ?1 AND tag = ?2)",
-                        params![note.id, tag],
-                        |row| row.get(0),
-                    )?
-                } else {
-                    let glob_prefix = format!("{tag}/*");
-                    conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM tags WHERE note_id = ?1 AND (tag = ?2 OR tag GLOB ?3))",
-                        params![note.id, tag, glob_prefix],
-                        |row| row.get(0),
-                    )?
-                };
-                if !tag_match {
-                    continue;
-                }
+            if let Some(n) = note {
+                result.push(n);
             }
-
-            result.push(note);
         }
 
         Ok(result)
@@ -2637,36 +2636,50 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn search_overfetch_under_tag_filter_pressure() {
+    fn search_returns_tagged_results_when_untagged_dominate_bm25() {
         let (_tmp, store) = test_store();
 
-        // 30 notes with common keyword; only 2 have the "target/exact" tag.
-        let mut tagged_titles = Vec::new();
-        for i in 0..30 {
-            let tags: Vec<String> = if i < 2 {
-                vec!["target/exact".to_string()]
-            } else {
-                vec!["other".to_string()]
-            };
-            let title = format!("Note {i}");
-            if i < 2 {
-                tagged_titles.push(title.clone());
-            }
+        // 200 untagged notes whose content repeats the keyword — high term
+        // frequency, so they rank above the tagged notes in bm25.
+        for i in 0..200 {
             store
-                .create_note(&title, "common keyword here", &tags)
+                .create_note(
+                    &format!("Loud {i}"),
+                    "common common common common keyword",
+                    &["other".to_string()],
+                )
                 .unwrap();
         }
 
-        // limit=10, tag prefix "target" — overfetch is (10*10).max(50) = 100 > 30.
+        // 5 tagged notes that mention the keyword only once — low bm25, but
+        // they're the only matches that satisfy the tag filter.
+        let mut tagged_titles = Vec::new();
+        for i in 0..5 {
+            let title = format!("Quiet {i}");
+            tagged_titles.push(title.clone());
+            store
+                .create_note(&title, "common", &["target/exact".to_string()])
+                .unwrap();
+        }
+
+        // With limit=5 and tag prefix "target", the rowid subquery restricts
+        // bm25 ranking to the 5 tagged notes — all five must come back.  Under
+        // the pre-fix code that fetched the top (limit*10).max(50)=50 rowids
+        // globally and post-filtered, none of the tagged notes would survive
+        // (they all rank below the 200 loud ones).
         let results = store
-            .search_notes("common", 10, Some("target"), false)
+            .search_notes("common", 5, Some("target"), false)
             .unwrap();
-        assert_eq!(results.len(), 2, "only the 2 tagged notes should be returned");
+        assert_eq!(
+            results.len(),
+            5,
+            "all five tagged notes must be returned even though untagged notes rank higher in bm25"
+        );
         let result_titles: Vec<&str> = results.iter().map(|n| n.title.as_str()).collect();
         for expected in &tagged_titles {
             assert!(
                 result_titles.contains(&expected.as_str()),
-                "expected note '{expected}' not found in results"
+                "expected tagged note '{expected}' not found in results: {result_titles:?}"
             );
         }
     }

@@ -173,8 +173,9 @@ async fn ac7_search() {
 
     // Search with tag filter — FTS5 searches title+content; use the `tag`
     // parameter to scope by tag.  Both "Rust Guide" and "Python Intro" are
-    // tagged "code".  A wildcard prefix query matches all indexed terms, and
-    // the tag filter narrows to the "code" namespace.
+    // tagged "code".  The `programming OR language` boolean query matches
+    // either keyword across both notes, and the tag filter narrows to the
+    // "code" namespace.
     let result = registry
         .execute(
             &ToolCall {

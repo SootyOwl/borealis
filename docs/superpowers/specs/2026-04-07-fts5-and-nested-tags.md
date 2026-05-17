@@ -133,10 +133,12 @@ SELECT t.tag, COUNT(*) AS cnt
 FROM tags t
 JOIN notes n ON t.note_id = n.id
 WHERE n.deleted_at IS NULL
-  AND (?1 IS NULL OR t.tag = ?1 OR t.tag LIKE ?1 || '/%')
+  AND (?1 IS NULL OR t.tag = ?1 OR t.tag GLOB ?1 || '/*')
 GROUP BY t.tag
 ORDER BY cnt DESC;
 ```
+
+GLOB (not LIKE) is used everywhere prefix tags are matched. `_` is an allowed tag character but is a LIKE wildcard, so LIKE would falsely match tags like `co_de/inner` against the prefix `code`. GLOB metacharacters (`*`, `?`, `[`) are all rejected by `normalize_tag`, so the user-supplied prefix can be safely concatenated with `/*`.
 
 ---
 
@@ -157,7 +159,7 @@ Normalization happens in one place: a `normalize_tag(&str) -> MemoryResult<Strin
 `tag_filter` arguments across the API switch from exact-match to **prefix-match by default**:
 
 - `tag_filter = Some("recipes")` matches `recipes`, `recipes/italian`, `recipes/italian/carbonara`.
-- SQL form: `tag = ?1 OR tag LIKE ?1 || '/%'` — the `|| '/%'` ensures `recipe` does *not* match `recipes`.
+- SQL form: `tag = ?1 OR tag GLOB ?1 || '/*'` — the `|| '/*'` ensures `recipe` does *not* match `recipes`. GLOB rather than LIKE so the `_` allowed in tag segments is not interpreted as a wildcard.
 - `tag_exact: true` on `list_notes_paginated` and `MemorySearch` forces exact-match.
 
 **Behavior change called out:** this is a breaking change for any caller that relied on exact-match `list_notes(tag_filter)`. Notes with single-segment tags (`person`, `preference`) keep working unchanged because exact-match is a subset of prefix-match. Update tool descriptions accordingly so the LLM uses the new semantics correctly.
@@ -176,17 +178,24 @@ New virtual table, created alongside `notes`/`tags`/`links` in `SqliteMemory::ne
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
     title,
     content,
-    content='notes',
-    content_rowid='rowid',
     tokenize='porter unicode61'
 );
 ```
 
-External-content table — the index references `notes` rows by rowid, no data duplication. `porter unicode61` gives English stemming + unicode folding.
+Regular (full-content) FTS5 table — the indexed text is stored inside `notes_fts` itself. `porter unicode61` gives English stemming + unicode folding.
+
+> **Deviation from original draft:** an earlier version of this spec proposed an
+> external-content table (`content='notes'`). That was rejected during
+> implementation because external-content tables transparently delegate
+> `SELECT COUNT(*)` and `EXISTS` to the source `notes` table, which made the
+> obvious `EXISTS(SELECT 1 FROM notes_fts ...)` backfill check return true even
+> when the FTS index was actually empty. Storing the text in `notes_fts` is
+> simpler, idempotent, and the storage overhead is acceptable at the note sizes
+> we expect.
 
 ### Triggers
 
-Standard FTS5 sync triggers on `notes`:
+Sync triggers on `notes`. The update trigger is split so that re-tokenization happens only when the note is still live, and a dedicated soft-delete trigger removes the row from the FTS index when `deleted_at` transitions from NULL to non-NULL.
 
 ```sql
 CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
@@ -194,29 +203,38 @@ CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, title, content) VALUES('delete', old.rowid, old.title, old.content);
+    DELETE FROM notes_fts WHERE rowid = old.rowid;
 END;
 
-CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, title, content) VALUES('delete', old.rowid, old.title, old.content);
-    INSERT INTO notes_fts(notes_fts, rowid, title, content) VALUES (new.rowid, new.title, new.content);
+CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes
+WHEN new.deleted_at IS NULL
+BEGIN
+    DELETE FROM notes_fts WHERE rowid = old.rowid;
+    INSERT INTO notes_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS notes_soft_delete AFTER UPDATE ON notes
+WHEN new.deleted_at IS NOT NULL AND old.deleted_at IS NULL
+BEGIN
+    DELETE FROM notes_fts WHERE rowid = new.rowid;
 END;
 ```
 
-Soft-deleted notes (`deleted_at IS NOT NULL`) stay in the FTS index but are filtered at query time via the join — simpler than juggling triggers around the soft-delete column.
+Soft-deleted notes are removed from the FTS index by `notes_soft_delete`, so they don't pollute bm25 corpus statistics with content that's no longer reachable. Hard-deletes also clear the FTS row via `notes_ad`.
 
 ### Backfill
 
-On startup, after creating the virtual table and triggers:
+On startup, after creating the virtual table and triggers, check whether the index is populated:
 
 ```sql
-SELECT 1 FROM notes_fts LIMIT 1;
+SELECT EXISTS(SELECT 1 FROM notes_fts LIMIT 1);
 ```
 
-If empty and `notes` is non-empty:
+If the index is empty and `notes` is non-empty, populate it from the live notes (excluding soft-deleted rows so they don't get re-indexed):
 
 ```sql
-INSERT INTO notes_fts(rowid, title, content) SELECT rowid, title, content FROM notes;
+INSERT INTO notes_fts(rowid, title, content)
+SELECT rowid, title, content FROM notes WHERE deleted_at IS NULL;
 ```
 
 Idempotent and cheap on subsequent boots.
@@ -233,28 +251,32 @@ fn search_notes(
 ) -> MemoryResult<Vec<Note>>;
 ```
 
-Implementation:
+Implementation: two-step rowid query, since `bm25(notes_fts)` requires `notes_fts` directly in `FROM` (not behind a JOIN). The soft-delete and tag filters are pushed into a `rowid IN (...)` subquery so they apply before sorting and `LIMIT` is honoured exactly.
 
 ```sql
-SELECT n.id, n.title, n.content, n.created_at, n.updated_at
-FROM notes_fts f
-JOIN notes n ON n.rowid = f.rowid
-LEFT JOIN tags t ON t.note_id = n.id
-WHERE f.notes_fts MATCH ?1
-  AND n.deleted_at IS NULL
-  AND (
-       ?2 IS NULL
-    OR (?3 = 1 AND t.tag = ?2)
-    OR (?3 = 0 AND (t.tag = ?2 OR t.tag LIKE ?2 || '/%'))
+-- No tag filter:
+SELECT rowid FROM notes_fts
+WHERE notes_fts MATCH ?1
+  AND rowid IN (SELECT rowid FROM notes WHERE deleted_at IS NULL)
+ORDER BY bm25(notes_fts) LIMIT ?2;
+
+-- Prefix tag filter:
+SELECT rowid FROM notes_fts
+WHERE notes_fts MATCH ?1
+  AND rowid IN (
+      SELECT n.rowid FROM notes n
+      JOIN tags t ON t.note_id = n.id
+      WHERE n.deleted_at IS NULL
+        AND (t.tag = ?2 OR t.tag GLOB ?3)
   )
-GROUP BY n.id
-ORDER BY bm25(notes_fts)
-LIMIT ?4;
+ORDER BY bm25(notes_fts) LIMIT ?4;
 ```
 
-`GROUP BY n.id` collapses duplicates from the tag join. Tags are populated per-result via the existing `get_tags_for_note_locked` helper.
+(The `tag_exact: true` variant drops the `OR t.tag GLOB ?3` clause.) Each rowid is then looked up in `notes` in relevance order to hydrate the returned `Note`. `tags` and `links` are left empty on the returned `Note` to keep search responses small; callers who need them follow up with `memory_read`.
 
 **Query passthrough.** The user's query string is passed directly to FTS5 MATCH. This gives Aurora prefix (`auth*`), phrase (`"oauth refresh"`), and boolean (`oauth AND token`) for free. If MATCH fails to parse (FTS5 syntax error on stray `:` etc.), retry once with the query wrapped in double quotes as a phrase before surfacing the error — Aurora shouldn't have to know FTS5 grammar to do a literal search.
+
+**Sanitization in the pipeline.** Free-form user messages are sanitized via `crate::memory::sanitize_for_fts` before being handed to `search_notes` from the conversation pipeline (FTS5 metacharacters stripped, bare operator keywords dropped, length-capped). Tool-driven `memory_search` calls do *not* go through the sanitizer — Aurora-the-LLM is trusted to use FTS5 syntax intentionally.
 
 ### Tool changes
 

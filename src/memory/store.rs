@@ -245,8 +245,8 @@ impl SqliteMemory {
         // This MUST run BEFORE the FTS5 triggers are created.  The UPDATE
         // statements here would fire `notes_au` if the trigger existed, causing
         // FTS5 to try to delete rows it has never indexed — which raises
-        // SQLITE_CORRUPT_VTAB on the empty external-content table.  Doing the
-        // timestamp backfill first avoids that.
+        // SQLITE_CORRUPT_VTAB on the empty FTS5 index.  Doing the timestamp
+        // backfill first avoids that.
         //
         // Idempotent: filtered to rows that don't already contain a `.`.
         conn.execute_batch(
@@ -1988,13 +1988,12 @@ mod tests {
 
     #[test]
     fn list_notes_paginated_deterministic_order_when_timestamps_tie() {
-        // The tiebreaker `ORDER BY id ASC` is load-bearing because `now_iso()` is
-        // second-resolution: notes created in the same second tie on `updated_at`.
-        // Without the tiebreaker, the ordering is unspecified and rows can appear
-        // on multiple pages or be skipped between LIMIT/OFFSET calls.
-        //
-        // Force the tie deterministically (don't rely on wall-clock granularity)
-        // by overwriting all four notes' `updated_at` to the same exact value.
+        // The tiebreaker `ORDER BY id ASC` is load-bearing: any two notes that
+        // share an `updated_at` value must still paginate in a stable order, or
+        // rows can appear on multiple pages (or be skipped) between successive
+        // LIMIT/OFFSET calls.  `now_iso()` is millisecond-precision, so genuine
+        // collisions are rare under wall-clock — we force one here by writing
+        // the same `updated_at` to every row.
         let (_tmp, store) = test_store();
         for i in 0..4 {
             store

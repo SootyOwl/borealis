@@ -487,6 +487,7 @@ impl<P: Provider + 'static> Pipeline<P> {
     /// On HTTP 400 (context too large, invalid request, etc.):
     /// - First retry: evict oldest half of non-fixed turns and retry.
     /// - Second failure: fall back to system prompt + core persona + current message only.
+    #[allow(clippy::too_many_arguments)] // distinct context pieces, no clear grouping
     async fn call_llm_with_400_recovery(
         &self,
         provider_messages: &mut Vec<ChatMessage>,
@@ -698,10 +699,9 @@ impl<P: Provider + 'static> Pipeline<P> {
     /// The user message is sanitized for FTS5: metacharacters are stripped and
     /// bare operator keywords are dropped, but the surviving tokens are passed
     /// through so FTS5's tokenizer + Porter stemmer can do their normal work.
-    /// This preserves recall (a multi-word user message matches notes containing
-    /// any of those words via implicit AND) while preventing user text from
-    /// being misinterpreted as FTS5 syntax. See `crate::memory::sanitize_for_fts`
-    /// for the exact rules.
+    /// FTS5's default is implicit AND, so a multi-word user message matches
+    /// notes containing all of the surviving tokens — narrow but predictable.
+    /// See `crate::memory::sanitize_for_fts` for the exact rules.
     async fn retrieve_memories(&self, query: &str) -> Vec<String> {
         let sanitized = crate::memory::sanitize_for_fts(query);
         if sanitized.is_empty() {

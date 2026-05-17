@@ -564,6 +564,70 @@ async fn tag_tool_empty_array_clears_tags() {
     assert!(missing.is_error, "missing `tags` field should error");
 }
 
+/// memory_tag rejects arrays containing non-string elements rather than silently
+/// dropping them — otherwise a malformed `{"tags":[123]}` collapses to `[]` and
+/// clears all tags on the note.
+#[tokio::test]
+async fn tag_tool_rejects_non_string_elements() {
+    let (_store, registry) = setup();
+    let ctx = test_ctx();
+
+    let create = registry
+        .execute(
+            &ToolCall {
+                id: "c1".into(),
+                name: "memory_create".into(),
+                arguments: serde_json::json!({
+                    "title": "Tagged",
+                    "content": "Content",
+                    "tags": ["keep_me"]
+                }),
+            },
+            &ctx,
+        )
+        .await;
+    let note_id = create.content["id"].as_str().unwrap().to_string();
+
+    let bad = registry
+        .execute(
+            &ToolCall {
+                id: "t1".into(),
+                name: "memory_tag".into(),
+                arguments: serde_json::json!({
+                    "id": note_id,
+                    "tags": [123]
+                }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        bad.is_error,
+        "memory_tag with non-string element must error: {:?}",
+        bad.content
+    );
+
+    // Existing tags must be preserved — the malformed call must not have
+    // clobbered them via the empty-array path.
+    let read = registry
+        .execute(
+            &ToolCall {
+                id: "r1".into(),
+                name: "memory_read".into(),
+                arguments: serde_json::json!({ "id": note_id }),
+            },
+            &ctx,
+        )
+        .await;
+    let tags: Vec<String> = read.content["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(tags, vec!["keep_me"], "tags should be unchanged after a rejected malformed call");
+}
+
 /// Fix B — memory_list clamps limit to MEMORY_LIST_MAX_LIMIT (100) silently.
 #[tokio::test]
 async fn memory_list_caps_limit_at_max() {

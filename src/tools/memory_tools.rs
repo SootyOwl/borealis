@@ -83,7 +83,10 @@ impl Tool for MemoryCreate {
             Some(c) => c,
             None => return error_result(call_id, "missing required field: content"),
         };
-        let tags = get_string_array(&args, "tags");
+        let tags = match get_string_array(&args, "tags") {
+            Ok(t) => t,
+            Err(e) => return error_result(call_id, &e),
+        };
 
         let store = self.0.clone();
         let title = title.to_string();
@@ -383,7 +386,12 @@ impl Tool for MemoryTag {
                 "missing required field: tags (must be an array; pass [] to clear)",
             );
         }
-        let tags = get_string_array(&args, "tags");
+        // Strict parse: a malformed `tags: [123]` must error rather than fall
+        // through to the empty-array clear-all path.
+        let tags = match get_string_array(&args, "tags") {
+            Ok(t) => t,
+            Err(e) => return error_result(call_id, &e),
+        };
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || store.tag_note(&id, &tags)).await {

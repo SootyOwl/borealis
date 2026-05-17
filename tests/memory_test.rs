@@ -705,6 +705,45 @@ async fn memory_list_caps_limit_at_max() {
     );
 }
 
+/// memory_list with an offset above i64::MAX must not error out via signed
+/// overflow when bound to SQLite (rusqlite encodes `usize` as i64). The tool
+/// clamps oversized values so the call returns an empty page instead.
+#[tokio::test]
+async fn memory_list_handles_oversized_offset() {
+    let (_store, registry) = setup();
+    let ctx = test_ctx();
+
+    // Seed one note so the table isn't empty.
+    registry
+        .execute(
+            &ToolCall {
+                id: "c1".into(),
+                name: "memory_create".into(),
+                arguments: serde_json::json!({ "title": "Seed", "content": "content" }),
+            },
+            &ctx,
+        )
+        .await;
+
+    let result = registry
+        .execute(
+            &ToolCall {
+                id: "l1".into(),
+                name: "memory_list".into(),
+                arguments: serde_json::json!({ "offset": u64::MAX }),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        !result.is_error,
+        "memory_list with u64::MAX offset must not error: {:?}",
+        result.content
+    );
+    let notes = result.content["notes"].as_array().unwrap();
+    assert!(notes.is_empty(), "huge offset should yield an empty page");
+}
+
 /// Fix C — memory_tags tool: lists all tags with counts, supports prefix filter,
 /// and returns an error for an invalid prefix.
 #[tokio::test]

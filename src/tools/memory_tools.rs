@@ -546,7 +546,15 @@ impl Tool for MemoryList {
             .and_then(|v| v.as_u64())
             .unwrap_or(20)
             .min(MEMORY_LIST_MAX_LIMIT as u64) as usize;
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        // Clamp to i64::MAX before casting: rusqlite binds `usize` parameters as
+        // i64, so a u64 value above i64::MAX would wrap to a negative offset and
+        // SQLite would treat that as invalid rather than the documented
+        // "returns empty pages" behaviour.
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(i64::MAX as u64) as usize;
 
         let store = self.0.clone();
         match tokio::task::spawn_blocking(move || {

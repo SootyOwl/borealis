@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,10 +75,15 @@ pub struct PipelineDeps {
 /// Takes an inbound event, loads conversation history, builds a prompt with
 /// budget-aware turn selection, calls the LLM provider, executes any tool
 /// calls in a loop, persists history, and returns an outbound event.
+///
+/// The system prompt is read once at construction (it changes rarely and
+/// requires a restart-equivalent to redeploy).  The core persona is re-read
+/// from disk on every invocation so edits to `memory/core.md` take effect
+/// without restarting the bot.
 pub struct Pipeline<P: Provider + 'static> {
     provider: Arc<P>,
     system_prompt: String,
-    core_persona: String,
+    core_persona_path: PathBuf,
     history_store: Arc<HistoryStore>,
     tool_registry: Arc<ToolRegistry>,
     memory_store: Arc<dyn Memory>,
@@ -109,17 +114,13 @@ impl<P: Provider + 'static> Pipeline<P> {
             default_system_prompt()
         };
 
-        let core_persona = if core_persona_path.exists() {
-            std::fs::read_to_string(core_persona_path).with_context(|| {
-                format!(
-                    "failed to read core persona: {}",
-                    core_persona_path.display()
-                )
-            })?
-        } else {
-            debug!(path = %core_persona_path.display(), "core persona file not found, using empty");
-            String::new()
-        };
+        // Core persona is read lazily per invocation (see `load_core_persona`)
+        // so edits to memory/core.md take effect without restarting the bot.
+        // We probe the file here only to surface a one-shot startup warning if
+        // the configured path is wrong; the runtime path stores the PathBuf.
+        if !core_persona_path.exists() {
+            debug!(path = %core_persona_path.display(), "core persona file not found at startup; will retry per invocation");
+        }
 
         let compaction_prompt = if deps.compaction_config.summary_prompt_path.exists() {
             std::fs::read_to_string(&deps.compaction_config.summary_prompt_path)
@@ -138,7 +139,7 @@ impl<P: Provider + 'static> Pipeline<P> {
 
         info!(
             system_prompt_len = system_prompt.len(),
-            core_persona_len = core_persona.len(),
+            core_persona_path = %core_persona_path.display(),
             tool_count = deps.tool_registry.tool_count(),
             provider = provider.name(),
             "pipeline initialized"
@@ -147,7 +148,7 @@ impl<P: Provider + 'static> Pipeline<P> {
         Ok(Self {
             provider,
             system_prompt,
-            core_persona,
+            core_persona_path: core_persona_path.to_path_buf(),
             history_store: deps.history_store,
             tool_registry: deps.tool_registry,
             memory_store: deps.memory_store,
@@ -157,6 +158,29 @@ impl<P: Provider + 'static> Pipeline<P> {
             pipeline_config: deps.pipeline_config,
             llm_semaphore: deps.llm_semaphore,
         })
+    }
+
+    /// Read the core persona from disk.  Runs on the blocking pool so the file
+    /// IO doesn't park a runtime worker.  A missing file is treated as an empty
+    /// persona (with a warning) rather than a fatal error — the bot stays up
+    /// even if `memory/core.md` is temporarily removed during editing.
+    async fn load_core_persona(&self) -> String {
+        let path = self.core_persona_path.clone();
+        match tokio::task::spawn_blocking(move || std::fs::read_to_string(&path)).await {
+            Ok(Ok(contents)) => contents,
+            Ok(Err(e)) => {
+                warn!(
+                    path = %self.core_persona_path.display(),
+                    error = %e,
+                    "failed to read core persona, continuing with empty persona"
+                );
+                String::new()
+            }
+            Err(e) => {
+                warn!(error = %e, "core persona load task panicked, continuing with empty persona");
+                String::new()
+            }
+        }
     }
 
     async fn process_impl(&self, event: &InEvent) -> Result<OutEvent> {
@@ -198,9 +222,13 @@ impl<P: Provider + 'static> Pipeline<P> {
         // Retrieve relevant memories based on user message.
         let retrieved_memories = self.retrieve_memories(&event.message.text).await;
 
+        // Read the core persona fresh from disk for this invocation so edits to
+        // memory/core.md take effect without a restart.
+        let core_persona = self.load_core_persona().await;
+
         // Build the context budget.
         let system_tokens = estimate_tokens(&self.system_prompt);
-        let persona_tokens = estimate_tokens(&self.core_persona);
+        let persona_tokens = estimate_tokens(&core_persona);
         let tool_defs = if let Some(ref group_names) = event.tool_groups {
             let groups: Vec<crate::tools::ToolGroup> = group_names
                 .iter()
@@ -237,7 +265,7 @@ impl<P: Provider + 'static> Pipeline<P> {
         let included_turns: Vec<Turn> = selection.included.iter().map(|t| (*t).clone()).collect();
         let assembled = budget.assemble(
             &self.system_prompt,
-            &self.core_persona,
+            &core_persona,
             &included_turns,
             &retrieved_memories,
         );
@@ -284,6 +312,7 @@ impl<P: Provider + 'static> Pipeline<P> {
                     &included_turns,
                     &retrieved_memories,
                     &channel_context,
+                    &core_persona,
                 )
                 .await?;
 
@@ -458,6 +487,7 @@ impl<P: Provider + 'static> Pipeline<P> {
     /// On HTTP 400 (context too large, invalid request, etc.):
     /// - First retry: evict oldest half of non-fixed turns and retry.
     /// - Second failure: fall back to system prompt + core persona + current message only.
+    #[allow(clippy::too_many_arguments)] // distinct context pieces, no clear grouping
     async fn call_llm_with_400_recovery(
         &self,
         provider_messages: &mut Vec<ChatMessage>,
@@ -466,6 +496,7 @@ impl<P: Provider + 'static> Pipeline<P> {
         included_turns: &[Turn],
         retrieved_memories: &[String],
         channel_context: &str,
+        core_persona: &str,
     ) -> Result<(crate::providers::LlmResponse, std::time::Duration)> {
         let _permit = self
             .llm_semaphore
@@ -504,7 +535,7 @@ impl<P: Provider + 'static> Pipeline<P> {
 
         let mut retry_messages = ContextBudget::assemble_static(
             &self.system_prompt,
-            &self.core_persona,
+            core_persona,
             reduced_turns,
             retrieved_memories,
         );
@@ -550,7 +581,7 @@ impl<P: Provider + 'static> Pipeline<P> {
 
         let mut minimal_messages = ContextBudget::assemble_static(
             &self.system_prompt,
-            &self.core_persona,
+            core_persona,
             minimal_turns,
             &[], // no memories
         );
@@ -664,10 +695,23 @@ impl<P: Provider + 'static> Pipeline<P> {
     /// Search memory for notes relevant to the user's message.
     ///
     /// Runs on the blocking thread pool since `Memory::search_notes` does SQLite I/O.
+    ///
+    /// The user message is sanitized for FTS5: metacharacters are stripped and
+    /// bare operator keywords are dropped, but the surviving tokens are passed
+    /// through so FTS5's tokenizer + Porter stemmer can do their normal work.
+    /// FTS5's default is implicit AND, so a multi-word user message matches
+    /// notes containing all of the surviving tokens — narrow but predictable.
+    /// See `crate::memory::sanitize_for_fts` for the exact rules.
     async fn retrieve_memories(&self, query: &str) -> Vec<String> {
+        let sanitized = crate::memory::sanitize_for_fts(query);
+        if sanitized.is_empty() {
+            // Nothing salvageable from the user message — skip retrieval rather
+            // than handing FTS5 an empty query that would match-all.
+            return vec![];
+        }
         let mem = Arc::clone(&self.memory_store);
-        let q = query.to_owned();
-        let result = tokio::task::spawn_blocking(move || mem.search_notes(&q, 5)).await;
+        let result =
+            tokio::task::spawn_blocking(move || mem.search_notes(&sanitized, 5, None, false)).await;
         match result {
             Ok(Ok(notes)) => notes
                 .into_iter()
@@ -732,16 +776,23 @@ mod tests {
     use crate::security::Security;
     use std::sync::Mutex;
 
-    /// A mock provider that returns a configurable sequence of responses.
+    /// A mock provider that returns a configurable sequence of responses and
+    /// records the messages it was called with.
     struct MockProvider {
         responses: Mutex<Vec<LlmResponse>>,
+        captured: Mutex<Vec<Vec<ChatMessage>>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<LlmResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                captured: Mutex::new(Vec::new()),
             }
+        }
+
+        fn captured(&self) -> Vec<Vec<ChatMessage>> {
+            self.captured.lock().unwrap().clone()
         }
     }
 
@@ -752,10 +803,11 @@ mod tests {
 
         async fn chat(
             &self,
-            _messages: Vec<ChatMessage>,
+            messages: Vec<ChatMessage>,
             _tools: &[ToolDef],
             _config: &crate::providers::RequestConfig,
         ) -> anyhow::Result<LlmResponse> {
+            self.captured.lock().unwrap().push(messages);
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 Ok(LlmResponse {
@@ -1223,6 +1275,73 @@ mod tests {
             counts[0],
             counts[1]
         );
+    }
+
+    #[tokio::test]
+    async fn core_persona_is_reloaded_each_invocation() {
+        // Build a pipeline pointing at a tempfile, then change the file
+        // between invocations and confirm the new contents flow through to
+        // the provider on the next call.
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
+                .unwrap();
+        }
+        crate::history::schema::initialize(&db.lock().unwrap()).unwrap();
+        let history_store = Arc::new(crate::history::store::HistoryStore::new(Arc::clone(&db)));
+
+        let tmp_persona = std::env::temp_dir().join("borealis_test_reload_core.md");
+        std::fs::write(&tmp_persona, "PERSONA_VERSION_ONE").unwrap();
+        let memory_store: Arc<dyn crate::memory::Memory> = Arc::new(
+            crate::memory::SqliteMemory::new(Arc::clone(&db), tmp_persona.clone()).unwrap(),
+        );
+
+        let tool_registry = Arc::new(crate::tools::ToolRegistry::new());
+        let observers = Arc::new(ObserverRegistry::new());
+        let security = make_test_security();
+        let deps = PipelineDeps {
+            history_store,
+            tool_registry,
+            memory_store,
+            security,
+            observers,
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction_state: Arc::new(crate::history::compaction::CompactionState::new()),
+            pipeline_config: PipelineConfig::default(),
+            llm_semaphore: Arc::new(Semaphore::new(4)),
+        };
+
+        let sys_path = std::path::Path::new("/nonexistent/system_prompt.md");
+        let pipeline = Pipeline::new(Arc::clone(&provider), sys_path, &tmp_persona, deps).unwrap();
+
+        // First call: persona should be VERSION_ONE.
+        let event = make_test_event(ChannelSource::Cli, "user_reload");
+        pipeline.process_impl(&event).await.unwrap();
+        let captured = provider.captured();
+        assert!(
+            captured.last().unwrap().iter().any(|m| m.content.contains("PERSONA_VERSION_ONE")),
+            "first invocation should see PERSONA_VERSION_ONE in the prompt",
+        );
+
+        // Overwrite the persona file. No restart, no Pipeline rebuild.
+        std::fs::write(&tmp_persona, "PERSONA_VERSION_TWO").unwrap();
+
+        // Second call: persona should be VERSION_TWO.
+        pipeline.process_impl(&event).await.unwrap();
+        let captured = provider.captured();
+        let second_call = captured.last().unwrap();
+        assert!(
+            second_call.iter().any(|m| m.content.contains("PERSONA_VERSION_TWO")),
+            "second invocation should see PERSONA_VERSION_TWO after the file was rewritten",
+        );
+        assert!(
+            !second_call.iter().any(|m| m.content.contains("PERSONA_VERSION_ONE")),
+            "second invocation must NOT carry the stale PERSONA_VERSION_ONE content",
+        );
+
+        let _ = std::fs::remove_file(&tmp_persona);
     }
 
     #[tokio::test]

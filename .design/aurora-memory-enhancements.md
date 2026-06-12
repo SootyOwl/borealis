@@ -62,7 +62,7 @@ All notes below describe **changes to make** to the existing codebase. The curre
 
 **Modify:**
 - `src/main.rs`: add `"memory_edit"` to the restricted tools list (alongside `memory_create`, `memory_update`, etc.)
-- `src/core/pipeline.rs`: Pipeline currently loads `core.md` once at startup into `self.core_persona` (line 112-122) and never re-reads it. **Change** `process_impl` to call `self.memory_store.load_core_persona()` on each invocation instead of using the cached `self.core_persona` field. This ensures edits to core.md take effect on the next message. The file I/O cost is negligible compared to LLM API call latency. The `core_persona` field on the Pipeline struct can be removed or kept as a fallback.
+- `src/core/pipeline.rs`: Pipeline currently loads `core.md` once at startup into `self.core_persona` (line 112-122) and never re-reads it. **Change** `process_impl` to call `self.memory_store.load_core_persona()` (via `spawn_blocking`) on each invocation instead of using the cached field. If `load_core_persona()` fails (file missing/unreadable), fall back to empty string and log `warn!`. The file I/O cost is negligible compared to LLM API call latency. **Remove** the `core_persona` field from the Pipeline struct.
 
 **Concurrency:** Safe — all DB ops and file I/O are serialized via `Arc<Mutex<Connection>>` and `spawn_blocking`.
 

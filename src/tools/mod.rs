@@ -40,11 +40,34 @@ pub(crate) fn get_str<'a>(args: &'a serde_json::Value, field: &str) -> Option<&'
     args.get(field).and_then(|v| v.as_str())
 }
 
-pub(crate) fn get_string_array(args: &serde_json::Value, field: &str) -> Vec<String> {
-    args.get(field)
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default()
+/// Parse a JSON array of strings from `args[field]`.
+///
+/// Returns `Ok(vec![])` if the field is absent or JSON null — these are treated as
+/// "no value supplied." Returns `Err` if the field is present but not an array, or
+/// if any element is not a string: silently dropping non-string elements would
+/// turn a malformed `{"tags":[123]}` into `{"tags":[]}`, which has surprising
+/// destructive semantics in tools like `memory_tag` where an empty array clears
+/// all tags. Better to surface the type error to the caller.
+pub(crate) fn get_string_array(
+    args: &serde_json::Value,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    match args.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| format!("field `{field}` must be an array of strings"))?;
+            arr.iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    item.as_str().map(String::from).ok_or_else(|| {
+                        format!("field `{field}` element {i} must be a string")
+                    })
+                })
+                .collect()
+        }
+    }
 }
 use poise::serenity_prelude as serenity;
 

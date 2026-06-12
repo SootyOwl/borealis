@@ -15,7 +15,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::history::{schema as history_schema, store::HistoryStore};
-use crate::memory::{Memory, SqliteMemory};
+use crate::memory::{Memory, SqliteMemory, normalize_tag};
 use crate::types::{ChannelSource, ChatMessage, ConversationId, ConversationMode, ToolCall};
 
 // ---------------------------------------------------------------------------
@@ -224,6 +224,57 @@ pub fn run_migration(
 }
 
 // ---------------------------------------------------------------------------
+// Tag sanitization
+// ---------------------------------------------------------------------------
+
+/// Best-effort coercion of an arbitrary Letta string into a valid Borealis tag.
+///
+/// Letta tag/description strings are free-form (spaces, capitals, punctuation).
+/// Borealis tags require `[a-z0-9._-]` segments separated by `/`. We:
+/// 1. Lowercase the input.
+/// 2. Replace whitespace runs with `-`.
+/// 3. Drop any character that isn't allowed (or `/` for nesting).
+/// 4. Collapse repeated slashes.
+/// 5. Validate the result via `normalize_tag`.
+///
+/// Returns `None` (with a warning) if nothing salvageable remains.
+fn sanitize_letta_tag(raw: &str) -> Option<String> {
+    let lowered = raw.to_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    let mut prev_dash = false;
+    for c in lowered.chars() {
+        let mapped = match c {
+            'a'..='z' | '0'..='9' | '.' | '_' | '-' | '/' => Some(c),
+            c if c.is_whitespace() => Some('-'),
+            _ => None,
+        };
+        if let Some(ch) = mapped {
+            // Collapse runs of dashes — both whitespace-derived and literal.
+            // Two consecutive dashes anywhere in the input become one.
+            if ch == '-' && prev_dash {
+                continue;
+            }
+            prev_dash = ch == '-';
+            out.push(ch);
+        }
+    }
+    // Collapse `//` runs.
+    while out.contains("//") {
+        out = out.replace("//", "/");
+    }
+    // Strip leading/trailing dashes that would otherwise survive normalization
+    // (e.g. whitespace-only input would become a literal `-` tag).
+    let out = out.trim_matches('-').to_string();
+    match normalize_tag(&out) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            warn!(raw, error = %e, "dropping unsalvageable Letta tag");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core memory import
 // ---------------------------------------------------------------------------
 
@@ -245,11 +296,16 @@ fn import_core_memory(
         } else {
             // Other blocks (human, custom) → note rows
             let title = format!("Letta core: {label}");
-            let mut tags = vec!["letta-core".to_string(), label.to_string()];
+            let mut tags: Vec<String> = ["letta-core", label]
+                .iter()
+                .filter_map(|t| sanitize_letta_tag(t))
+                .collect();
             if let Some(ref desc) = block.description {
                 // Truncate long descriptions for tag use
                 if desc.len() <= 50 {
-                    tags.push(desc.clone());
+                    if let Some(t) = sanitize_letta_tag(desc) {
+                        tags.push(t);
+                    }
                 }
             }
             store
@@ -277,14 +333,16 @@ fn import_archival_memory(
             passage.id.as_deref().unwrap_or(&format!("{}", i + 1))
         );
 
-        let mut tags = vec!["letta-archival".to_string()];
+        let mut tags: Vec<String> = sanitize_letta_tag("letta-archival").into_iter().collect();
 
         // Extract string tags from metadata if present
         if let Some(Value::Object(meta)) = &passage.metadata {
             if let Some(Value::Array(arr)) = meta.get("tags") {
                 for v in arr {
                     if let Value::String(s) = v {
-                        tags.push(s.clone());
+                        if let Some(t) = sanitize_letta_tag(s) {
+                            tags.push(t);
+                        }
                     }
                 }
             }
@@ -494,6 +552,104 @@ mod tests {
         )
         .unwrap();
         (source_dir, data_dir)
+    }
+
+    // --- sanitize_letta_tag direct unit tests ---
+
+    #[test]
+    fn sanitize_passes_already_valid_tag() {
+        assert_eq!(sanitize_letta_tag("letta-archival").as_deref(), Some("letta-archival"));
+        assert_eq!(sanitize_letta_tag("recipes/italian").as_deref(), Some("recipes/italian"));
+    }
+
+    #[test]
+    fn sanitize_lowercases_and_replaces_spaces() {
+        assert_eq!(
+            sanitize_letta_tag("Human Profile").as_deref(),
+            Some("human-profile")
+        );
+        assert_eq!(
+            sanitize_letta_tag("CUSTOM_DATA").as_deref(),
+            Some("custom_data")
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_disallowed_characters() {
+        assert_eq!(sanitize_letta_tag("block#3").as_deref(), Some("block3"));
+        assert_eq!(sanitize_letta_tag("foo!bar?baz").as_deref(), Some("foobarbaz"));
+        // Disallowed characters at the start and end of the input should be
+        // dropped just as cleanly as those in the middle.
+        assert_eq!(sanitize_letta_tag("#block").as_deref(), Some("block"));
+        assert_eq!(sanitize_letta_tag("foo!").as_deref(), Some("foo"));
+        assert_eq!(sanitize_letta_tag("?foo!").as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn sanitize_handles_disallowed_char_between_slashes() {
+        // `foo/!/bar` — the middle segment is a single disallowed char.
+        // After dropping `!` we get `foo//bar`, which the slash-collapse
+        // pass reduces to `foo/bar`.
+        assert_eq!(
+            sanitize_letta_tag("foo/!/bar").as_deref(),
+            Some("foo/bar")
+        );
+    }
+
+    #[test]
+    fn sanitize_returns_none_for_slash_only_input() {
+        assert_eq!(sanitize_letta_tag("///"), None);
+    }
+
+    #[test]
+    fn sanitize_collapses_runs_of_dashes() {
+        // Multiple spaces in a row should produce one dash, not many.
+        assert_eq!(
+            sanitize_letta_tag("foo    bar").as_deref(),
+            Some("foo-bar")
+        );
+        // Literal `--` in input also collapses (documented behaviour).
+        assert_eq!(
+            sanitize_letta_tag("foo--bar").as_deref(),
+            Some("foo-bar")
+        );
+    }
+
+    #[test]
+    fn sanitize_collapses_repeated_slashes() {
+        assert_eq!(
+            sanitize_letta_tag("foo//bar///baz").as_deref(),
+            Some("foo/bar/baz")
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_outer_dashes_from_whitespace_input() {
+        // Whitespace-only input would otherwise become a literal `-` tag.
+        assert_eq!(sanitize_letta_tag("   "), None);
+        assert_eq!(sanitize_letta_tag(" foo "), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn sanitize_returns_none_for_empty_input() {
+        assert_eq!(sanitize_letta_tag(""), None);
+    }
+
+    #[test]
+    fn sanitize_returns_none_for_unsalvageable_input() {
+        // Nothing in the allowed character set survives.
+        assert_eq!(sanitize_letta_tag("!!!"), None);
+        assert_eq!(sanitize_letta_tag("漢字"), None);
+    }
+
+    #[test]
+    fn sanitize_respects_max_tag_depth() {
+        // 9 segments should fail normalize_tag's depth check and return None.
+        let too_deep = (1..=9).map(|i| i.to_string()).collect::<Vec<_>>().join("/");
+        assert_eq!(sanitize_letta_tag(&too_deep), None);
+        // 8 segments should pass.
+        let just_ok = (1..=8).map(|i| i.to_string()).collect::<Vec<_>>().join("/");
+        assert!(sanitize_letta_tag(&just_ok).is_some());
     }
 
     // --- Core memory tests ---

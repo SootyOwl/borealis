@@ -65,10 +65,18 @@ pub struct BotConfig {
     /// Maximum number of concurrent LLM API calls (default: 4).
     #[serde(default = "default_max_concurrent_llm")]
     pub max_concurrent_llm: usize,
+    /// Maximum tokens the model may generate per response (default: 1024).
+    /// Responses that hit this limit are marked as truncated.
+    #[serde(default = "default_max_response_tokens")]
+    pub max_response_tokens: usize,
 }
 
 fn default_max_concurrent_llm() -> usize {
     4
+}
+
+fn default_max_response_tokens() -> usize {
+    1024
 }
 
 fn default_system_prompt_path() -> PathBuf {
@@ -144,6 +152,9 @@ pub struct ProviderEntry {
     pub max_retries: u32,
     #[serde(default = "default_max_history_tokens")]
     pub max_history_tokens: usize,
+    /// Sampling temperature for this provider (default: 0.7).
+    #[serde(default = "default_temperature")]
+    pub temperature: Option<f32>,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -156,6 +167,10 @@ fn default_max_retries() -> u32 {
 
 fn default_max_history_tokens() -> usize {
     8192
+}
+
+fn default_temperature() -> Option<f32> {
+    Some(0.7)
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +524,24 @@ impl Settings {
             return Err(ConfigError::Validation(
                 "bot.max_concurrent_llm must be > 0".into(),
             ));
+        }
+        if self.bot.max_response_tokens == 0 {
+            return Err(ConfigError::Validation(
+                "bot.max_response_tokens must be > 0".into(),
+            ));
+        }
+        let provider_entries = [
+            ("anthropic", self.providers.anthropic.as_ref()),
+            ("openai", self.providers.openai.as_ref()),
+        ];
+        for (name, entry) in provider_entries {
+            if let Some(t) = entry.and_then(|e| e.temperature)
+                && !(0.0..=2.0).contains(&t)
+            {
+                return Err(ConfigError::Validation(format!(
+                    "providers.{name}.temperature must be between 0.0 and 2.0, got {t}"
+                )));
+            }
         }
         if self.rate_limit.per_user.refill_secs == 0 {
             return Err(ConfigError::Validation(

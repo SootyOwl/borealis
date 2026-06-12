@@ -160,6 +160,19 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Sentinel key used in [`ToolCall::arguments`] when a provider returned tool
+/// arguments that were not valid JSON (common with local models).
+///
+/// The registry short-circuits such calls into an `is_error` tool result that
+/// names the problem and echoes the raw string, so the model can see and
+/// correct its mistake instead of a tool silently running with `{}`.
+pub const MALFORMED_ARGS_KEY: &str = "__malformed_tool_arguments__";
+
+/// Wrap a raw, unparseable argument string in the malformed-arguments sentinel.
+pub fn malformed_arguments(raw: &str) -> serde_json::Value {
+    serde_json::json!({ MALFORMED_ARGS_KEY: raw })
+}
+
 /// Result of executing a tool.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolResult {
@@ -258,6 +271,24 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult {
+        // Provider flagged the arguments as unparseable JSON — return an
+        // error result instead of running the tool with bogus arguments.
+        if let Some(raw) = call
+            .arguments
+            .get(MALFORMED_ARGS_KEY)
+            .and_then(|v| v.as_str())
+        {
+            return ToolResult {
+                call_id: call.id.clone(),
+                content: serde_json::json!({
+                    "error": format!(
+                        "invalid JSON in tool call arguments: {raw}"
+                    )
+                }),
+                is_error: true,
+            };
+        }
+
         match self.handlers.get(&call.name) {
             Some(handler) => handler.execute_boxed(call.arguments.clone(), ctx).await,
             None => ToolResult {
@@ -350,6 +381,37 @@ mod tests {
         let result = registry.execute(&call, &ctx).await;
         assert!(!result.is_error);
         assert_eq!(result.content, serde_json::json!({"text": "hello"}));
+    }
+
+    #[tokio::test]
+    async fn registry_execute_malformed_arguments_returns_error_result() {
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "echo".to_string(),
+            arguments: malformed_arguments(r#"{"text": "hello"#),
+        };
+        let ctx = ToolContext {
+            call_id: "call_1".to_string(),
+            author_id: "user1".to_string(),
+            conversation_id: "conv1".to_string(),
+            channel_source: "cli".to_string(),
+        };
+
+        let result = registry.execute(&call, &ctx).await;
+        assert!(result.is_error);
+        assert_eq!(result.call_id, "call_1");
+        let err = result.content["error"].as_str().unwrap();
+        assert!(
+            err.contains("invalid JSON"),
+            "error should mention invalid JSON: {err}"
+        );
+        assert!(
+            err.contains(r#"{"text": "hello"#),
+            "error should include the raw arguments: {err}"
+        );
     }
 
     #[tokio::test]

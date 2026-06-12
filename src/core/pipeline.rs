@@ -16,13 +16,18 @@ use crate::history::compaction::{CompactionService, CompactionState};
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
 use crate::providers::retry::RetryError;
-use crate::providers::{Provider, RequestConfig};
+use crate::providers::{Provider, RequestConfig, StopReason};
 use crate::security::{AuthorizationResult, Security};
 use crate::tools::{ToolContext, ToolRegistry, ToolResult};
 use crate::types::{ChatMessage, ConversationId, ConversationMode, estimate_tokens};
 
 /// Maximum number of tool-call → LLM round-trips before we stop looping.
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Marker appended to responses that hit the max output token limit, so
+/// neither the user nor the persisted history mistakes a truncated response
+/// for a complete turn.
+const TRUNCATION_MARKER: &str = "[response truncated: hit max output tokens]";
 
 /// Object-safe trait for processing inbound events.
 /// This wraps the generic `Pipeline<P>` so we can use `dyn PipelineRunner` in main.
@@ -293,7 +298,7 @@ impl<P: Provider + 'static> Pipeline<P> {
 
         // Tool execution loop.
         let mut iterations = 0;
-        let response = loop {
+        let mut response = loop {
             debug!(
                 message_count = provider_messages.len(),
                 iteration = iterations,
@@ -449,6 +454,23 @@ impl<P: Provider + 'static> Pipeline<P> {
 
             iterations += 1;
         };
+
+        // The response was cut off mid-generation by the output token limit.
+        // Mark it visibly so neither the user nor the persisted history
+        // mistakes it for a complete turn.
+        if response.stop_reason == StopReason::MaxTokens {
+            warn!(
+                max_response_tokens = ?self.pipeline_config.max_response_tokens,
+                "LLM response hit max output tokens; appending truncation marker"
+            );
+            match response.text.as_mut() {
+                Some(text) => {
+                    text.push_str("\n\n");
+                    text.push_str(TRUNCATION_MARKER);
+                }
+                None => response.text = Some(TRUNCATION_MARKER.to_string()),
+            }
+        }
 
         // Persist the final assistant response to history.
         // Only persist if the loop exited because tool_calls was empty (normal exit).
@@ -771,7 +793,7 @@ mod tests {
         Author, ChannelSource, ConversationId, InEvent, Message, MessageContext, MessageId,
     };
     use crate::core::observer::ObserverRegistry;
-    use crate::providers::{LlmResponse, TokenUsage};
+    use crate::providers::{LlmResponse, StopReason, TokenUsage};
     use crate::tools::{ToolCall, ToolDef};
     use crate::security::Security;
     use std::sync::Mutex;
@@ -814,6 +836,7 @@ mod tests {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: TokenUsage::default(),
+                    stop_reason: StopReason::EndTurn,
                 })
             } else {
                 Ok(responses.remove(0))
@@ -921,6 +944,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                 },
+                stop_reason: StopReason::ToolUse,
             },
             LlmResponse {
                 text: Some("I was denied.".into()),
@@ -929,6 +953,7 @@ mod tests {
                     input_tokens: 20,
                     output_tokens: 10,
                 },
+                stop_reason: StopReason::EndTurn,
             },
         ];
 
@@ -958,6 +983,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                 },
+                stop_reason: StopReason::ToolUse,
             },
             LlmResponse {
                 text: Some("Done.".into()),
@@ -966,6 +992,7 @@ mod tests {
                     input_tokens: 20,
                     output_tokens: 10,
                 },
+                stop_reason: StopReason::EndTurn,
             },
         ];
 
@@ -993,6 +1020,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                 },
+                stop_reason: StopReason::ToolUse,
             },
             LlmResponse {
                 text: Some("System done.".into()),
@@ -1001,6 +1029,7 @@ mod tests {
                     input_tokens: 20,
                     output_tokens: 10,
                 },
+                stop_reason: StopReason::EndTurn,
             },
         ];
 
@@ -1056,6 +1085,7 @@ mod tests {
                 text: Some("ok".into()),
                 tool_calls: vec![],
                 usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
             })
         }
 
@@ -1205,6 +1235,7 @@ mod tests {
                 text: Some("recovered".into()),
                 tool_calls: vec![],
                 usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
             })
         }
 
@@ -1339,6 +1370,84 @@ mod tests {
         assert!(
             !second_call.iter().any(|m| m.content.contains("PERSONA_VERSION_ONE")),
             "second invocation must NOT carry the stale PERSONA_VERSION_ONE content",
+        );
+
+        let _ = std::fs::remove_file(&tmp_persona);
+    }
+
+    #[tokio::test]
+    async fn max_tokens_response_is_marked_truncated_and_persisted_with_marker() {
+        // Build a pipeline keeping a handle on the history store so we can
+        // verify what gets persisted.
+        let truncated = LlmResponse {
+            text: Some("This reply was cut off mid-sen".into()),
+            tool_calls: vec![],
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 1024,
+            },
+            stop_reason: StopReason::MaxTokens,
+        };
+        let provider = Arc::new(MockProvider::new(vec![truncated]));
+
+        let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
+                .unwrap();
+        }
+        crate::history::schema::initialize(&db.lock().unwrap()).unwrap();
+        let history_store = Arc::new(crate::history::store::HistoryStore::new(Arc::clone(&db)));
+
+        let tmp_persona = std::env::temp_dir().join("borealis_test_trunc_core.md");
+        std::fs::write(&tmp_persona, "test persona").unwrap();
+        let memory_store: Arc<dyn crate::memory::Memory> = Arc::new(
+            crate::memory::SqliteMemory::new(Arc::clone(&db), tmp_persona.clone()).unwrap(),
+        );
+
+        let deps = PipelineDeps {
+            history_store: Arc::clone(&history_store),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            memory_store,
+            security: make_test_security(),
+            observers: Arc::new(ObserverRegistry::new()),
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction_state: Arc::new(crate::history::compaction::CompactionState::new()),
+            pipeline_config: PipelineConfig::default(),
+            llm_semaphore: Arc::new(Semaphore::new(4)),
+        };
+
+        let sys_path = std::path::Path::new("/nonexistent/system_prompt.md");
+        let pipeline = Pipeline::new(provider, sys_path, &tmp_persona, deps).unwrap();
+
+        let event = make_test_event(ChannelSource::Cli, "trunc_user");
+        let result = pipeline.process_impl(&event).await.unwrap();
+
+        // The delivered text carries the visible truncation marker.
+        let text = result.text.expect("response text");
+        assert!(text.starts_with("This reply was cut off mid-sen"));
+        assert!(
+            text.contains("[response truncated: hit max output tokens]"),
+            "delivered text should carry the truncation marker: {text}"
+        );
+
+        // The persisted assistant turn also carries the marker, so history
+        // doesn't record the truncated reply as a clean turn.
+        let conv_id = crate::core::event::ConversationId::Dm {
+            channel_type: ChannelSource::Cli,
+            user_id: "trunc_user".into(),
+        };
+        let messages = history_store.load_messages(&conv_id).unwrap();
+        let assistant = messages
+            .iter()
+            .find(|m| m.role == crate::types::Role::Assistant)
+            .expect("assistant message persisted");
+        assert!(
+            assistant
+                .content
+                .contains("[response truncated: hit max output tokens]"),
+            "persisted assistant message should carry the marker: {}",
+            assistant.content
         );
 
         let _ = std::fs::remove_file(&tmp_persona);

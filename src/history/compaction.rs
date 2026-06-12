@@ -314,6 +314,7 @@ mod tests {
                 text: Some(self.response_text.clone()),
                 tool_calls: vec![],
                 usage: TokenUsage::default(),
+                stop_reason: crate::providers::StopReason::EndTurn,
             })
         }
 

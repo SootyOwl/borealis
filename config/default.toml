@@ -17,6 +17,8 @@
 name = "Aurora"                                # Display name for the bot
 system_prompt_path = "config/system_prompt.md" # Path to system prompt (loaded at startup)
 core_persona_path = "memory/core.md"           # Aurora's self-knowledge file (editable by Aurora)
+max_response_tokens = 1024                     # Max tokens per LLM response; replies that hit this
+                                               # limit are visibly marked as truncated
 
 [bot.compaction]
 enabled = true                                 # Automatically summarize old conversation history
@@ -42,6 +44,7 @@ summary_prompt_path = "config/compaction_prompt.md"
 # timeout_secs = 60
 # max_retries = 3
 # max_history_tokens = 8192
+# temperature = 0.7                            # sampling temperature (defaults to 0.7 if omitted)
 
 # OpenAI-compatible — works with Ollama, OpenAI, OpenRouter, etc.
 # This default config points at a local Ollama instance (no API key needed).
@@ -52,6 +55,7 @@ model = "llama3"
 timeout_secs = 60
 max_retries = 3
 max_history_tokens = 4096
+temperature = 0.7                              # sampling temperature (defaults to 0.7 if omitted)
 
 # ---------------------------------------------------------------------------
 # Channel adapters

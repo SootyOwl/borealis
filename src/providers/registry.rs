@@ -24,6 +24,8 @@ pub struct ResolvedProvider {
     pub config: ProviderConfig,
     /// Maximum tokens the model supports for history.
     pub max_history_tokens: usize,
+    /// Sampling temperature for this provider (None = use the API default).
+    pub temperature: Option<f32>,
 }
 
 /// Resolve a `ProviderEntry` from config into a `ResolvedProvider`.
@@ -48,6 +50,7 @@ fn resolve_entry(name: &str, entry: &ProviderEntry) -> ResolvedProvider {
             max_retries: entry.max_retries,
         },
         max_history_tokens: entry.max_history_tokens,
+        temperature: entry.temperature,
     }
 }
 
@@ -148,8 +151,8 @@ pub fn build_pipeline(
     let pipeline_config = crate::core::pipeline::PipelineConfig {
         model_max_tokens: resolved.max_history_tokens,
         response_reserve: 1024,
-        temperature: Some(0.7),
-        max_response_tokens: Some(1024),
+        temperature: resolved.temperature,
+        max_response_tokens: Some(settings.bot.max_response_tokens),
     };
 
     let llm_semaphore = Arc::new(Semaphore::new(settings.bot.max_concurrent_llm));
@@ -182,6 +185,7 @@ mod tests {
                 core_persona_path: "memory/core.md".into(),
                 compaction: CompactionConfig::default(),
                 max_concurrent_llm: 4,
+                max_response_tokens: 1024,
             },
             providers: ProvidersConfig {
                 anthropic: Some(ProviderEntry {
@@ -191,6 +195,7 @@ mod tests {
                     timeout_secs: 60,
                     max_retries: 3,
                     max_history_tokens: 8192,
+                    temperature: Some(0.7),
                 }),
                 openai: Some(ProviderEntry {
                     base_url: "http://localhost:11434/v1".into(),
@@ -199,6 +204,7 @@ mod tests {
                     timeout_secs: 60,
                     max_retries: 3,
                     max_history_tokens: 4096,
+                    temperature: Some(0.3),
                 }),
             },
             channels: ChannelsConfig::default(),
@@ -279,8 +285,39 @@ mod tests {
             timeout_secs: 30,
             max_retries: 2,
             max_history_tokens: 2048,
+            temperature: Some(0.7),
         };
         let resolved = resolve_entry("test", &entry);
         assert_eq!(resolved.config.api_key, "");
+    }
+
+    #[test]
+    fn resolve_entry_carries_temperature() {
+        let entry = ProviderEntry {
+            base_url: "http://localhost".into(),
+            model: "test".into(),
+            api_key_env: None,
+            timeout_secs: 30,
+            max_retries: 2,
+            max_history_tokens: 2048,
+            temperature: Some(0.2),
+        };
+        let resolved = resolve_entry("test", &entry);
+        assert_eq!(resolved.temperature, Some(0.2));
+
+        let entry_none = ProviderEntry {
+            temperature: None,
+            ..entry
+        };
+        let resolved_none = resolve_entry("test", &entry_none);
+        assert_eq!(resolved_none.temperature, None);
+    }
+
+    #[test]
+    fn resolved_providers_carry_per_provider_temperature() {
+        let settings = make_settings_both();
+        let providers = resolve_configured_providers(&settings);
+        assert_eq!(providers[0].temperature, Some(0.7));
+        assert_eq!(providers[1].temperature, Some(0.3));
     }
 }

@@ -84,6 +84,7 @@ fn full_flow_store_and_assemble() {
         "Helpful assistant.",
         &included_turns,
         &[],
+        None,
     );
 
     // [0] system, [1..=4] history
@@ -243,7 +244,7 @@ fn four_hundred_recovery_drops_to_minimal() {
 
     // --- (b) Second 400: only the very last turn ---
     let last_turn = &turns[turns.len() - 1];
-    let prompt = budget_a.assemble("SYS", "PERSONA", std::slice::from_ref(last_turn), &[]);
+    let prompt = budget_a.assemble("SYS", "PERSONA", std::slice::from_ref(last_turn), &[], None);
 
     // system + last turn's 2 messages = 3 total
     assert_eq!(prompt.len(), 3);

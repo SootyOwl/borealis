@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use rusqlite::params;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::types::{
@@ -23,8 +24,6 @@ pub enum StoreError {
     ConversationId(#[from] ConversationIdError),
     #[error("parse error: {0}")]
     Parse(#[from] ParseError),
-    #[error("lock poisoned")]
-    LockPoisoned,
 }
 
 // ---------------------------------------------------------------------------
@@ -69,8 +68,16 @@ impl HistoryStore {
     }
 
     /// Acquire the database connection, recovering from mutex poisoning.
-    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, StoreError> {
-        self.conn.lock().map_err(|_| StoreError::LockPoisoned)
+    ///
+    /// A panic while holding the lock poisons the mutex, but the SQLite
+    /// connection state itself is sound across a Rust panic (statement-level
+    /// rollback applies), so we recover the guard rather than permanently
+    /// bricking every store that shares this connection.
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap_or_else(|poisoned| {
+            warn!("history store connection mutex was poisoned by a panic; recovering");
+            poisoned.into_inner()
+        })
     }
 
     /// INSERT OR UPDATE a conversation record (upsert).
@@ -82,7 +89,7 @@ impl HistoryStore {
         id: &ConversationId,
         mode: ConversationMode,
     ) -> Result<(), StoreError> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO conversations (id, mode, created_at, last_active_at)
@@ -131,7 +138,7 @@ impl HistoryStore {
         let now = Utc::now().to_rfc3339();
         let conv_id_str = conversation_id.to_string();
 
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
 
         // Monotonic sequence number per conversation for stable ordering.
         let next_seq: i64 = conn.query_row(
@@ -173,16 +180,30 @@ impl HistoryStore {
         &self,
         conversation_id: &ConversationId,
     ) -> Result<Vec<StoredMessage>, StoreError> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
+        // seq starts at 1, so `after_seq = 0` returns every message.
+        Self::query_messages_after(&conn, conversation_id, 0)
+    }
+
+    /// Query messages with seq > `after_seq` using an already-held connection.
+    ///
+    /// Shared by [`load_messages`](Self::load_messages) and
+    /// [`load_summary_and_messages`](Self::load_summary_and_messages) so the
+    /// combined read can run under a single lock acquisition.
+    fn query_messages_after(
+        conn: &rusqlite::Connection,
+        conversation_id: &ConversationId,
+        after_seq: i64,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, turn_id, seq, role, content,
                     tool_call_id, tool_calls, token_estimate, created_at
              FROM messages
-             WHERE conversation_id = ?1
+             WHERE conversation_id = ?1 AND seq > ?2
              ORDER BY seq ASC",
         )?;
 
-        let rows = stmt.query_map(params![conversation_id.to_string()], |row| {
+        let rows = stmt.query_map(params![conversation_id.to_string(), after_seq], |row| {
             let seq: i64 = row.get(3)?;
             let role_str: String = row.get(4)?;
             let tool_calls_json: Option<String> = row.get(7)?;
@@ -267,7 +288,7 @@ impl HistoryStore {
         &self,
         conversation_id: &ConversationId,
     ) -> Result<Vec<TurnSummary>, StoreError> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT turn_id,
                     SUM(token_estimate),
@@ -306,7 +327,7 @@ impl HistoryStore {
         conversation_id: &ConversationId,
         turn_id: &str,
     ) -> Result<usize, StoreError> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         let deleted = conn.execute(
             "DELETE FROM messages WHERE conversation_id = ?1 AND turn_id = ?2",
             params![conversation_id.to_string(), turn_id],
@@ -319,7 +340,7 @@ impl HistoryStore {
         &self,
         conversation_id: &ConversationId,
     ) -> Result<usize, StoreError> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         let total: i64 = conn.query_row(
             "SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE conversation_id = ?1",
             params![conversation_id.to_string()],
@@ -361,7 +382,24 @@ impl HistoryStore {
         compacted_up_to: i64,
         token_estimate: usize,
     ) -> Result<(), StoreError> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
+        Self::upsert_summary(
+            &conn,
+            conversation_id,
+            summary_text,
+            compacted_up_to,
+            token_estimate,
+        )
+    }
+
+    /// Upsert the summary row using an already-held connection.
+    fn upsert_summary(
+        conn: &rusqlite::Connection,
+        conversation_id: &ConversationId,
+        summary_text: &str,
+        compacted_up_to: i64,
+        token_estimate: usize,
+    ) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO conversation_summaries
@@ -388,7 +426,15 @@ impl HistoryStore {
         &self,
         conversation_id: &ConversationId,
     ) -> Result<Option<CompactionSummary>, StoreError> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
+        Self::query_summary(&conn, conversation_id)
+    }
+
+    /// Query the summary row using an already-held connection.
+    fn query_summary(
+        conn: &rusqlite::Connection,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<CompactionSummary>, StoreError> {
         let mut stmt = conn.prepare(
             "SELECT conversation_id, summary_text, compacted_up_to, token_estimate, created_at
              FROM conversation_summaries
@@ -410,103 +456,57 @@ impl HistoryStore {
         }
     }
 
-    /// Delete all messages with seq <= `up_to_seq` for a conversation.
+    /// Atomically commit a compaction pass: save (or replace) the summary AND
+    /// delete the compacted messages in a single transaction under a single
+    /// lock acquisition.
     ///
-    /// Used after compaction to remove messages that are now represented
-    /// by the summary. Returns the number of deleted rows.
-    pub fn delete_messages_up_to(
+    /// Using one transaction prevents concurrent readers from observing the
+    /// new summary without the matching deletion (or vice versa), which would
+    /// silently drop or duplicate context in prompt assembly.
+    ///
+    /// Returns the number of deleted message rows.
+    pub fn commit_compaction(
         &self,
         conversation_id: &ConversationId,
-        up_to_seq: i64,
+        summary_text: &str,
+        compacted_up_to: i64,
+        token_estimate: usize,
     ) -> Result<usize, StoreError> {
-        let conn = self.lock_conn()?;
-        let deleted = conn.execute(
-            "DELETE FROM messages WHERE conversation_id = ?1 AND seq <= ?2",
-            params![conversation_id.to_string(), up_to_seq],
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        Self::upsert_summary(
+            &tx,
+            conversation_id,
+            summary_text,
+            compacted_up_to,
+            token_estimate,
         )?;
+        let deleted = tx.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1 AND seq <= ?2",
+            params![conversation_id.to_string(), compacted_up_to],
+        )?;
+        tx.commit()?;
         Ok(deleted)
     }
 
-    /// Load messages with seq > `after_seq` for a conversation, ordered ASC.
-    ///
-    /// Used to load only messages after the compaction point.
-    pub fn load_messages_after(
+    /// Load the compaction summary (if any) and the messages after its
+    /// boundary in ONE lock acquisition, so the pair is always mutually
+    /// consistent even while a concurrent compaction commits.
+    pub fn load_summary_and_messages(
         &self,
         conversation_id: &ConversationId,
-        after_seq: i64,
-    ) -> Result<Vec<StoredMessage>, StoreError> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, turn_id, seq, role, content,
-                    tool_call_id, tool_calls, token_estimate, created_at
-             FROM messages
-             WHERE conversation_id = ?1 AND seq > ?2
-             ORDER BY seq ASC",
-        )?;
-
-        let rows = stmt.query_map(params![conversation_id.to_string(), after_seq], |row| {
-            let seq: i64 = row.get(3)?;
-            let role_str: String = row.get(4)?;
-            let tool_calls_json: Option<String> = row.get(7)?;
-            let token_estimate_i64: i64 = row.get(8)?;
-
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                seq,
-                role_str,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                tool_calls_json,
-                token_estimate_i64,
-                row.get::<_, String>(9)?,
-            ))
-        })?;
-
-        let mut messages = Vec::new();
-        for row_result in rows {
-            let (
-                id,
-                conv_id,
-                turn_id,
-                seq,
-                role_str,
-                content,
-                tool_call_id,
-                tool_calls_json,
-                token_i64,
-                created_at,
-            ) = row_result?;
-
-            let role = Role::from_str(&role_str)?;
-
-            let tool_calls: Vec<ToolCall> = match tool_calls_json {
-                None => vec![],
-                Some(json) => serde_json::from_str(&json)
-                    .map_err(|e| StoreError::InvalidData(e.to_string()))?,
-            };
-
-            messages.push(StoredMessage {
-                id,
-                conversation_id: conv_id,
-                turn_id,
-                seq,
-                role,
-                content,
-                tool_call_id,
-                tool_calls,
-                token_estimate: token_i64 as usize,
-                created_at,
-            });
-        }
-
-        Ok(messages)
+    ) -> Result<(Option<CompactionSummary>, Vec<StoredMessage>), StoreError> {
+        let conn = self.lock_conn();
+        let summary = Self::query_summary(&conn, conversation_id)?;
+        // seq starts at 1, so a missing summary (`after_seq = 0`) loads all.
+        let after_seq = summary.as_ref().map_or(0, |s| s.compacted_up_to);
+        let messages = Self::query_messages_after(&conn, conversation_id, after_seq)?;
+        Ok((summary, messages))
     }
 
     /// Return the maximum seq number for a conversation, or None if empty.
     pub fn max_seq(&self, conversation_id: &ConversationId) -> Result<Option<i64>, StoreError> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         let max: Option<i64> = conn.query_row(
             "SELECT MAX(seq) FROM messages WHERE conversation_id = ?1",
             params![conversation_id.to_string()],
@@ -556,15 +556,12 @@ impl HistoryStore {
         hours: u32,
         channel: Option<&str>,
     ) -> Result<Vec<RecentConversation>, StoreError> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         let cutoff = Utc::now() - chrono::Duration::hours(i64::from(hours));
         let cutoff_str = cutoff.to_rfc3339();
 
         // Build channel filter dynamically, escaping LIKE wildcards.
-        let channel_pattern = channel.map(|c| {
-            let escaped = c.replace('%', "\\%").replace('_', "\\_");
-            format!("%{escaped}%")
-        });
+        let channel_pattern = channel.map(|c| format!("%{}%", escape_like(c)));
 
         let sql = "\
             SELECT conversation_id,
@@ -622,23 +619,13 @@ impl HistoryStore {
                 )
                 .ok();
 
-            // Truncate previews to 200 chars (safe for multi-byte UTF-8).
-            let truncate = |s: String| -> String {
-                if s.len() > 200 {
-                    let end = (0..=200).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
-                    format!("{}…", &s[..end])
-                } else {
-                    s
-                }
-            };
-
             results.push(RecentConversation {
                 conversation_id: conv_id,
                 message_count: msg_count,
                 earliest,
                 latest,
-                first_preview: truncate(first_preview),
-                last_preview: truncate(last_preview),
+                first_preview: truncate_chars(&first_preview, 200),
+                last_preview: truncate_chars(&last_preview, 200),
                 summary,
             });
         }
@@ -654,9 +641,8 @@ impl HistoryStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<MessageSearchResult>, StoreError> {
-        let conn = self.lock_conn()?;
-        let escaped = query.replace('%', "\\%").replace('_', "\\_");
-        let pattern = format!("%{escaped}%");
+        let conn = self.lock_conn();
+        let pattern = format!("%{}%", escape_like(query));
 
         let mut stmt = conn.prepare(
             "SELECT conversation_id, role, content, created_at
@@ -678,21 +664,33 @@ impl HistoryStore {
         let mut results = Vec::new();
         for row_result in rows {
             let (conv_id, role, content, created_at) = row_result?;
-            let truncated = if content.len() > 200 {
-                let end = (0..=200).rev().find(|&i| content.is_char_boundary(i)).unwrap_or(0);
-                format!("{}…", &content[..end])
-            } else {
-                content
-            };
             results.push(MessageSearchResult {
                 conversation_id: conv_id,
                 role,
-                content: truncated,
+                content: truncate_chars(&content, 200),
                 created_at,
             });
         }
 
         Ok(results)
+    }
+}
+
+/// Escape LIKE wildcards. Backslash MUST be escaped first, before % and _,
+/// so the escaping backslashes it introduces are not themselves re-escaped.
+/// Pairs with `ESCAPE '\'` in the query.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary, appending an
+/// ellipsis when truncation occurs. Safe for multi-byte UTF-8 content.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.len() > max {
+        let end = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+        format!("{}…", &s[..end])
+    } else {
+        s.to_string()
     }
 }
 
@@ -961,6 +959,92 @@ mod tests {
         // Each message: estimate_tokens(content)
         let expected = estimate_tokens("aaaa") + estimate_tokens("bbbbbbbb");
         assert_eq!(total, expected);
+    }
+
+    // --- LIKE escaping (STORE-1) ---
+
+    #[test]
+    fn search_messages_matches_literal_backslash() {
+        let store = make_store();
+        let id = test_conv_id();
+        store
+            .ensure_conversation(&id, ConversationMode::Shared)
+            .unwrap();
+
+        store
+            .append_message(&id, &ChatMessage::user(r"the path is C:\Users\tyto"), None)
+            .unwrap();
+        // Decoy: same text minus the backslashes. If the backslash is not
+        // escaped, `\U` in the pattern collapses to a literal `U` and this
+        // message matches instead.
+        store
+            .append_message(&id, &ChatMessage::user("the path is C:Userstyto"), None)
+            .unwrap();
+
+        let results = store.search_messages(r"C:\Users", 10).unwrap();
+        assert_eq!(results.len(), 1, "backslash should match literally");
+        assert!(
+            results[0].content.contains(r"C:\Users"),
+            "matched the wrong message: {}",
+            results[0].content
+        );
+    }
+
+    #[test]
+    fn recent_conversations_channel_filter_matches_literal_backslash() {
+        let store = make_store();
+        let id = ConversationId::Dm {
+            channel_type: ChannelSource::Cli,
+            user_id: r"alice\backslash".to_string(),
+        };
+        store
+            .ensure_conversation(&id, ConversationMode::Shared)
+            .unwrap();
+        store
+            .append_message(&id, &ChatMessage::user("hi"), None)
+            .unwrap();
+
+        let results = store
+            .recent_conversations(24, Some(r"alice\backslash"))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "channel filter containing a backslash should match literally"
+        );
+    }
+
+    // --- Mutex poisoning recovery (STORE-2) ---
+
+    #[test]
+    fn store_recovers_from_poisoned_mutex() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        schema::initialize(&conn.lock().unwrap()).expect("schema init");
+        let store = HistoryStore::new(Arc::clone(&conn));
+        let id = test_conv_id();
+        store
+            .ensure_conversation(&id, ConversationMode::Shared)
+            .unwrap();
+
+        // Poison the mutex by panicking while holding the lock.
+        let poisoner = Arc::clone(&conn);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the shared connection mutex");
+        })
+        .join();
+        assert!(conn.is_poisoned(), "mutex should be poisoned");
+
+        // The store must keep working: SQLite connection state is sound
+        // across a Rust panic (statement-level rollback applies).
+        store
+            .append_message(&id, &ChatMessage::user("after poison"), None)
+            .expect("store should recover from a poisoned mutex");
+        let messages = store.load_messages(&id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "after poison");
     }
 
     // --- StoredMessage::to_chat_message ---

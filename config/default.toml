@@ -116,15 +116,22 @@ refill_secs = 2                                # 1 token per 2s = 30 msg/min sus
 # Tools — Computer Use
 # ---------------------------------------------------------------------------
 # Give Aurora access to the filesystem and shell.
-# The sandbox restricts where file tools can read/write.
+# The sandbox restricts where the file_* tools can read/write.
 # Memory is managed separately via memory_* tools — the sandbox doesn't need
 # to know about the memory directory.
+#
+# SECURITY: bash_exec is NOT confined by sandbox_root. The sandbox root is
+# only the working directory of spawned commands — absolute paths (or `cd`)
+# escape it entirely, and the allowlist checks only the base command name.
+# The real boundary is the authorization layer: bash_exec and file_write are
+# restricted tools, callable only by users in rate_limit.allowed_users.
 
 [tools.computer_use]
 enabled = true
-sandbox_root = "."                             # file tools are restricted to this directory
-command_allowlist = []                         # empty = all commands allowed; e.g. ["ls", "cat", "grep"]
+sandbox_root = "."                             # file_* tools are restricted to this directory (bash_exec is NOT — see note above)
+command_allowlist = []                         # empty = all commands allowed; e.g. ["ls", "cat", "grep"] — checks the base command only, not file paths
 command_timeout_secs = 30                      # kill commands that run longer than this
+max_output_bytes = 65536                       # cap captured output (bash stdout/stderr, file_read) — truncated with a marker
 # excluded_paths = ["secrets/", ".env"]        # (future) additional paths to block
 
 # ---------------------------------------------------------------------------
@@ -138,6 +145,16 @@ command_timeout_secs = 30                      # kill commands that run longer t
 enabled = true
 jina_api_key_env = "JINA_API_KEY"              # env var holding Jina API key
 max_fetch_bytes = 51200                        # 50 KiB max response size (prevents context blowup)
+
+# ---------------------------------------------------------------------------
+# Tools — Channel
+# ---------------------------------------------------------------------------
+# Discord interaction tools: react, send_message, send_file.
+# These are restricted tools — only users in rate_limit.allowed_users can
+# trigger them. Disable entirely if Aurora shouldn't proactively send.
+
+[tools.channel]
+enabled = true
 
 # ---------------------------------------------------------------------------
 # Scheduler

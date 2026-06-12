@@ -1,3 +1,22 @@
+//! Computer-use tools: shell execution and sandboxed file access.
+//!
+//! # Security model — read before trusting the "sandbox"
+//!
+//! `bash_exec` is **not** filesystem-confined. The sandbox root is only the
+//! child process's working directory: commands can use absolute paths (or
+//! `cd`) to read and write anywhere the bot's OS user can. The optional
+//! command allowlist checks only the base command name (plus a shell
+//! metacharacter rejection) — it does not constrain file paths or what an
+//! allowlisted binary does. There is no OS-level confinement.
+//!
+//! The real security boundary is the authorization layer: `bash_exec` and
+//! `file_write` are part of [`crate::security::RESTRICTED_TOOLS`], so only
+//! users on the authorized allowlist can trigger them. Treat anyone on that
+//! allowlist as having shell access as the bot's OS user.
+//!
+//! The file tools (`file_read`, `file_write`, `file_list`) *are* path-validated
+//! against the sandbox root, with the memory/ directory excluded.
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,10 +51,33 @@ inventory::submit! {
 /// Prevents leaking API keys (ANTHROPIC_API_KEY, etc.) to child processes.
 const SAFE_ENV_VARS: &[&str] = &["PATH", "HOME", "LANG", "TERM", "USER", "SHELL"];
 
+/// Marker appended to tool output that was cut at the configured byte limit.
+const TRUNCATION_MARKER: &str = "\n[output truncated]";
+
+/// Maximum number of entries returned by `file_list` (recursive or not).
+const MAX_FILE_LIST_ENTRIES: usize = 1000;
+
+/// Truncate `s` to at most `max_bytes` bytes, backing off to the nearest
+/// char boundary, and append [`TRUNCATION_MARKER`] if anything was cut.
+/// Callers must lossy-convert non-UTF8 bytes to a `String` first.
+fn truncate_with_marker(mut s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str(TRUNCATION_MARKER);
+    s
+}
+
 /// Register all 4 computer use tools into the given registry.
 ///
-/// `bash_exec` and `file_write` are registered as restricted tools via `Security`
-/// at the call site — not here, to keep this module decoupled from authorization.
+/// Authorization is not handled here (this module stays decoupled from it):
+/// `bash_exec` and `file_write` are part of [`crate::security::RESTRICTED_TOOLS`],
+/// which main.rs registers via `Security::register_default_restricted()` at startup.
 pub fn register_computer_tools(
     registry: &mut ToolRegistry,
     sandbox: Arc<Sandbox>,
@@ -54,9 +96,11 @@ pub fn register_computer_tools(
         sandbox: Arc::clone(&sandbox),
         command_allowlist: allowlist,
         timeout,
+        max_output_bytes: config.max_output_bytes,
     }, ToolGroup::Computer);
     registry.register_with_group(FileRead {
         sandbox: Arc::clone(&sandbox),
+        max_output_bytes: config.max_output_bytes,
     }, ToolGroup::Computer);
     registry.register_with_group(FileWrite {
         sandbox: Arc::clone(&sandbox),
@@ -74,6 +118,7 @@ struct BashExec {
     sandbox: Arc<Sandbox>,
     command_allowlist: Option<Arc<[String]>>,
     timeout: Duration,
+    max_output_bytes: usize,
 }
 
 impl Tool for BashExec {
@@ -84,8 +129,9 @@ impl Tool for BashExec {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "bash_exec".to_string(),
-            description: "Execute a shell command within the sandbox. Returns stdout, stderr, \
-                          and exit code. Stdin is closed (no interactive commands)."
+            description: "Execute a shell command (working directory is the sandbox root). \
+                          Returns stdout, stderr, and exit code. Stdin is closed (no \
+                          interactive commands)."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -154,8 +200,17 @@ impl Tool for BashExec {
         // preventing deadlock when the child produces large output.
         match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
             Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Cap each stream at the configured limit so a single command
+                // can't blow up the LLM context with huge output. (The child's full
+                // output is still buffered in process memory before truncation.)
+                let stdout = truncate_with_marker(
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                    self.max_output_bytes,
+                );
+                let stderr = truncate_with_marker(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                    self.max_output_bytes,
+                );
                 let exit_code = output.status.code().unwrap_or(-1);
 
                 ok_result(
@@ -185,6 +240,7 @@ impl Tool for BashExec {
 
 struct FileRead {
     sandbox: Arc<Sandbox>,
+    max_output_bytes: usize,
 }
 
 impl Tool for FileRead {
@@ -224,16 +280,34 @@ impl Tool for FileRead {
             Err(e) => return error_result(call_id, &e.to_string()),
         };
 
-        match tokio::fs::read_to_string(&canonical).await {
-            Ok(content) => ok_result(
-                call_id,
-                serde_json::json!({
-                    "path": path_str,
-                    "content": content,
-                }),
-            ),
-            Err(e) => error_result(call_id, &format!("failed to read file: {e}")),
+        // Bounded read: never pull more than the configured limit (+1 byte to
+        // detect truncation) into memory. Non-UTF8 content is converted lossily.
+        use tokio::io::AsyncReadExt;
+        let file = match tokio::fs::File::open(&canonical).await {
+            Ok(f) => f,
+            Err(e) => return error_result(call_id, &format!("failed to read file: {e}")),
+        };
+        let mut buf = Vec::new();
+        if let Err(e) = file
+            .take(self.max_output_bytes as u64 + 1)
+            .read_to_end(&mut buf)
+            .await
+        {
+            return error_result(call_id, &format!("failed to read file: {e}"));
         }
+
+        let content = truncate_with_marker(
+            String::from_utf8_lossy(&buf).into_owned(),
+            self.max_output_bytes,
+        );
+
+        ok_result(
+            call_id,
+            serde_json::json!({
+                "path": path_str,
+                "content": content,
+            }),
+        )
     }
 }
 
@@ -447,7 +521,7 @@ impl Tool for FileList {
         }
 
         let mut entries = Vec::new();
-        if let Err(e) = list_dir(
+        let truncated = match list_dir(
             &canonical,
             &canonical,
             recursive,
@@ -457,20 +531,24 @@ impl Tool for FileList {
         )
         .await
         {
-            return error_result(call_id, &format!("failed to list directory: {e}"));
-        }
+            Ok(t) => t,
+            Err(e) => return error_result(call_id, &format!("failed to list directory: {e}")),
+        };
 
         ok_result(
             call_id,
             serde_json::json!({
                 "path": path_str,
                 "entries": entries,
+                "truncated": truncated,
             }),
         )
     }
 }
 
-/// Recursively list directory entries.
+/// Recursively list directory entries, capped at [`MAX_FILE_LIST_ENTRIES`].
+///
+/// Returns `true` if the cap was hit (i.e. at least one entry was omitted).
 async fn list_dir(
     base: &std::path::Path,
     dir: &std::path::Path,
@@ -478,10 +556,14 @@ async fn list_dir(
     max_depth: usize,
     current_depth: usize,
     entries: &mut Vec<serde_json::Value>,
-) -> Result<(), std::io::Error> {
+) -> Result<bool, std::io::Error> {
     let mut read_dir = tokio::fs::read_dir(dir).await?;
 
     while let Some(entry) = read_dir.next_entry().await? {
+        if entries.len() >= MAX_FILE_LIST_ENTRIES {
+            // The current entry won't fit — the listing is genuinely truncated.
+            return Ok(true);
+        }
         let metadata = entry.metadata().await?;
         let file_type = if metadata.is_dir() {
             "directory"
@@ -505,7 +587,7 @@ async fn list_dir(
         }));
 
         if recursive && metadata.is_dir() && current_depth < max_depth {
-            Box::pin(list_dir(
+            let truncated = Box::pin(list_dir(
                 base,
                 &entry.path(),
                 recursive,
@@ -514,10 +596,13 @@ async fn list_dir(
                 entries,
             ))
             .await?;
+            if truncated {
+                return Ok(true);
+            }
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +636,68 @@ mod tests {
         (tmp, sandbox)
     }
 
+    // -- truncation helper tests --
+
+    #[test]
+    fn truncate_with_marker_noop_when_under_limit() {
+        let out = truncate_with_marker("short".to_string(), 100);
+        assert_eq!(out, "short");
+    }
+
+    #[test]
+    fn truncate_with_marker_respects_char_boundaries() {
+        // 'é' is 2 bytes in UTF-8; a 5-byte limit falls mid-char and must
+        // back off to the previous boundary instead of panicking.
+        let s = "é".repeat(10);
+        let out = truncate_with_marker(s, 5);
+        assert!(out.starts_with("éé"));
+        assert!(out.ends_with(TRUNCATION_MARKER));
+        assert_eq!(out.len(), 4 + TRUNCATION_MARKER.len());
+    }
+
     // -- bash_exec tests --
+
+    #[tokio::test]
+    async fn bash_exec_truncates_large_output() {
+        let (_tmp, sandbox) = setup_sandbox();
+        let tool = BashExec {
+            sandbox,
+            command_allowlist: None,
+            timeout: Duration::from_secs(5),
+            max_output_bytes: 64,
+        };
+
+        // seq 1 1000 produces ~3.9 KB of stdout — far beyond the 64-byte cap.
+        let result = tool
+            .execute(serde_json::json!({"command": "seq 1 1000"}), &test_ctx())
+            .await;
+        assert!(!result.is_error);
+        let stdout = result.content["stdout"].as_str().unwrap();
+        assert!(stdout.ends_with(TRUNCATION_MARKER), "stdout: {stdout:?}");
+        assert!(stdout.len() <= 64 + TRUNCATION_MARKER.len());
+    }
+
+    #[tokio::test]
+    async fn bash_exec_truncates_large_stderr() {
+        let (_tmp, sandbox) = setup_sandbox();
+        let tool = BashExec {
+            sandbox,
+            command_allowlist: None,
+            timeout: Duration::from_secs(5),
+            max_output_bytes: 64,
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "seq 1 1000 1>&2"}),
+                &test_ctx(),
+            )
+            .await;
+        assert!(!result.is_error);
+        let stderr = result.content["stderr"].as_str().unwrap();
+        assert!(stderr.ends_with(TRUNCATION_MARKER), "stderr: {stderr:?}");
+        assert!(stderr.len() <= 64 + TRUNCATION_MARKER.len());
+    }
 
     #[tokio::test]
     async fn bash_exec_echo() {
@@ -560,6 +706,7 @@ mod tests {
             sandbox,
             command_allowlist: None,
             timeout: Duration::from_secs(5),
+            max_output_bytes: 65536,
         };
 
         let result = tool
@@ -577,6 +724,7 @@ mod tests {
             sandbox,
             command_allowlist: Some(Arc::from(vec!["ls".to_string()].into_boxed_slice())),
             timeout: Duration::from_secs(5),
+            max_output_bytes: 65536,
         };
 
         let result = tool
@@ -598,6 +746,7 @@ mod tests {
             sandbox,
             command_allowlist: Some(Arc::from(vec!["ls".to_string()].into_boxed_slice())),
             timeout: Duration::from_secs(5),
+            max_output_bytes: 65536,
         };
 
         let result = tool
@@ -619,6 +768,7 @@ mod tests {
             sandbox,
             command_allowlist: None,
             timeout: Duration::from_millis(100),
+            max_output_bytes: 65536,
         };
 
         let result = tool
@@ -640,6 +790,7 @@ mod tests {
             sandbox,
             command_allowlist: None,
             timeout: Duration::from_secs(5),
+            max_output_bytes: 65536,
         };
 
         // Set a fake API key in the environment
@@ -664,7 +815,10 @@ mod tests {
     #[tokio::test]
     async fn file_read_success() {
         let (_tmp, sandbox) = setup_sandbox();
-        let tool = FileRead { sandbox };
+        let tool = FileRead {
+            sandbox,
+            max_output_bytes: 65536,
+        };
 
         let result = tool
             .execute(serde_json::json!({"path": "hello.txt"}), &test_ctx())
@@ -674,9 +828,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_read_truncates_large_file() {
+        let (tmp, sandbox) = setup_sandbox();
+        std::fs::write(tmp.path().join("big.txt"), "x".repeat(200)).expect("write big.txt");
+        let tool = FileRead {
+            sandbox,
+            max_output_bytes: 16,
+        };
+
+        let result = tool
+            .execute(serde_json::json!({"path": "big.txt"}), &test_ctx())
+            .await;
+        assert!(!result.is_error);
+        let content = result.content["content"].as_str().unwrap();
+        assert!(content.ends_with(TRUNCATION_MARKER), "content: {content:?}");
+        assert!(content.len() <= 16 + TRUNCATION_MARKER.len());
+    }
+
+    #[tokio::test]
+    async fn file_read_handles_non_utf8_lossily() {
+        let (tmp, sandbox) = setup_sandbox();
+        std::fs::write(tmp.path().join("binary.bin"), [0x66, 0x6f, 0xff, 0xfe, 0x6f])
+            .expect("write binary.bin");
+        let tool = FileRead {
+            sandbox,
+            max_output_bytes: 65536,
+        };
+
+        let result = tool
+            .execute(serde_json::json!({"path": "binary.bin"}), &test_ctx())
+            .await;
+        assert!(!result.is_error);
+        let content = result.content["content"].as_str().unwrap();
+        assert!(content.contains('\u{FFFD}'), "content: {content:?}");
+    }
+
+    #[tokio::test]
     async fn file_read_rejects_traversal() {
         let (_tmp, sandbox) = setup_sandbox();
-        let tool = FileRead { sandbox };
+        let tool = FileRead {
+            sandbox,
+            max_output_bytes: 65536,
+        };
 
         let result = tool
             .execute(serde_json::json!({"path": "../../etc/passwd"}), &test_ctx())
@@ -687,7 +880,10 @@ mod tests {
     #[tokio::test]
     async fn file_read_rejects_memory_dir() {
         let (_tmp, sandbox) = setup_sandbox();
-        let tool = FileRead { sandbox };
+        let tool = FileRead {
+            sandbox,
+            max_output_bytes: 65536,
+        };
 
         let result = tool
             .execute(serde_json::json!({"path": "memory/core.md"}), &test_ctx())
@@ -829,6 +1025,37 @@ mod tests {
         let entries = result.content["entries"].as_array().unwrap();
         let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
         assert!(names.contains(&"nested.txt"));
+    }
+
+    #[tokio::test]
+    async fn file_list_caps_entries() {
+        let (tmp, sandbox) = setup_sandbox();
+        let many = tmp.path().join("many");
+        std::fs::create_dir_all(&many).expect("mkdir many");
+        for i in 0..(MAX_FILE_LIST_ENTRIES + 10) {
+            std::fs::File::create(many.join(format!("f{i}"))).expect("create file");
+        }
+        let tool = FileList { sandbox };
+
+        let result = tool
+            .execute(serde_json::json!({"path": "many"}), &test_ctx())
+            .await;
+        assert!(!result.is_error);
+        let entries = result.content["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), MAX_FILE_LIST_ENTRIES);
+        assert_eq!(result.content["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn file_list_not_truncated_under_cap() {
+        let (_tmp, sandbox) = setup_sandbox();
+        let tool = FileList { sandbox };
+
+        let result = tool
+            .execute(serde_json::json!({"path": "."}), &test_ctx())
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(result.content["truncated"], false);
     }
 
     // -- registration test --

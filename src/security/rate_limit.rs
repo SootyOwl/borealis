@@ -132,11 +132,13 @@ impl RateLimiter {
             };
         }
 
-        // Global check
-        let Ok(mut bucket) = self.global_bucket.lock() else {
-            warn!("global rate limit mutex poisoned — allowing request");
-            return RateLimitResult::Allowed;
-        };
+        // Global check. A poisoned mutex means a thread panicked while holding
+        // the guard — the bucket state is plain data and safe to reuse, so
+        // recover it rather than failing open (which would disable the limit).
+        let mut bucket = self.global_bucket.lock().unwrap_or_else(|poisoned| {
+            warn!("global rate limit mutex poisoned — recovering bucket state");
+            poisoned.into_inner()
+        });
         let global_allowed = bucket.try_consume();
 
         if !global_allowed {
@@ -343,6 +345,33 @@ mod tests {
             limiter.check("user30", None),
             RateLimitResult::GlobalLimited,
             "31st message should be rejected by global limit"
+        );
+    }
+
+    #[test]
+    fn global_limit_enforced_even_when_mutex_poisoned() {
+        let limiter = RateLimiter::new(&test_config());
+
+        // Poison the global bucket mutex by panicking while holding the guard.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = limiter.global_bucket.lock().unwrap();
+            panic!("poison the mutex");
+        }));
+        assert!(limiter.global_bucket.is_poisoned());
+
+        // The limiter must fail CLOSED: recover the bucket state and keep
+        // enforcing the global limit (capacity=5) instead of allowing everything.
+        for i in 0..5 {
+            assert_eq!(
+                limiter.check(&format!("u{i}"), None),
+                RateLimitResult::Allowed,
+                "message {i} should be allowed"
+            );
+        }
+        assert_eq!(
+            limiter.check("u5", None),
+            RateLimitResult::GlobalLimited,
+            "global limit must still be enforced after mutex poisoning"
         );
     }
 

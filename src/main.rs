@@ -82,16 +82,10 @@ async fn main() -> anyhow::Result<()> {
         settings.rate_limit.allowed_users.clone(),
     );
 
-    // Register memory write tools as restricted so only authorized users can call them.
-    for tool_name in &[
-        "memory_create",
-        "memory_update",
-        "memory_link",
-        "memory_tag",
-        "memory_forget",
-    ] {
-        security.register_restricted(tool_name);
-    }
+    // Register all side-effecting tools (memory writes, bash_exec, file_write,
+    // channel sends) as restricted so only authorized users can call them.
+    // The set is defined in borealis::security::RESTRICTED_TOOLS.
+    security.register_default_restricted();
 
     let security = Arc::new(security);
     info!("security module initialized");

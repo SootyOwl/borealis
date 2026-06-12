@@ -314,6 +314,8 @@ pub struct ToolsConfig {
     pub computer_use: ComputerUseConfig,
     #[serde(default)]
     pub web: WebToolsConfig,
+    #[serde(default)]
+    pub channel: ChannelToolsConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,6 +329,10 @@ pub struct ComputerUseConfig {
     pub command_allowlist: Vec<String>,
     #[serde(default = "default_command_timeout_secs")]
     pub command_timeout_secs: u64,
+    /// Maximum bytes of captured tool output (bash_exec stdout/stderr each,
+    /// file_read content). Longer output is truncated with a marker.
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
 }
 
 impl Default for ComputerUseConfig {
@@ -336,6 +342,7 @@ impl Default for ComputerUseConfig {
             sandbox_root: default_sandbox_root(),
             command_allowlist: Vec::new(),
             command_timeout_secs: default_command_timeout_secs(),
+            max_output_bytes: default_max_output_bytes(),
         }
     }
 }
@@ -346,6 +353,10 @@ fn default_sandbox_root() -> PathBuf {
 
 fn default_command_timeout_secs() -> u64 {
     30
+}
+
+fn default_max_output_bytes() -> usize {
+    65536
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,6 +384,20 @@ impl Default for WebToolsConfig {
 
 fn default_max_fetch_bytes() -> usize {
     51200
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChannelToolsConfig {
+    /// Whether the channel tools (react, send_message, send_file) are
+    /// registered. Defaults to true for backward compatibility.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for ChannelToolsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -783,7 +783,11 @@ mod tests {
         );
     }
 
+    // The guard must stay held across the `.await` so no other test mutates the
+    // environment while this subprocess inherits and reads it; that is the whole
+    // point of serializing here, so the await-holding-lock lint is expected.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn bash_exec_does_not_leak_api_keys() {
         let (_tmp, sandbox) = setup_sandbox();
         let tool = BashExec {
@@ -793,8 +797,9 @@ mod tests {
             max_output_bytes: 65536,
         };
 
-        // Set a fake API key in the environment
-        // SAFETY: test-only, single-threaded test
+        // Serialize against other env-mutating tests: `set_var` is unsafe under
+        // concurrency (see crate::test_support::env_guard).
+        let _env = crate::test_support::env_guard();
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-test-secret") };
 
         let result = tool
@@ -806,7 +811,6 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(result.content["stdout"], "NOT_SET\n");
 
-        // SAFETY: test-only, single-threaded test
         unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
     }
 

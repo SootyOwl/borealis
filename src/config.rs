@@ -3,6 +3,11 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::warn;
+
+/// Allowed Discord `response_mode` values (must match the arms handled by
+/// `ConfigModeFactory::create` in `channels::modes`).
+const ALLOWED_RESPONSE_MODES: [&str; 3] = ["mention-only", "digest", "always"];
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -515,10 +520,17 @@ impl Settings {
         {
             resolve_env_var("channels.discord.token_env", &discord.token_env)?;
         }
-        if self.tools.web.enabled {
-            if let Some(ref key_env) = self.tools.web.jina_api_key_env {
-                resolve_env_var("tools.web.jina_api_key_env", key_env)?;
-            }
+        // The Jina API key is a SOFT dependency: the web tool works without it
+        // (rate-limited by IP). Warn if the named env var is unset/empty, but
+        // do not refuse to boot. See LIFE-4.
+        if self.tools.web.enabled
+            && let Some(ref key_env) = self.tools.web.jina_api_key_env
+            && resolve_env_var("tools.web.jina_api_key_env", key_env).is_err()
+        {
+            warn!(
+                env_var = %key_env,
+                "{key_env} not set; web fetches will be IP-rate-limited"
+            );
         }
         if self.bot.max_concurrent_llm == 0 {
             return Err(ConfigError::Validation(
@@ -569,13 +581,93 @@ impl Settings {
                 self.scheduler.timezone
             )));
         }
+
+        // LIFE-6: validate Discord response_mode values. A typo would otherwise
+        // silently fall through to the most permissive mode (see modes.rs).
+        if let Some(ref discord) = self.channels.discord
+            && discord.enabled
+        {
+            for group in &discord.groups {
+                validate_response_mode(
+                    &group.response_mode,
+                    &format!("channels.discord guild '{}'", group.guild_id),
+                )?;
+                for ch in &group.channels {
+                    if let Some(ref mode) = ch.response_mode {
+                        validate_response_mode(
+                            mode,
+                            &format!(
+                                "channels.discord guild '{}' channel '{}'",
+                                group.guild_id, ch.channel_id
+                            ),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // LIFE-12: numeric range checks for values that break the bot at runtime.
+        let threshold = self.bot.compaction.threshold;
+        if !(0.0 < threshold && threshold <= 1.0) {
+            return Err(ConfigError::Validation(format!(
+                "bot.compaction.threshold must be in (0.0, 1.0], got {threshold}"
+            )));
+        }
+        for (name, entry) in [
+            ("anthropic", self.providers.anthropic.as_ref()),
+            ("openai", self.providers.openai.as_ref()),
+        ] {
+            if let Some(entry) = entry {
+                if entry.timeout_secs == 0 {
+                    return Err(ConfigError::Validation(format!(
+                        "providers.{name}.timeout_secs must be > 0"
+                    )));
+                }
+                if entry.max_history_tokens == 0 {
+                    return Err(ConfigError::Validation(format!(
+                        "providers.{name}.max_history_tokens must be > 0"
+                    )));
+                }
+            }
+        }
+        if self.tools.computer_use.command_timeout_secs == 0 {
+            return Err(ConfigError::Validation(
+                "tools.computer_use.command_timeout_secs must be > 0".into(),
+            ));
+        }
+        if self.tools.computer_use.max_output_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "tools.computer_use.max_output_bytes must be > 0".into(),
+            ));
+        }
+        if self.tools.web.max_fetch_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "tools.web.max_fetch_bytes must be > 0".into(),
+            ));
+        }
+
         Ok(())
+    }
+}
+
+/// Validate a single Discord `response_mode` value against the allowed set.
+/// `context` describes where the value came from (guild/channel) for the error.
+fn validate_response_mode(mode: &str, context: &str) -> Result<(), ConfigError> {
+    if ALLOWED_RESPONSE_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        Err(ConfigError::Validation(format!(
+            "{context}: invalid response_mode '{mode}' — must be one of {ALLOWED_RESPONSE_MODES:?}"
+        )))
     }
 }
 
 /// Resolve an environment variable by name, returning an error that names
 /// both the config field and the missing env var.
-fn resolve_env_var(field: &str, env_var: &str) -> Result<String, ConfigError> {
+///
+/// `pub` so integration tests (`tests/config_test.rs`) can exercise the real
+/// implementation rather than a copy (see LIFE-14).
+pub fn resolve_env_var(field: &str, env_var: &str) -> Result<String, ConfigError> {
     match env::var(env_var) {
         Ok(val) if val.is_empty() => Err(ConfigError::EmptyEnvVar {
             field: field.to_owned(),
@@ -587,17 +679,6 @@ fn resolve_env_var(field: &str, env_var: &str) -> Result<String, ConfigError> {
             env_var: env_var.to_owned(),
         }),
     }
-}
-
-/// Convenience function for runtime lookup of an env var that was already
-/// validated at startup. Panics if called before validation.
-pub fn get_secret(env_var: &str) -> String {
-    env::var(env_var).unwrap_or_else(|_| {
-        panic!(
-            "BUG: env var '{env_var}' should have been validated at startup — \
-             this is a programming error"
-        )
-    })
 }
 
 #[cfg(test)]
@@ -651,5 +732,263 @@ timezone = "{tz}"
     fn validate_accepts_valid_scheduler_timezone() {
         let settings = settings_with_timezone("Europe/London");
         assert!(settings.validate().is_ok());
+    }
+
+    /// Build a minimal valid `Settings` with web tools disabled (so the Jina
+    /// key is not consulted). Callers mutate one field to exercise a check.
+    fn minimal_settings() -> Settings {
+        let toml = r#"
+[bot]
+name = "TestBot"
+
+[providers]
+
+[tools.web]
+enabled = false
+"#;
+        let config = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config");
+        config.try_deserialize().expect("deserialize Settings")
+    }
+
+    /// Build a Settings with Discord enabled and a single guild whose
+    /// `response_mode` is set to `mode`. `token_env` names the env var the
+    /// caller must set so validation gets past the token check.
+    fn settings_with_discord_mode(mode: &str, token_env: &str) -> Settings {
+        let toml = format!(
+            r#"
+[bot]
+name = "TestBot"
+
+[providers]
+
+[tools.web]
+enabled = false
+
+[channels.discord]
+enabled = true
+token_env = "{token_env}"
+
+[[channels.discord.groups]]
+guild_id = "123"
+response_mode = "{mode}"
+"#
+        );
+        let config = config::Config::builder()
+            .add_source(config::File::from_str(&toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config");
+        config.try_deserialize().expect("deserialize Settings")
+    }
+
+    // --- LIFE-6: response_mode validation -------------------------------------
+
+    #[test]
+    fn validate_rejects_invalid_guild_response_mode() {
+        const TOKEN: &str = "BOREALIS_TEST_DISCORD_TOKEN_REJECT_GUILD";
+        let settings = settings_with_discord_mode("always_on", TOKEN);
+        // token_env is validated before response_mode; set it so validation
+        // reaches the response_mode check. Hold the env lock across the whole
+        // set/validate/remove window: `set_var` is unsafe under concurrency, so
+        // we serialize all env-mutating tests rather than racing `setenv`.
+        let _env = crate::test_support::env_guard();
+        unsafe { std::env::set_var(TOKEN, "tok") };
+        let result = settings.validate();
+        unsafe { std::env::remove_var(TOKEN) };
+        let err = result.expect_err("typo'd response_mode should fail validation");
+        match err {
+            ConfigError::Validation(msg) => {
+                assert!(
+                    msg.contains("always_on") && msg.contains("response_mode"),
+                    "error should name the bad value, got: {msg}"
+                );
+                assert!(
+                    msg.contains("123"),
+                    "error should name the guild, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_valid_guild_response_modes() {
+        const TOKEN: &str = "BOREALIS_TEST_DISCORD_TOKEN_ACCEPT_GUILD";
+        // Serialize against other env-mutating tests (see env_guard docs).
+        let _env = crate::test_support::env_guard();
+        for mode in ["mention-only", "digest", "always"] {
+            let settings = settings_with_discord_mode(mode, TOKEN);
+            // token_env is also validated against the process env; set it for
+            // the duration of this assertion.
+            unsafe { std::env::set_var(TOKEN, "tok") };
+            let ok = settings.validate().is_ok();
+            unsafe { std::env::remove_var(TOKEN) };
+            assert!(ok, "mode '{mode}' should validate");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_channel_override_response_mode() {
+        let toml = r#"
+[bot]
+name = "TestBot"
+
+[providers]
+
+[tools.web]
+enabled = false
+
+[channels.discord]
+enabled = true
+token_env = "BOREALIS_TEST_DISCORD_TOKEN_UNUSED"
+
+[[channels.discord.groups]]
+guild_id = "123"
+response_mode = "mention-only"
+
+[[channels.discord.groups.channels]]
+channel_id = "456"
+response_mode = "Always"
+"#;
+        let settings: Settings = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config")
+            .try_deserialize()
+            .expect("deserialize Settings");
+        // token_env is validated first; set it so validation reaches the
+        // channel response_mode override check. Env lock serializes the
+        // set/validate/remove window (see env_guard docs).
+        let _env = crate::test_support::env_guard();
+        unsafe {
+            std::env::set_var("BOREALIS_TEST_DISCORD_TOKEN_UNUSED", "tok");
+        }
+        let result = settings.validate();
+        unsafe {
+            std::env::remove_var("BOREALIS_TEST_DISCORD_TOKEN_UNUSED");
+        }
+        let err = result.expect_err("invalid channel override should fail");
+        match err {
+            ConfigError::Validation(msg) => {
+                assert!(
+                    msg.contains("Always") && msg.contains("456"),
+                    "error should name bad value and channel, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    // --- LIFE-4: Jina key is a soft dependency --------------------------------
+
+    #[test]
+    fn validate_succeeds_when_jina_key_env_unset() {
+        // Web enabled, jina_api_key_env points at a definitely-unset var.
+        let toml = r#"
+[bot]
+name = "TestBot"
+
+[providers]
+
+[tools.web]
+enabled = true
+jina_api_key_env = "BOREALIS_TEST_JINA_UNSET_VAR_9z8y7x"
+"#;
+        let settings: Settings = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config")
+            .try_deserialize()
+            .expect("deserialize Settings");
+        // Ensure the var is truly unset. Env lock serializes against other
+        // env-mutating tests (see env_guard docs).
+        let _env = crate::test_support::env_guard();
+        unsafe { std::env::remove_var("BOREALIS_TEST_JINA_UNSET_VAR_9z8y7x") };
+        assert!(
+            settings.validate().is_ok(),
+            "unset Jina key should warn, not fail validation"
+        );
+    }
+
+    // --- LIFE-12: numeric range checks ----------------------------------------
+
+    #[test]
+    fn validate_rejects_out_of_range_compaction_threshold() {
+        for bad in [0.0_f64, 1.5, -0.3] {
+            let mut settings = minimal_settings();
+            settings.bot.compaction.threshold = bad;
+            let err = settings
+                .validate()
+                .expect_err(&format!("threshold {bad} should fail"));
+            match err {
+                ConfigError::Validation(msg) => assert!(
+                    msg.contains("threshold"),
+                    "error should name threshold, got: {msg}"
+                ),
+                other => panic!("expected Validation error, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_accepts_in_range_compaction_threshold() {
+        for good in [0.75_f64, 1.0, 0.01] {
+            let mut settings = minimal_settings();
+            settings.bot.compaction.threshold = good;
+            assert!(
+                settings.validate().is_ok(),
+                "threshold {good} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_provider_timeout() {
+        let toml = r#"
+[bot]
+name = "TestBot"
+
+[providers.openai]
+base_url = "http://localhost:11434/v1"
+model = "llama3"
+timeout_secs = 0
+
+[tools.web]
+enabled = false
+"#;
+        let settings: Settings = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config")
+            .try_deserialize()
+            .expect("deserialize Settings");
+        let err = settings
+            .validate()
+            .expect_err("zero provider timeout should fail");
+        match err {
+            ConfigError::Validation(msg) => assert!(
+                msg.contains("timeout_secs"),
+                "error should name timeout_secs, got: {msg}"
+            ),
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_command_timeout() {
+        let mut settings = minimal_settings();
+        settings.tools.computer_use.command_timeout_secs = 0;
+        let err = settings
+            .validate()
+            .expect_err("zero command timeout should fail");
+        match err {
+            ConfigError::Validation(msg) => assert!(
+                msg.contains("command_timeout_secs"),
+                "error should name command_timeout_secs, got: {msg}"
+            ),
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
     }
 }

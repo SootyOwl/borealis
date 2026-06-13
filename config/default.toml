@@ -147,7 +147,7 @@ max_output_bytes = 65536                       # cap captured output (bash stdou
 
 [tools.web]
 enabled = true
-jina_api_key_env = "JINA_API_KEY"              # env var holding Jina API key
+jina_api_key_env = "JINA_API_KEY"              # OPTIONAL env var holding Jina API key; if unset/empty, fetches are IP-rate-limited (does not block boot)
 max_fetch_bytes = 51200                        # 50 KiB max response size (prevents context blowup)
 
 # ---------------------------------------------------------------------------

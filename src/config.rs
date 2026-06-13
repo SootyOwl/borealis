@@ -563,6 +563,12 @@ impl Settings {
                 "rate_limit.global.capacity must be > 0".into(),
             ));
         }
+        if self.scheduler.timezone.parse::<chrono_tz::Tz>().is_err() {
+            return Err(ConfigError::Validation(format!(
+                "scheduler.timezone '{}' is not a valid IANA timezone",
+                self.scheduler.timezone
+            )));
+        }
         Ok(())
     }
 }
@@ -592,4 +598,58 @@ pub fn get_secret(env_var: &str) -> String {
              this is a programming error"
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal valid `Settings` from a TOML string, overriding the
+    /// scheduler timezone. Only the bot section is required.
+    fn settings_with_timezone(tz: &str) -> Settings {
+        // Disable web tools so validation does not require the JINA_API_KEY env
+        // var — we only want to exercise the scheduler.timezone check here.
+        let toml = format!(
+            r#"
+[bot]
+name = "TestBot"
+
+[providers]
+
+[tools.web]
+enabled = false
+
+[scheduler]
+timezone = "{tz}"
+"#
+        );
+        let config = config::Config::builder()
+            .add_source(config::File::from_str(&toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config");
+        config.try_deserialize().expect("deserialize Settings")
+    }
+
+    #[test]
+    fn validate_rejects_invalid_scheduler_timezone() {
+        let settings = settings_with_timezone("Not/AZone");
+        let err = settings
+            .validate()
+            .expect_err("invalid timezone should fail validation");
+        match err {
+            ConfigError::Validation(msg) => {
+                assert!(
+                    msg.contains("scheduler.timezone") && msg.contains("Not/AZone"),
+                    "error should name field and bad value, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_valid_scheduler_timezone() {
+        let settings = settings_with_timezone("Europe/London");
+        assert!(settings.validate().is_ok());
+    }
 }

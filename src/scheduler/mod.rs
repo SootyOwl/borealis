@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::SchedulerConfig;
 use crate::core::event::InEvent;
@@ -57,6 +57,27 @@ impl Scheduler {
         }
         info!(tasks = self.handles.len(), "scheduler started");
     }
+
+    /// Wait for all event-runner tasks to finish, then return.
+    ///
+    /// Each `ScheduledEventRunner::run` loop exits promptly once the shared
+    /// `CancellationToken` is cancelled (its `tokio::select!`s are `biased` with
+    /// the cancel branch first), so the caller is expected to have cancelled the
+    /// token already — otherwise this awaits until the runners' next sleep wakes.
+    /// Mirrors `ChannelRegistry::await_shutdown`: join each handle, warn on a
+    /// join error (a panicked runner) rather than propagating.
+    ///
+    /// Note: this only joins the runners. The event-feed loop that consumes the
+    /// runners' events and drives the pipeline is owned and drained by the caller
+    /// (see `main.rs`), because it depends on the pipeline which the scheduler
+    /// does not hold.
+    pub async fn shutdown(self) {
+        for handle in self.handles {
+            if let Err(e) = handle.await {
+                warn!("scheduler runner join error: {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +121,61 @@ mod tests {
             tx,
             CancellationToken::new(),
         )
+    }
+
+    /// Build a scheduler whose runners share `cancel`, so a test can cancel them
+    /// and observe `shutdown()` returning promptly. The mpsc receiver is dropped
+    /// — runners in these tests use a long interval and never fire within the
+    /// test window, so they never `send`.
+    fn build_scheduler_with_cancel(
+        events: Vec<SchedulerEventConfig>,
+        timezone: &str,
+        cancel: CancellationToken,
+    ) -> Result<Scheduler> {
+        let (tx, _rx) = mpsc::channel(8);
+        Scheduler::new(
+            SchedulerConfig {
+                timezone: timezone.into(),
+                events,
+            },
+            tx,
+            cancel,
+        )
+    }
+
+    /// LIFE: the shutdown gap fix — a started scheduler whose token is cancelled
+    /// must join its runner tasks and return promptly (not hang). This guards the
+    /// drain that lets an in-flight scheduled event finish before process exit.
+    #[tokio::test]
+    async fn shutdown_returns_after_cancel() {
+        let cancel = CancellationToken::new();
+        let mut ev = event("tick", "recurring");
+        ev.interval = Some("60s".into()); // long interval: runner is asleep
+        let mut scheduler =
+            build_scheduler_with_cancel(vec![ev], "UTC", cancel.clone()).expect("valid scheduler");
+        scheduler.start();
+
+        // Cancel first so the runners' `biased` selects take the cancel branch.
+        cancel.cancel();
+
+        // shutdown() must return well within the 5s force-exit backstop.
+        tokio::time::timeout(std::time::Duration::from_secs(2), scheduler.shutdown())
+            .await
+            .expect("scheduler.shutdown() should return promptly after cancel");
+    }
+
+    /// A scheduler with zero events has no runners; shutdown() is an immediate
+    /// no-op and must still return.
+    #[tokio::test]
+    async fn shutdown_with_no_events_is_noop() {
+        let cancel = CancellationToken::new();
+        let mut scheduler =
+            build_scheduler_with_cancel(vec![], "UTC", cancel.clone()).expect("valid scheduler");
+        scheduler.start();
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), scheduler.shutdown())
+            .await
+            .expect("empty scheduler.shutdown() should return immediately");
     }
 
     #[test]

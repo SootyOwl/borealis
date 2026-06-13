@@ -125,24 +125,36 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&security),
     )?;
 
+    // Scheduler + its event-feed loop. Both are held until shutdown so the drain
+    // sequence can join them — otherwise an in-flight scheduled event (LLM call +
+    // history write) is killed by process exit before it finishes.
+    let mut scheduler: Option<borealis::scheduler::Scheduler> = None;
+    let mut feed_handle: Option<tokio::task::JoinHandle<()>> = None;
+
     // Spawn the scheduler if events are configured.
     if !settings.scheduler.events.is_empty() {
         let (sched_tx, mut sched_rx) = tokio::sync::mpsc::channel(256);
-        let mut scheduler = borealis::scheduler::Scheduler::new(
+        let mut sched = borealis::scheduler::Scheduler::new(
             settings.scheduler.clone(),
             sched_tx,
             cancel.clone(),
         )?;
-        scheduler.start();
+        sched.start();
 
-        // Spawn a task that feeds scheduler events into the pipeline.
+        // Spawn a task that feeds scheduler events into the pipeline. Retain its
+        // JoinHandle (don't detach) so the in-flight `process()` it owns can be
+        // drained at shutdown.
         let pipeline_sched = pipeline.clone();
         let cancel_sched = cancel.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Some(event) = sched_rx.recv() => {
                         let completion_flag = event.completion_flag.clone();
+                        // NOTE: this `process().await` is intentionally NOT raced
+                        // against cancel — once an event is received, it runs to
+                        // completion (history write included) even mid-shutdown.
+                        // Cancel only stops us accepting NEW events (the arm below).
                         match pipeline_sched.process(&event).await {
                             Ok(_out_event) => {
                                 tracing::debug!("scheduler event processed");
@@ -163,6 +175,9 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+
+        scheduler = Some(sched);
+        feed_handle = Some(handle);
 
         info!(
             events = settings.scheduler.events.len(),
@@ -191,8 +206,21 @@ async fn main() -> anyhow::Result<()> {
     // Wait for shutdown signal.
     cancel.cancelled().await;
 
-    // Run the graceful shutdown sequence with 5s timeout.
-    let drain = channels.await_shutdown();
+    // Run the graceful shutdown sequence with 5s timeout. The token is already
+    // cancelled here, so the channel adapters, scheduler runners and the
+    // event-feed loop are all winding down. We join them in one combined drain so
+    // any in-flight scheduled `process()` (LLM call + history write) completes
+    // BEFORE run_shutdown checkpoints the WAL and the process exits. The whole
+    // drain is bounded by run_shutdown's 5s force-exit backstop.
+    let drain = async move {
+        channels.await_shutdown().await;
+        if let Some(scheduler) = scheduler {
+            scheduler.shutdown().await;
+        }
+        if let Some(feed_handle) = feed_handle {
+            let _ = feed_handle.await;
+        }
+    };
     borealis::shutdown::run_shutdown(drain, Some(db_conn)).await;
 
     // Force exit — the tokio stdin reader holds the process alive because

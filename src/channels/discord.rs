@@ -186,6 +186,7 @@ fn serenity_message_to_in_event(msg: &serenity::Message, bot_user_id: serenity::
                 .referenced_message
                 .as_ref()
                 .map(|m| MessageId(m.id.to_string())),
+            guild_id: msg.guild_id.map(|g| g.to_string()),
         },
         tool_groups: None,
         completion_flag: None,

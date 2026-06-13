@@ -294,6 +294,7 @@ mod tests {
                 },
                 channel_id: group_id.into(),
                 reply_to: None,
+                guild_id: None,
             },
             tool_groups: None,
             completion_flag: None,

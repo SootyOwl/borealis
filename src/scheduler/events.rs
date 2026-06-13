@@ -305,6 +305,7 @@ impl ScheduledEventRunner {
                 },
                 channel_id: format!("scheduler:{name}"),
                 reply_to: None,
+                guild_id: None,
             },
             tool_groups: self.config.tools.clone(),
             // Pass the processing flag so the consumer can clear it when done.

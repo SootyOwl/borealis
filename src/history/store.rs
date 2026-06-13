@@ -114,6 +114,28 @@ impl HistoryStore {
         message: &ChatMessage,
         turn_id: Option<&str>,
     ) -> Result<String, StoreError> {
+        self.append_message_at(conversation_id, message, turn_id, &Utc::now().to_rfc3339())
+    }
+
+    /// Append a message stamped with a caller-supplied `created_at`, instead of
+    /// the current time.
+    ///
+    /// This exists for the Letta migration, which must preserve the original
+    /// `msg.date` rather than stamping `Utc::now()`. The supplied timestamp is
+    /// stored verbatim — callers are responsible for any normalization. Both
+    /// the message row's `created_at` and the parent conversation's
+    /// `last_active_at` bump use this value, so a migrated conversation's
+    /// activity reflects the original message time.
+    ///
+    /// The regular [`append_message`](Self::append_message) delegates here with
+    /// `Utc::now()`, so the two share one code path.
+    pub fn append_message_at(
+        &self,
+        conversation_id: &ConversationId,
+        message: &ChatMessage,
+        turn_id: Option<&str>,
+        created_at: &str,
+    ) -> Result<String, StoreError> {
         let used_turn_id = match turn_id {
             Some(t) => t.to_string(),
             None => Uuid::new_v4().to_string(),
@@ -135,7 +157,7 @@ impl HistoryStore {
         }
 
         let msg_id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
+        let now = created_at.to_string();
         let conv_id_str = conversation_id.to_string();
 
         let conn = self.lock_conn();

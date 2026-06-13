@@ -367,6 +367,23 @@ impl SqliteMemory {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 
+    /// Normalize an arbitrary RFC 3339 timestamp string into the store's
+    /// canonical UTC millisecond format (`...:SS.mmmZ`).
+    ///
+    /// This keeps externally-supplied timestamps (e.g. migrated from Letta)
+    /// lex-sortable and format-consistent with [`now_iso`](Self::now_iso),
+    /// matching what the schema backfill in `init_schema` would otherwise
+    /// normalize them to. Any RFC 3339 / ISO 8601 input with an offset is
+    /// converted to UTC. Returns `None` if the input is not parseable.
+    fn normalize_rfc3339(input: &str) -> Option<String> {
+        chrono::DateTime::parse_from_rfc3339(input)
+            .ok()
+            .map(|dt| {
+                dt.with_timezone(&chrono::Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            })
+    }
+
     fn read_core(&self) -> MemoryResult<Note> {
         let content = std::fs::read_to_string(&self.core_md_path)?;
         let now = Self::now_iso();
@@ -578,17 +595,38 @@ impl SqliteMemory {
     }
 }
 
-impl Memory for SqliteMemory {
-    fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
+impl SqliteMemory {
+    /// Create a note stamped with a caller-supplied `created_at` (used as both
+    /// `created_at` and `updated_at`), instead of the current time.
+    ///
+    /// This exists for the Letta migration, which must preserve the original
+    /// `passage.created_at` rather than stamping `Utc::now()`. The supplied
+    /// timestamp is normalized to the store's canonical millisecond RFC 3339
+    /// format when it parses as RFC 3339; otherwise it is stored verbatim
+    /// (the `init_schema` second-precision backfill still normalizes the common
+    /// `...:SSZ` shape on the next open, so non-canonical-but-RFC3339 input
+    /// stays lex-sortable either way).
+    ///
+    /// The regular trait [`create_note`](Memory::create_note) delegates here
+    /// with `now_iso()`, so the two share one code path.
+    pub fn create_note_at(
+        &self,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        created_at: &str,
+    ) -> MemoryResult<Note> {
         let normalized = normalize_tags(tags)?;
         let id = self.generate_id()?;
-        let now = Self::now_iso();
+        // Normalize the incoming timestamp to canonical millis RFC3339 when we
+        // can; fall back to the raw string for anything unparseable.
+        let ts = Self::normalize_rfc3339(created_at).unwrap_or_else(|| created_at.to_string());
         let conn = self.lock_conn();
 
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO notes (id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, title, content, now, now],
+            params![id, title, content, ts, ts],
         )?;
 
         for tag in &normalized {
@@ -605,9 +643,15 @@ impl Memory for SqliteMemory {
             content: content.to_string(),
             tags: normalized,
             links: Vec::new(),
-            created_at: now.clone(),
-            updated_at: now,
+            created_at: ts.clone(),
+            updated_at: ts,
         })
+    }
+}
+
+impl Memory for SqliteMemory {
+    fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
+        self.create_note_at(title, content, tags, &Self::now_iso())
     }
 
     fn read_note(&self, id: &str) -> MemoryResult<Note> {

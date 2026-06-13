@@ -54,41 +54,57 @@ fn resolve_entry(name: &str, entry: &ProviderEntry) -> ResolvedProvider {
     }
 }
 
-/// Return all configured providers in priority order (Anthropic first, then OpenAI).
+/// Return all configured providers in priority order.
 ///
-/// Only providers that are present in the config are included. This does not
-/// validate that the provider can actually be constructed (e.g., API key validity);
-/// that happens at construction time.
+/// Ordering, with duplicates removed so each provider appears once:
+///   1. `bot.default_provider`, if set and present in the configured entries.
+///   2. `anthropic`, if configured.
+///   3. `openai`, if configured.
+///   4. Any remaining configured providers, sorted by name.
+///
+/// With `default_provider` unset and only `anthropic`/`openai` configured this
+/// reproduces the historical behavior exactly (anthropic first, then openai).
+///
+/// Only providers present in the config are included. This does not validate
+/// that the provider can actually be constructed (e.g., API key validity); that
+/// happens at construction time.
 pub fn resolve_configured_providers(settings: &Settings) -> Vec<ResolvedProvider> {
-    let mut providers = Vec::new();
+    let entries = &settings.providers.entries;
+    let mut order: Vec<&str> = Vec::new();
 
-    if let Some(ref entry) = settings.providers.anthropic {
-        providers.push(resolve_entry("anthropic", entry));
+    if let Some(ref name) = settings.bot.default_provider
+        && entries.contains_key(name)
+    {
+        order.push(name.as_str());
     }
-    if let Some(ref entry) = settings.providers.openai {
-        providers.push(resolve_entry("openai", entry));
+    for preferred in ["anthropic", "openai"] {
+        if entries.contains_key(preferred) && !order.contains(&preferred) {
+            order.push(preferred);
+        }
     }
+    let mut remaining: Vec<&str> = entries
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !order.contains(k))
+        .collect();
+    remaining.sort_unstable();
+    order.extend(remaining);
 
-    providers
+    order
+        .into_iter()
+        .map(|name| resolve_entry(name, &entries[name]))
+        .collect()
 }
 
 /// Resolve a specific provider by name from settings.
 ///
 /// Returns `None` if the named provider is not configured.
 pub fn resolve_named_provider(name: &str, settings: &Settings) -> Option<ResolvedProvider> {
-    match name {
-        "anthropic" => settings
-            .providers
-            .anthropic
-            .as_ref()
-            .map(|e| resolve_entry("anthropic", e)),
-        "openai" => settings
-            .providers
-            .openai
-            .as_ref()
-            .map(|e| resolve_entry("openai", e)),
-        _ => None,
-    }
+    settings
+        .providers
+        .entries
+        .get(name)
+        .map(|e| resolve_entry(name, e))
 }
 
 /// Construct a concrete provider and wrap it in a `Pipeline`, returning the
@@ -117,11 +133,11 @@ fn build_pipeline_for_provider(
     bail!("unknown provider type: {}", resolved.name);
 }
 
-/// Build a `PipelineRunner` from the first valid configured provider.
+/// Build a `PipelineRunner` from the primary configured provider.
 ///
-/// Iterates providers in priority order (Anthropic, then OpenAI) and builds a
-/// pipeline from the first one present in the config. Returns an error if no
-/// providers are configured.
+/// The primary is chosen by [`resolve_configured_providers`]: `bot.default_provider`
+/// if set, otherwise anthropic, then openai, then any other configured provider.
+/// Returns an error if no providers are configured.
 pub fn build_pipeline(
     settings: &Settings,
     history_store: Arc<HistoryStore>,
@@ -176,36 +192,52 @@ pub fn build_pipeline(
 mod tests {
     use super::*;
 
-    fn make_settings_both() -> Settings {
+    fn anthropic_entry() -> ProviderEntry {
+        ProviderEntry {
+            base_url: "https://api.anthropic.com".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            api_key_env: None,
+            timeout_secs: 60,
+            max_retries: 3,
+            max_history_tokens: 8192,
+            temperature: Some(0.7),
+        }
+    }
+
+    fn openai_entry() -> ProviderEntry {
+        ProviderEntry {
+            base_url: "http://localhost:11434/v1".into(),
+            model: "llama3".into(),
+            api_key_env: None,
+            timeout_secs: 60,
+            max_retries: 3,
+            max_history_tokens: 4096,
+            temperature: Some(0.3),
+        }
+    }
+
+    fn make_bot_config() -> crate::config::BotConfig {
+        use crate::config::*;
+        BotConfig {
+            name: "Test".into(),
+            default_provider: None,
+            system_prompt_path: "config/system_prompt.md".into(),
+            core_persona_path: "memory/core.md".into(),
+            compaction: CompactionConfig::default(),
+            max_concurrent_llm: 4,
+            max_response_tokens: 1024,
+        }
+    }
+
+    fn make_settings_with(entries: Vec<(&str, ProviderEntry)>) -> Settings {
         use crate::config::*;
         Settings {
-            bot: BotConfig {
-                name: "Test".into(),
-                system_prompt_path: "config/system_prompt.md".into(),
-                core_persona_path: "memory/core.md".into(),
-                compaction: CompactionConfig::default(),
-                max_concurrent_llm: 4,
-                max_response_tokens: 1024,
-            },
+            bot: make_bot_config(),
             providers: ProvidersConfig {
-                anthropic: Some(ProviderEntry {
-                    base_url: "https://api.anthropic.com".into(),
-                    model: "claude-sonnet-4-20250514".into(),
-                    api_key_env: None,
-                    timeout_secs: 60,
-                    max_retries: 3,
-                    max_history_tokens: 8192,
-                    temperature: Some(0.7),
-                }),
-                openai: Some(ProviderEntry {
-                    base_url: "http://localhost:11434/v1".into(),
-                    model: "llama3".into(),
-                    api_key_env: None,
-                    timeout_secs: 60,
-                    max_retries: 3,
-                    max_history_tokens: 4096,
-                    temperature: Some(0.3),
-                }),
+                entries: entries
+                    .into_iter()
+                    .map(|(name, entry)| (name.to_string(), entry))
+                    .collect(),
             },
             channels: ChannelsConfig::default(),
             database: DatabaseConfig::default(),
@@ -215,17 +247,19 @@ mod tests {
         }
     }
 
+    fn make_settings_both() -> Settings {
+        make_settings_with(vec![
+            ("anthropic", anthropic_entry()),
+            ("openai", openai_entry()),
+        ])
+    }
+
     fn make_settings_openai_only() -> Settings {
-        let mut s = make_settings_both();
-        s.providers.anthropic = None;
-        s
+        make_settings_with(vec![("openai", openai_entry())])
     }
 
     fn make_settings_none() -> Settings {
-        let mut s = make_settings_both();
-        s.providers.anthropic = None;
-        s.providers.openai = None;
-        s
+        make_settings_with(vec![])
     }
 
     #[test]
@@ -235,6 +269,65 @@ mod tests {
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].name, "anthropic");
         assert_eq!(providers[1].name, "openai");
+    }
+
+    #[test]
+    fn default_provider_takes_precedence_over_anthropic() {
+        // PROV-8: bot.default_provider = "gemini" puts gemini first even when
+        // anthropic and openai are also configured.
+        let mut settings = make_settings_with(vec![
+            ("anthropic", anthropic_entry()),
+            ("openai", openai_entry()),
+            (
+                "gemini",
+                ProviderEntry {
+                    base_url: "https://generativelanguage.googleapis.com".into(),
+                    model: "gemini-1.5-pro".into(),
+                    api_key_env: None,
+                    timeout_secs: 60,
+                    max_retries: 3,
+                    max_history_tokens: 8192,
+                    temperature: Some(0.5),
+                },
+            ),
+        ]);
+        settings.bot.default_provider = Some("gemini".into());
+
+        let providers = resolve_configured_providers(&settings);
+        assert_eq!(providers.len(), 3);
+        assert_eq!(providers[0].name, "gemini");
+        // The remaining two keep the historical anthropic-then-openai order.
+        assert_eq!(providers[1].name, "anthropic");
+        assert_eq!(providers[2].name, "openai");
+    }
+
+    #[test]
+    fn default_provider_unset_keeps_anthropic_first() {
+        // With default_provider unset, a custom provider sorts after the
+        // hardcoded anthropic/openai preference.
+        let mut settings = make_settings_with(vec![
+            ("anthropic", anthropic_entry()),
+            ("openai", openai_entry()),
+            (
+                "gemini",
+                ProviderEntry {
+                    base_url: "https://generativelanguage.googleapis.com".into(),
+                    model: "gemini-1.5-pro".into(),
+                    api_key_env: None,
+                    timeout_secs: 60,
+                    max_retries: 3,
+                    max_history_tokens: 8192,
+                    temperature: Some(0.5),
+                },
+            ),
+        ]);
+        settings.bot.default_provider = None;
+
+        let providers = resolve_configured_providers(&settings);
+        assert_eq!(providers.len(), 3);
+        assert_eq!(providers[0].name, "anthropic");
+        assert_eq!(providers[1].name, "openai");
+        assert_eq!(providers[2].name, "gemini");
     }
 
     #[test]
@@ -268,6 +361,30 @@ mod tests {
     fn resolve_named_provider_not_found() {
         let settings = make_settings_both();
         assert!(resolve_named_provider("gemini", &settings).is_none());
+    }
+
+    #[test]
+    fn resolve_named_custom_provider_found() {
+        // PROV-8: a custom provider name is resolvable once it is in the config
+        // map — this was impossible with the old hardcoded match arms.
+        let settings = make_settings_with(vec![(
+            "gemini",
+            ProviderEntry {
+                base_url: "https://generativelanguage.googleapis.com".into(),
+                model: "gemini-1.5-pro".into(),
+                api_key_env: None,
+                timeout_secs: 60,
+                max_retries: 3,
+                max_history_tokens: 8192,
+                temperature: Some(0.5),
+            },
+        )]);
+        let resolved = resolve_named_provider("gemini", &settings);
+        assert!(resolved.is_some(), "custom provider should resolve");
+        let r = resolved.unwrap();
+        assert_eq!(r.name, "gemini");
+        assert_eq!(r.config.model, "gemini-1.5-pro");
+        assert_eq!(r.config.base_url, "https://generativelanguage.googleapis.com");
     }
 
     #[test]

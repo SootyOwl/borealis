@@ -19,6 +19,8 @@ system_prompt_path = "config/system_prompt.md" # Path to system prompt (loaded a
 core_persona_path = "memory/core.md"           # Aurora's self-knowledge file (editable by Aurora)
 max_response_tokens = 1024                     # Max tokens per LLM response; replies that hit this
                                                # limit are visibly marked as truncated
+# default_provider = "anthropic"               # which configured provider to use; if unset, falls back
+                                               # to anthropic, then openai, then any other (alphabetical)
 
 [bot.compaction]
 enabled = true                                 # Automatically summarize old conversation history
@@ -29,8 +31,11 @@ summary_prompt_path = "config/compaction_prompt.md"
 # ---------------------------------------------------------------------------
 # LLM Providers
 # ---------------------------------------------------------------------------
-# At least one provider must be configured. Borealis tries providers in order:
-# Anthropic first, then OpenAI-compatible.
+# At least one provider must be configured. Provider sections are keyed by
+# name ([providers.anthropic], [providers.openai], or any custom name like
+# [providers.gemini] backed by a downstream ProviderRegistration). The primary
+# provider is chosen by bot.default_provider; if unset, Borealis falls back to
+# anthropic, then openai, then any other configured provider (alphabetical).
 #
 # API keys use env var indirection: api_key_env names the env var that holds
 # the actual secret (never put secrets in config files).

@@ -61,6 +61,12 @@ pub struct Settings {
 #[derive(Debug, Deserialize)]
 pub struct BotConfig {
     pub name: String,
+    /// Which configured provider to use as the primary pipeline provider.
+    /// If unset, resolution falls back to `anthropic`, then `openai`, then any
+    /// other configured provider (alphabetical). See `default_provider`
+    /// handling in `providers::registry::resolve_configured_providers`.
+    #[serde(default)]
+    pub default_provider: Option<String>,
     #[serde(default = "default_system_prompt_path")]
     pub system_prompt_path: PathBuf,
     #[serde(default = "default_core_persona_path")]
@@ -135,12 +141,17 @@ fn default_summary_prompt_path() -> PathBuf {
 // Providers
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+/// Configured LLM providers, keyed by provider name.
+///
+/// Provider sections (`[providers.anthropic]`, `[providers.openai]`,
+/// `[providers.gemini]`, …) all flatten into `entries`, so an arbitrary
+/// provider name can be expressed in config and resolved against the
+/// inventory of `ProviderRegistration` entries — no core changes needed to
+/// add a new provider (PROV-8).
+#[derive(Debug, Default, Deserialize)]
 pub struct ProvidersConfig {
-    #[serde(default)]
-    pub anthropic: Option<ProviderEntry>,
-    #[serde(default)]
-    pub openai: Option<ProviderEntry>,
+    #[serde(flatten)]
+    pub entries: std::collections::HashMap<String, ProviderEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -505,15 +516,27 @@ impl Settings {
     /// Validate resolved settings — checks that referenced env vars are set
     /// and contain non-empty values.
     fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(ref anthropic) = self.providers.anthropic
-            && let Some(ref key_env) = anthropic.api_key_env
-        {
-            resolve_env_var("providers.anthropic.api_key_env", key_env)?;
+        // Provider API keys are a HARD dependency: if an entry names an
+        // api_key_env, that env var must resolve to a non-empty value. This
+        // iterates every configured provider, including custom ones (PROV-8).
+        for (name, entry) in &self.providers.entries {
+            if let Some(ref key_env) = entry.api_key_env {
+                resolve_env_var(&format!("providers.{name}.api_key_env"), key_env)?;
+            }
         }
-        if let Some(ref openai) = self.providers.openai
-            && let Some(ref key_env) = openai.api_key_env
+        // If `bot.default_provider` is set it must name a configured provider —
+        // otherwise a typo silently boots on a different provider (fall back to
+        // anthropic/openai/...) with no warning. Fail fast instead.
+        if let Some(ref preferred) = self.bot.default_provider
+            && !self.providers.entries.contains_key(preferred)
         {
-            resolve_env_var("providers.openai.api_key_env", key_env)?;
+            let mut available: Vec<&str> =
+                self.providers.entries.keys().map(String::as_str).collect();
+            available.sort_unstable();
+            return Err(ConfigError::Validation(format!(
+                "bot.default_provider = {preferred:?} is not a configured provider \
+                 (available: {available:?})"
+            )));
         }
         if let Some(ref discord) = self.channels.discord
             && discord.enabled
@@ -542,12 +565,8 @@ impl Settings {
                 "bot.max_response_tokens must be > 0".into(),
             ));
         }
-        let provider_entries = [
-            ("anthropic", self.providers.anthropic.as_ref()),
-            ("openai", self.providers.openai.as_ref()),
-        ];
-        for (name, entry) in provider_entries {
-            if let Some(t) = entry.and_then(|e| e.temperature)
+        for (name, entry) in &self.providers.entries {
+            if let Some(t) = entry.temperature
                 && !(0.0..=2.0).contains(&t)
             {
                 return Err(ConfigError::Validation(format!(
@@ -613,21 +632,16 @@ impl Settings {
                 "bot.compaction.threshold must be in (0.0, 1.0], got {threshold}"
             )));
         }
-        for (name, entry) in [
-            ("anthropic", self.providers.anthropic.as_ref()),
-            ("openai", self.providers.openai.as_ref()),
-        ] {
-            if let Some(entry) = entry {
-                if entry.timeout_secs == 0 {
-                    return Err(ConfigError::Validation(format!(
-                        "providers.{name}.timeout_secs must be > 0"
-                    )));
-                }
-                if entry.max_history_tokens == 0 {
-                    return Err(ConfigError::Validation(format!(
-                        "providers.{name}.max_history_tokens must be > 0"
-                    )));
-                }
+        for (name, entry) in &self.providers.entries {
+            if entry.timeout_secs == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "providers.{name}.timeout_secs must be > 0"
+                )));
+            }
+            if entry.max_history_tokens == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "providers.{name}.max_history_tokens must be > 0"
+                )));
             }
         }
         if self.tools.computer_use.command_timeout_secs == 0 {
@@ -709,6 +723,113 @@ timezone = "{tz}"
             .build()
             .expect("build config");
         config.try_deserialize().expect("deserialize Settings")
+    }
+
+    // --- PROV-8: arbitrary provider names flatten into entries ----------------
+
+    #[test]
+    fn providers_flatten_arbitrary_names_into_entries() {
+        // Proves `#[serde(flatten)] HashMap<String, ProviderEntry>` populates
+        // from layered TOML via the `config` crate: a hardcoded name
+        // (anthropic) AND a custom one (customllm) both land in `entries`.
+        let toml = r#"
+[bot]
+name = "TestBot"
+
+[tools.web]
+enabled = false
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-4-20250514"
+
+[providers.customllm]
+base_url = "http://localhost:9000/v1"
+model = "custom-model"
+temperature = 0.4
+"#;
+        let settings: Settings = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config")
+            .try_deserialize()
+            .expect("deserialize Settings");
+
+        let entries = &settings.providers.entries;
+        assert!(
+            entries.contains_key("anthropic"),
+            "anthropic should land in entries, got keys: {:?}",
+            entries.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            entries.contains_key("customllm"),
+            "custom provider name should land in entries, got keys: {:?}",
+            entries.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(entries["customllm"].base_url, "http://localhost:9000/v1");
+        assert_eq!(entries["customllm"].model, "custom-model");
+        assert_eq!(entries["customllm"].temperature, Some(0.4));
+        // Defaults still apply to flattened entries.
+        assert_eq!(entries["anthropic"].timeout_secs, 60);
+        assert_eq!(entries["customllm"].max_retries, 3);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_default_provider() {
+        // A typo'd default_provider must fail fast, not silently fall back.
+        let toml = r#"
+[bot]
+name = "TestBot"
+default_provider = "gemeni"
+
+[tools.web]
+enabled = false
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-4-20250514"
+"#;
+        let settings: Settings = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config")
+            .try_deserialize()
+            .expect("deserialize Settings");
+        let err = settings
+            .validate()
+            .expect_err("unknown default_provider should fail validation");
+        match err {
+            ConfigError::Validation(msg) => {
+                assert!(
+                    msg.contains("gemeni") && msg.contains("default_provider"),
+                    "error should name the bad value, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_configured_default_provider() {
+        let toml = r#"
+[bot]
+name = "TestBot"
+default_provider = "anthropic"
+
+[tools.web]
+enabled = false
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-4-20250514"
+"#;
+        let settings: Settings = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config")
+            .try_deserialize()
+            .expect("deserialize Settings");
+        assert!(settings.validate().is_ok());
     }
 
     #[test]

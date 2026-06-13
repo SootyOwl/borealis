@@ -34,8 +34,8 @@ async fn main() -> anyhow::Result<()> {
     info!(bot_name = %settings.bot.name, "configuration loaded");
 
     info!(
-        providers.anthropic = settings.providers.anthropic.is_some(),
-        providers.openai = settings.providers.openai.is_some(),
+        providers = ?settings.providers.entries.keys().collect::<Vec<_>>(),
+        default_provider = ?settings.bot.default_provider,
         channels.cli = settings.channels.cli.is_some(),
         channels.discord = settings.channels.discord.is_some(),
         database.path = %settings.database.path.display(),

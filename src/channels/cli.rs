@@ -76,6 +76,7 @@ impl CliAdapter {
                 },
                 channel_id: "cli".into(),
                 reply_to: None,
+                guild_id: None,
             },
             tool_groups: None,
             completion_flag: None,

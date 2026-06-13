@@ -94,12 +94,16 @@ const CHANNEL_BUFFER: usize = 256;
 /// trait and calling [`ChannelRegistry::register`].
 pub struct ChannelRegistry {
     handles: Vec<(String, Vec<JoinHandle<()>>)>,
+    /// Per-channel dispatchers, retained so `await_shutdown` can drain their
+    /// in-flight conversation workers before the process exits.
+    dispatchers: Vec<Arc<ConversationDispatcher>>,
 }
 
 impl ChannelRegistry {
     pub fn new() -> Self {
         Self {
             handles: Vec::new(),
+            dispatchers: Vec::new(),
         }
     }
 
@@ -128,6 +132,13 @@ impl ChannelRegistry {
                     result = Channel::run_inbound(ch, in_tx) => {
                         if let Err(e) = result {
                             error!(channel = %name, "inbound error: {e}");
+                            // A fatal inbound error (bad token, fatal gateway error)
+                            // is unrecoverable — serenity already auto-reconnects
+                            // transient drops, so anything that propagates here is
+                            // terminal. Fail fast: cancel the whole process so a
+                            // supervisor/systemd restarts it, rather than running
+                            // deaf with the outbound task busy-polling forever.
+                            cancel.cancel();
                         }
                     }
                     _ = cancel.cancelled() => {
@@ -156,12 +167,16 @@ impl ChannelRegistry {
             })
         };
 
+        // Create the dispatcher up front so the registry can retain a clone and
+        // drain its in-flight workers at shutdown (see `await_shutdown`).
+        let dispatcher =
+            ConversationDispatcher::new(pipeline, out_tx, cancel.clone(), name.clone());
+        self.dispatchers.push(Arc::clone(&dispatcher));
+
         // Spawn the dispatcher loop that routes events to per-conversation workers.
         let processing_handle = {
             let name = name.clone();
             let cancel = cancel.clone();
-            let dispatcher =
-                ConversationDispatcher::new(pipeline, out_tx, cancel.clone(), name.clone());
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -171,7 +186,7 @@ impl ChannelRegistry {
                                 if let Some(ref sec) = security {
                                     let result = sec.rate_limiter.check(
                                         &event.message.author.id,
-                                        None,
+                                        event.context.guild_id.as_deref(),
                                     );
                                     if result != crate::security::RateLimitResult::Allowed {
                                         tracing::warn!(
@@ -213,6 +228,13 @@ impl ChannelRegistry {
     }
 
     /// Wait for all channel tasks to complete (typically via cancellation).
+    ///
+    /// Joining the per-channel handles waits for the inbound, outbound and
+    /// dispatcher-loop tasks to stop. Those loops exit on cancel, but the
+    /// per-conversation workers are spawned separately, so we then drain each
+    /// dispatcher to let any in-flight pipeline processing (LLM call / history
+    /// write) finish before returning. The caller is expected to have cancelled
+    /// the token already.
     pub async fn await_shutdown(self) {
         for (name, handles) in self.handles {
             for handle in handles {
@@ -220,6 +242,11 @@ impl ChannelRegistry {
                     error!(channel = %name, "task join error: {e}");
                 }
             }
+        }
+
+        // Drain in-flight conversation workers across all channels.
+        for dispatcher in &self.dispatchers {
+            dispatcher.drain().await;
         }
     }
 }
@@ -265,6 +292,7 @@ mod tests {
                     },
                     channel_id: "mock".into(),
                     reply_to: None,
+                    guild_id: None,
                 },
                 tool_groups: None,
                 completion_flag: None,
@@ -301,6 +329,11 @@ mod tests {
 
     /// Helper to create a Security instance with a tight rate limit for testing.
     fn make_test_security(capacity: u32) -> Arc<Security> {
+        make_test_security_with_guilds(capacity, vec![])
+    }
+
+    /// Like [`make_test_security`] but with a configurable `allowed_guilds` list.
+    fn make_test_security_with_guilds(capacity: u32, allowed_guilds: Vec<String>) -> Arc<Security> {
         let config = crate::config::RateLimitConfig {
             per_user: crate::config::TokenBucketConfig {
                 capacity,
@@ -311,7 +344,7 @@ mod tests {
                 refill_secs: 60,
             },
             allowed_users: vec!["allowed-user".into()],
-            allowed_guilds: vec![],
+            allowed_guilds,
         };
         let tmp = std::env::temp_dir().join("borealis_test_ratelimit");
         let _ = std::fs::create_dir_all(&tmp);
@@ -319,6 +352,14 @@ mod tests {
     }
 
     fn make_test_event(user_id: &str, source: crate::core::event::ChannelSource) -> InEvent {
+        make_test_event_with_guild(user_id, source, None)
+    }
+
+    fn make_test_event_with_guild(
+        user_id: &str,
+        source: crate::core::event::ChannelSource,
+        guild_id: Option<String>,
+    ) -> InEvent {
         InEvent {
             source: source.clone(),
             message: crate::core::event::Message {
@@ -338,6 +379,7 @@ mod tests {
                 },
                 channel_id: "test".into(),
                 reply_to: None,
+                guild_id,
             },
             tool_groups: None,
             completion_flag: None,
@@ -446,6 +488,70 @@ mod tests {
         }
 
         assert_eq!(received, 3, "all scheduler events should bypass rate limit");
+
+        drop(in_tx);
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    /// CORE-4: a user whose message carries a guild id on the `allowed_guilds`
+    /// list bypasses the per-user rate limit. This exercises the same
+    /// `guild_id.as_deref()` threading the real dispatcher loop uses.
+    #[tokio::test]
+    async fn allowed_guild_user_bypasses_rate_limit() {
+        let cancel = CancellationToken::new();
+        let pipeline: Arc<dyn PipelineRunner> = Arc::new(EchoPipeline);
+        // capacity=1 per user, but "trusted" guild is allowlisted.
+        let security = make_test_security_with_guilds(1, vec!["trusted".into()]);
+
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<InEvent>(64);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<OutEvent>(64);
+
+        let sec = Some(security);
+        let dispatcher =
+            ConversationDispatcher::new(pipeline, out_tx, cancel.clone(), "test".into());
+
+        // Mirror the real dispatcher loop's rate-limit check, threading guild_id.
+        let handle = tokio::spawn(async move {
+            while let Some(event) = in_rx.recv().await {
+                if event.source != ChannelSource::Scheduler {
+                    if let Some(ref s) = sec {
+                        let result = s
+                            .rate_limiter
+                            .check(&event.message.author.id, event.context.guild_id.as_deref());
+                        if result != crate::security::RateLimitResult::Allowed {
+                            continue;
+                        }
+                    }
+                }
+                dispatcher.dispatch(event).await;
+            }
+        });
+
+        // Send 5 messages from one user in the trusted guild — capacity is 1,
+        // but the guild bypass means all 5 pass.
+        for _ in 0..5 {
+            in_tx
+                .send(make_test_event_with_guild(
+                    "guild-user",
+                    ChannelSource::Discord,
+                    Some("trusted".into()),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut received = 0;
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), out_rx.recv()).await
+        {
+            received += 1;
+        }
+
+        assert_eq!(
+            received, 5,
+            "all messages from an allowed-guild user should bypass the per-user limit"
+        );
 
         drop(in_tx);
         cancel.cancel();

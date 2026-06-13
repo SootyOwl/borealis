@@ -53,12 +53,36 @@ pub struct RequestConfig {
     pub stop_sequences: Vec<String>,
 }
 
+/// Why the model stopped generating, normalized across providers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StopReason {
+    /// Natural end of turn (Anthropic `end_turn`, OpenAI `stop`).
+    /// Also the default when the provider reports no stop reason.
+    #[default]
+    EndTurn,
+    /// Output was cut off by the max output token limit
+    /// (Anthropic `max_tokens`, OpenAI `length`).
+    MaxTokens,
+    /// The model stopped to invoke tools
+    /// (Anthropic `tool_use`, OpenAI `tool_calls`).
+    ToolUse,
+    /// The provider refused to continue generating
+    /// (Anthropic `refusal`, OpenAI `content_filter`).
+    Refusal,
+    /// Any other provider-specific reason, preserved verbatim
+    /// (e.g. Anthropic `pause_turn`, `stop_sequence`).
+    Other(String),
+}
+
 /// Response from an LLM provider.
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
+    /// Why generation stopped. Pipelines use this to detect truncated
+    /// responses (`MaxTokens`) so they are not persisted as clean turns.
+    pub stop_reason: StopReason,
 }
 
 /// Configuration for constructing a provider instance.

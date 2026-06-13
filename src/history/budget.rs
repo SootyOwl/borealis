@@ -116,42 +116,27 @@ impl ContextBudget {
     ///
     /// Order:
     /// 1. System message: system_prompt (+ core_persona if non-empty)
-    /// 2. All messages from `turns` in order (flattened)
-    /// 3. If `retrieved_memories` is non-empty: a system message with the memories
+    /// 2. If `summary` is `Some`: a system message with the compaction summary,
+    ///    placed right after the persona and before any history so it is fixed,
+    ///    non-evictable context (the turns themselves are pre-evicted by the
+    ///    caller; the summary is never part of that selection).
+    /// 3. All messages from `turns` in order (flattened)
+    /// 4. If `retrieved_memories` is non-empty: a system message with the memories
     pub fn assemble(
         &self,
         system_prompt: &str,
         core_persona: &str,
         turns: &[Turn],
         retrieved_memories: &[String],
+        summary: Option<&str>,
     ) -> Vec<ChatMessage> {
-        let mut messages = Vec::new();
-
-        // 1. System message
-        let system_content = if core_persona.is_empty() {
-            system_prompt.to_string()
-        } else {
-            format!("{}\n\n## Core Persona\n\n{}", system_prompt, core_persona)
-        };
-        messages.push(ChatMessage::system(system_content));
-
-        // 2. History
-        for turn in turns {
-            for msg in &turn.messages {
-                messages.push(msg.clone());
-            }
-        }
-
-        // 3. Retrieved memories (optional trailing system message)
-        if !retrieved_memories.is_empty() {
-            let memory_content = format!(
-                "## Retrieved Memories\n\n{}",
-                retrieved_memories.join("\n\n")
-            );
-            messages.push(ChatMessage::system(memory_content));
-        }
-
-        messages
+        Self::assemble_static(
+            system_prompt,
+            core_persona,
+            turns,
+            retrieved_memories,
+            summary,
+        )
     }
 
     /// Same as [`assemble`](Self::assemble) but callable without a `ContextBudget` instance.
@@ -162,9 +147,11 @@ impl ContextBudget {
         core_persona: &str,
         turns: &[Turn],
         retrieved_memories: &[String],
+        summary: Option<&str>,
     ) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
 
+        // 1. System message (persona).
         let system_content = if core_persona.is_empty() {
             system_prompt.to_string()
         } else {
@@ -172,12 +159,23 @@ impl ContextBudget {
         };
         messages.push(ChatMessage::system(system_content));
 
+        // 2. Compaction summary — fixed, non-evictable context. Placed after the
+        //    persona and before history so it always survives turn eviction and
+        //    400-recovery rebuilds.
+        if let Some(summary_text) = summary {
+            messages.push(ChatMessage::system(format!(
+                "## Conversation Summary\n\n{summary_text}"
+            )));
+        }
+
+        // 3. History.
         for turn in turns {
             for msg in &turn.messages {
                 messages.push(msg.clone());
             }
         }
 
+        // 4. Retrieved memories (optional trailing system message).
         if !retrieved_memories.is_empty() {
             let memory_content = format!(
                 "## Retrieved Memories\n\n{}",
@@ -302,7 +300,7 @@ mod tests {
         let turns = vec![make_turn("t1", 10, "hello")];
         let memories = vec!["memory one".to_string(), "memory two".to_string()];
 
-        let msgs = cb.assemble("SYS", "PERSONA", &turns, &memories);
+        let msgs = cb.assemble("SYS", "PERSONA", &turns, &memories, None);
 
         // [0] system, [1] user, [2] assistant, [3] memories system
         assert_eq!(msgs.len(), 4);
@@ -321,7 +319,7 @@ mod tests {
     fn assemble_with_empty_persona() {
         let cb = ContextBudget::new(10_000, 500, 0, 0, 0);
         let turns: Vec<Turn> = vec![];
-        let msgs = cb.assemble("SYS_ONLY", "", &turns, &[]);
+        let msgs = cb.assemble("SYS_ONLY", "", &turns, &[], None);
 
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "SYS_ONLY");
@@ -332,7 +330,7 @@ mod tests {
     fn assemble_with_no_memories() {
         let cb = ContextBudget::new(10_000, 500, 0, 0, 0);
         let turns = vec![make_turn("t1", 10, "hi")];
-        let msgs = cb.assemble("SYS", "PERSONA", &turns, &[]);
+        let msgs = cb.assemble("SYS", "PERSONA", &turns, &[], None);
 
         // system + user + assistant — no trailing memories message
         assert_eq!(msgs.len(), 3);
@@ -346,5 +344,73 @@ mod tests {
             .filter(|m| m.content.contains("## Retrieved Memories"))
             .collect();
         assert!(memory_msgs.is_empty());
+    }
+
+    // --- summary (BUD-1) ---
+
+    #[test]
+    fn assemble_places_summary_after_persona_before_history() {
+        let cb = ContextBudget::new(10_000, 500, 0, 0, 0);
+        let turns = vec![make_turn("t1", 10, "hello")];
+        let msgs = cb.assemble("SYS", "PERSONA", &turns, &[], Some("prior context here"));
+
+        // [0] system(persona), [1] system(summary), [2] user, [3] assistant
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].role, crate::types::Role::System);
+        assert!(msgs[0].content.contains("SYS"));
+        assert_eq!(msgs[1].role, crate::types::Role::System);
+        assert!(msgs[1].content.contains("## Conversation Summary"));
+        assert!(msgs[1].content.contains("prior context here"));
+        // History follows the summary.
+        assert_eq!(msgs[2].role, crate::types::Role::User);
+        assert_eq!(msgs[3].role, crate::types::Role::Assistant);
+    }
+
+    #[test]
+    fn assemble_omits_summary_when_none() {
+        let cb = ContextBudget::new(10_000, 500, 0, 0, 0);
+        let turns = vec![make_turn("t1", 10, "hi")];
+        let msgs = cb.assemble("SYS", "PERSONA", &turns, &[], None);
+        assert!(
+            !msgs.iter().any(|m| m.content.contains("## Conversation Summary")),
+            "no summary message should be emitted when summary is None"
+        );
+    }
+
+    #[test]
+    fn summary_survives_tight_budget_eviction() {
+        // Simulate the pipeline path: under a tight budget, old turns are
+        // evicted via select_turns, but the summary (passed separately to
+        // assemble) must still appear in the assembled output.
+        let cb = budget(100);
+        let turns = vec![
+            make_turn("t1", 100, "a"),
+            make_turn("t2", 100, "b"),
+            make_turn("t3", 100, "c"),
+        ];
+        let selection = cb.select_turns(&turns);
+        // Tight budget keeps only the most recent turn.
+        assert_eq!(selection.included.len(), 1);
+        assert_eq!(selection.included[0].turn_id, "t3");
+
+        let included: Vec<Turn> = selection.included.iter().map(|t| (*t).clone()).collect();
+        let msgs = cb.assemble("SYS", "PERSONA", &included, &[], Some("evicted-era summary"));
+
+        assert!(
+            msgs.iter().any(|m| m.content.contains("## Conversation Summary")
+                && m.content.contains("evicted-era summary")),
+            "summary must survive even when old turns are evicted under a tight budget"
+        );
+    }
+
+    #[test]
+    fn assemble_static_threads_summary() {
+        let turns = vec![make_turn("t1", 10, "hi")];
+        let msgs = ContextBudget::assemble_static("SYS", "PERSONA", &turns, &[], Some("static sum"));
+        assert!(
+            msgs.iter().any(|m| m.content.contains("## Conversation Summary")
+                && m.content.contains("static sum")),
+            "assemble_static must thread the summary through"
+        );
     }
 }

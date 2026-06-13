@@ -149,6 +149,9 @@ pub struct MessageContext {
     pub channel_id: String,
     /// Message this is a reply to, if any.
     pub reply_to: Option<MessageId>,
+    /// Discord guild id for guild messages; `None` for DMs, CLI, and scheduler
+    /// events. Used by the rate limiter's `allowed_guilds` bypass.
+    pub guild_id: Option<String>,
 }
 
 /// An inbound event from a channel adapter to the core.

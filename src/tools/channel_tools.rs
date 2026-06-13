@@ -10,6 +10,9 @@ use crate::tools::{
 };
 
 fn register(registry: &mut ToolRegistry, deps: &ToolDeps) {
+    if !deps.settings.tools.channel.enabled {
+        return;
+    }
     let root = deps.settings.tools.computer_use.sandbox_root.clone();
     let memory_dir = root.join("memory");
     let sandbox = Arc::new(Sandbox::with_memory_dir(root, memory_dir));
@@ -375,6 +378,67 @@ mod tests {
             }
             _ => panic!("expected custom emoji"),
         }
+    }
+
+    /// Build a `Settings` from a TOML snippet for testing the registration gate.
+    fn settings_from_toml(toml: &str) -> crate::config::Settings {
+        config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .expect("build config")
+            .try_deserialize()
+            .expect("deserialize settings")
+    }
+
+    /// Run the inventory registration fn with the given settings and return the registry.
+    fn registry_for_settings(settings: &crate::config::Settings) -> ToolRegistry {
+        let conn = std::sync::Arc::new(std::sync::Mutex::new(
+            rusqlite::Connection::open_in_memory().expect("open sqlite"),
+        ));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let memory_store = Arc::new(
+            crate::memory::SqliteMemory::new(Arc::clone(&conn), tmp.path().join("core.md"))
+                .expect("memory store"),
+        );
+        let history_store = Arc::new(crate::history::store::HistoryStore::new(conn));
+        let deps = ToolDeps {
+            settings,
+            memory_store,
+            history_store,
+            discord_http: Arc::new(tokio::sync::OnceCell::new()),
+        };
+        let mut registry = ToolRegistry::new();
+        super::register(&mut registry, &deps);
+        registry
+    }
+
+    const BASE_TOML: &str = r#"
+        [bot]
+        name = "test"
+        [providers]
+    "#;
+
+    #[test]
+    fn channel_tools_registered_by_default() {
+        // No [tools.channel] section — backward compat: tools are registered.
+        let settings = settings_from_toml(BASE_TOML);
+        let registry = registry_for_settings(&settings);
+        assert!(registry.has_tool("react"));
+        assert!(registry.has_tool("send_message"));
+        assert!(registry.has_tool("send_file"));
+    }
+
+    #[test]
+    fn channel_tools_not_registered_when_disabled() {
+        let toml = format!(
+            "{BASE_TOML}\n[tools.channel]\nenabled = false\n"
+        );
+        let settings = settings_from_toml(&toml);
+        let registry = registry_for_settings(&settings);
+        assert_eq!(registry.tool_count(), 0);
+        assert!(!registry.has_tool("react"));
+        assert!(!registry.has_tool("send_message"));
+        assert!(!registry.has_tool("send_file"));
     }
 
     #[test]

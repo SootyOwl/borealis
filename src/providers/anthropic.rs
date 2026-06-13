@@ -5,12 +5,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::retry::with_retry;
 use super::{
-    ChatMessage, LlmResponse, Provider, ProviderConfig, RequestConfig, Role, TokenUsage, ToolCall,
-    ToolDef,
+    ChatMessage, LlmResponse, Provider, ProviderConfig, RequestConfig, Role, StopReason,
+    TokenUsage, ToolCall, ToolDef,
 };
 use crate::core::pipeline::{Pipeline, PipelineDeps, PipelineRunner};
 
@@ -170,7 +170,6 @@ impl Provider for AnthropicProvider {
 struct AnthropicResponse {
     content: Vec<ContentBlock>,
     usage: AnthropicUsage,
-    #[allow(dead_code)]
     stop_reason: Option<String>,
 }
 
@@ -185,6 +184,11 @@ enum ContentBlock {
         name: String,
         input: serde_json::Value,
     },
+    /// Catch-all for block types we don't handle (e.g. `thinking`).
+    /// Unknown blocks are skipped with a warning instead of failing the
+    /// whole response parse.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +292,16 @@ fn parse_response(response: AnthropicResponse) -> Result<LlmResponse> {
                     arguments: input,
                 });
             }
+            ContentBlock::Unknown(value) => {
+                let block_type = value
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("<missing type>");
+                warn!(
+                    block_type,
+                    "skipping unknown content block in Anthropic response"
+                );
+            }
         }
     }
 
@@ -304,7 +318,19 @@ fn parse_response(response: AnthropicResponse) -> Result<LlmResponse> {
             input_tokens: response.usage.input_tokens,
             output_tokens: response.usage.output_tokens,
         },
+        stop_reason: map_stop_reason(response.stop_reason.as_deref()),
     })
+}
+
+/// Map Anthropic's `stop_reason` strings to the provider-neutral enum.
+fn map_stop_reason(reason: Option<&str>) -> StopReason {
+    match reason {
+        None | Some("end_turn") => StopReason::EndTurn,
+        Some("max_tokens") => StopReason::MaxTokens,
+        Some("tool_use") => StopReason::ToolUse,
+        Some("refusal") => StopReason::Refusal,
+        Some(other) => StopReason::Other(other.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +460,7 @@ mod tests {
         assert!(result.tool_calls.is_empty());
         assert_eq!(result.usage.input_tokens, 10);
         assert_eq!(result.usage.output_tokens, 5);
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
     }
 
     #[test]
@@ -460,6 +487,61 @@ mod tests {
         assert_eq!(result.text, Some("Searching...".to_string()));
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].name, "memory_search");
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn test_parse_response_max_tokens_stop_reason() {
+        let response = AnthropicResponse {
+            content: vec![ContentBlock::Text {
+                text: "Truncated mid-sen".into(),
+            }],
+            usage: AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 1024,
+            },
+            stop_reason: Some("max_tokens".into()),
+        };
+
+        let result = parse_response(response).unwrap();
+        assert_eq!(result.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn test_map_stop_reason() {
+        assert_eq!(map_stop_reason(Some("end_turn")), StopReason::EndTurn);
+        assert_eq!(map_stop_reason(Some("max_tokens")), StopReason::MaxTokens);
+        assert_eq!(map_stop_reason(Some("tool_use")), StopReason::ToolUse);
+        assert_eq!(map_stop_reason(Some("refusal")), StopReason::Refusal);
+        assert_eq!(
+            map_stop_reason(Some("pause_turn")),
+            StopReason::Other("pause_turn".into())
+        );
+        assert_eq!(
+            map_stop_reason(Some("stop_sequence")),
+            StopReason::Other("stop_sequence".into())
+        );
+        assert_eq!(map_stop_reason(None), StopReason::EndTurn);
+    }
+
+    #[test]
+    fn test_parse_response_skips_unknown_block_types() {
+        // A response containing an unknown `thinking` block must still parse:
+        // the unknown block is skipped and the text is extracted normally.
+        let raw = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "Let me reason about this...", "signature": "abc"},
+                {"type": "text", "text": "The answer is 42."}
+            ],
+            "usage": {"input_tokens": 30, "output_tokens": 12},
+            "stop_reason": "end_turn"
+        });
+
+        let response: AnthropicResponse = serde_json::from_value(raw).unwrap();
+        let result = parse_response(response).unwrap();
+        assert_eq!(result.text, Some("The answer is 42.".to_string()));
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.usage.input_tokens, 30);
     }
 
     #[test]
@@ -530,5 +612,36 @@ mod tests {
         assert_eq!(wire_tools.len(), 1);
         assert_eq!(wire_tools[0]["name"], "test_tool");
         assert_eq!(wire_tools[0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn test_build_request_body_omits_temperature_when_none() {
+        let config = ProviderConfig {
+            api_key: "test".into(),
+            base_url: "https://api.anthropic.com".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            timeout_secs: 60,
+            max_retries: 3,
+        };
+        let provider = AnthropicProvider::new(config).unwrap();
+
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: "Hi".into(),
+            tool_call_id: None,
+            tool_calls: vec![],
+        }];
+
+        let req_config = RequestConfig {
+            temperature: None,
+            max_tokens: Some(1024),
+            stop_sequences: vec![],
+        };
+
+        let body = provider.build_request_body(&messages, &[], &req_config);
+        assert!(
+            body.get("temperature").is_none(),
+            "temperature must be omitted when None so the API default applies"
+        );
     }
 }

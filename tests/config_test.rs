@@ -246,34 +246,32 @@ name = "LocalAurora"
 // ---------------------------------------------------------------------------
 // Validation tests (env var indirection)
 //
-// These test the resolve_env_var logic. Since we can't import from a binary
-// crate, we mirror the function and verify the error message format.
+// These exercise the REAL `resolve_env_var` from the library crate (LIFE-14),
+// so the test cannot silently pass if that function regresses.
 // ---------------------------------------------------------------------------
 
-/// Mirror of the resolve_env_var logic from config.rs for testing.
-fn resolve_env_var(field: &str, env_var: &str) -> Result<String, String> {
-    match std::env::var(env_var) {
-        Ok(val) if val.is_empty() => Err(format!(
-            "environment variable '{env_var}' (referenced by {field}) is set but empty — \
-             provide a non-empty value"
-        )),
-        Ok(val) => Ok(val),
-        Err(_) => Err(format!(
-            "environment variable '{env_var}' (referenced by {field}) is not set — \
-             set it or remove '{field}' from the config"
-        )),
-    }
+use borealis::config::resolve_env_var;
+
+// Serializes the env-touching tests in this (separate) test binary. `set_var`
+// is unsafe under concurrency because `setenv` may realloc the environment
+// while another thread is in `getenv`; holding this lock across each test's
+// env window makes those accesses mutually exclusive.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 #[test]
 fn resolve_env_var_missing() {
+    let _env = env_guard();
     // This var should not exist in the environment.
     let result = resolve_env_var(
         "providers.anthropic.api_key_env",
         "BOREALIS_TEST_NONEXISTENT_KEY_7f3a9c",
     );
     assert!(result.is_err());
-    let err_msg = result.unwrap_err();
+    let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("BOREALIS_TEST_NONEXISTENT_KEY_7f3a9c"),
         "error should name the missing env var, got: {err_msg}"
@@ -286,7 +284,7 @@ fn resolve_env_var_missing() {
 
 #[test]
 fn resolve_env_var_empty() {
-    // SAFETY: single-threaded test with a unique var name.
+    let _env = env_guard();
     unsafe { std::env::set_var("BOREALIS_TEST_EMPTY_KEY_a1b2c3", "") };
 
     let result = resolve_env_var(
@@ -294,7 +292,7 @@ fn resolve_env_var_empty() {
         "BOREALIS_TEST_EMPTY_KEY_a1b2c3",
     );
     assert!(result.is_err());
-    let err_msg = result.unwrap_err();
+    let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("empty"),
         "error should mention empty value, got: {err_msg}"
@@ -305,7 +303,7 @@ fn resolve_env_var_empty() {
 
 #[test]
 fn resolve_env_var_valid() {
-    // SAFETY: single-threaded test with a unique var name.
+    let _env = env_guard();
     unsafe { std::env::set_var("BOREALIS_TEST_VALID_KEY_d4e5f6", "sk-abc123") };
 
     let result = resolve_env_var(

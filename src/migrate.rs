@@ -116,7 +116,19 @@ pub struct MigrationStats {
     pub persona_updated: bool,
     pub archival_notes_imported: usize,
     pub messages_imported: usize,
+    /// Messages skipped because their `message_type` is unsupported (e.g.
+    /// `reasoning_message`). NOT a dedup counter — see `messages_skipped_existing`.
     pub messages_skipped: usize,
+
+    // --- Idempotent re-import skip counters (MIG-2) ---
+    /// Non-persona core blocks skipped because they were already imported on a
+    /// previous run (matched in `letta_imported`).
+    pub core_blocks_skipped: usize,
+    /// Archival passages skipped because they were already imported.
+    pub archival_notes_skipped: usize,
+    /// Messages skipped because they were already imported (distinct from
+    /// `messages_skipped`, which counts unsupported types).
+    pub messages_skipped_existing: usize,
 }
 
 impl std::fmt::Display for MigrationStats {
@@ -127,6 +139,11 @@ impl std::fmt::Display for MigrationStats {
             "  Core memory blocks imported: {}",
             self.core_blocks_imported
         )?;
+        writeln!(
+            f,
+            "  Core blocks skipped (already imported): {}",
+            self.core_blocks_skipped
+        )?;
         writeln!(f, "  Persona (core.md) updated:   {}", self.persona_updated)?;
         writeln!(
             f,
@@ -135,15 +152,118 @@ impl std::fmt::Display for MigrationStats {
         )?;
         writeln!(
             f,
+            "  Archival notes skipped (already imported): {}",
+            self.archival_notes_skipped
+        )?;
+        writeln!(
+            f,
             "  Messages imported:            {}",
             self.messages_imported
         )?;
         writeln!(
             f,
-            "  Messages skipped:             {}",
+            "  Messages skipped (unsupported type): {}",
             self.messages_skipped
         )?;
+        writeln!(
+            f,
+            "  Messages skipped (already imported): {}",
+            self.messages_skipped_existing
+        )?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provenance tracking (MIG-2: idempotent re-import)
+// ---------------------------------------------------------------------------
+
+/// Tracks which Letta source rows have already been imported, so a re-run
+/// against an updated export skips what is already present rather than
+/// duplicating it.
+///
+/// Backed by a migration-owned `letta_imported` table (created in
+/// [`run_migration`]). This deliberately does NOT touch the `notes` or
+/// `messages` schemas — provenance is recorded out-of-band keyed by the Letta
+/// source id (`passage.id` / `msg.id` / `block.id`).
+///
+/// Wiring choice: the import functions already receive `&SqliteMemory` /
+/// `&HistoryStore`, both of which wrap the SAME `Arc<Mutex<Connection>>` that
+/// `run_migration` owns. Rather than reach through the stores, we hand each
+/// import function a `&Provenance` that holds its own clone of that `Arc`. This
+/// keeps the dedup concern in one small, self-contained type, leaves the store
+/// APIs untouched, and never deadlocks: `is_imported`/`record_imported` acquire
+/// and release the lock around a single statement each, and are only called
+/// *between* store calls (never while a store guard is held).
+struct Provenance {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl Provenance {
+    fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|poisoned| {
+            warn!("migration provenance connection mutex was poisoned; recovering");
+            poisoned.into_inner()
+        })
+    }
+
+    /// True if `source_id` was already recorded as imported on a prior run.
+    fn is_imported(&self, source_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM letta_imported WHERE source_id = ?1)",
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .context("failed to query letta_imported")?;
+        Ok(exists)
+    }
+
+    /// Record `source_id` (of the given `kind`) as imported, stamping the
+    /// current time. `INSERT OR IGNORE` keeps this safe even if a row id
+    /// somehow appears twice within a single run.
+    fn record_imported(&self, source_id: &str, kind: &str) -> Result<()> {
+        let conn = self.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO letta_imported (source_id, kind, imported_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![source_id, kind, now],
+        )
+        .context("failed to record letta_imported row")?;
+        Ok(())
+    }
+}
+
+/// Resolve a Letta-supplied timestamp into a value to persist.
+///
+/// - `Some(ts)` that parses as RFC 3339 → returned as-is (callers that store it
+///   in the notes table get it normalized to canonical millis there; the
+///   messages table stores it verbatim, which is acceptable for ordering).
+/// - `Some(ts)` that does NOT parse → fall back to now() with a `warn!`.
+/// - `None` (field absent in the export) → fall back to now() silently.
+///
+/// We validate leniently rather than rejecting: a migration should never abort
+/// because one row has a malformed date.
+fn resolve_letta_timestamp(raw: Option<&str>, context: &str) -> String {
+    match raw {
+        Some(ts) => {
+            if chrono::DateTime::parse_from_rfc3339(ts).is_ok() {
+                ts.to_string()
+            } else {
+                warn!(
+                    raw = ts,
+                    context, "unparseable Letta timestamp; falling back to now()"
+                );
+                chrono::Utc::now().to_rfc3339()
+            }
+        }
+        None => chrono::Utc::now().to_rfc3339(),
     }
 }
 
@@ -176,8 +296,20 @@ pub fn run_migration(
     {
         let c = conn.lock().expect("mutex poisoned");
         history_schema::initialize(&c).context("failed to initialize history schema")?;
+
+        // Migration-owned provenance table for idempotent re-imports (MIG-2).
+        // Deliberately separate from the notes/messages schemas — no ALTER TABLE.
+        c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS letta_imported (
+                 source_id   TEXT PRIMARY KEY,
+                 kind        TEXT NOT NULL,
+                 imported_at TEXT NOT NULL
+             );",
+        )
+        .context("failed to initialize letta_imported provenance table")?;
     }
     let history_store = HistoryStore::new(Arc::clone(&conn));
+    let provenance = Provenance::new(Arc::clone(&conn));
 
     let mut stats = MigrationStats::default();
 
@@ -189,7 +321,7 @@ pub fn run_migration(
             .with_context(|| format!("failed to read {}", core_path.display()))?;
         let memory: LettaMemory = serde_json::from_str(&data)
             .with_context(|| format!("failed to parse {}", core_path.display()))?;
-        import_core_memory(&memory_store, &memory, &mut stats)?;
+        import_core_memory(&memory_store, &provenance, &memory, &mut stats)?;
     } else {
         info!("no core_memory.json found, skipping core memory import");
     }
@@ -202,7 +334,7 @@ pub fn run_migration(
             .with_context(|| format!("failed to read {}", archival_path.display()))?;
         let passages: Vec<LettaPassage> = serde_json::from_str(&data)
             .with_context(|| format!("failed to parse {}", archival_path.display()))?;
-        import_archival_memory(&memory_store, &passages, &mut stats)?;
+        import_archival_memory(&memory_store, &provenance, &passages, &mut stats)?;
     } else {
         info!("no archival_memory.json found, skipping archival memory import");
     }
@@ -215,7 +347,7 @@ pub fn run_migration(
             .with_context(|| format!("failed to read {}", messages_path.display()))?;
         let messages: Vec<LettaMessageRaw> = serde_json::from_str(&data)
             .with_context(|| format!("failed to parse {}", messages_path.display()))?;
-        import_messages(&history_store, &messages, &mut stats)?;
+        import_messages(&history_store, &provenance, &messages, &mut stats)?;
     } else {
         info!("no messages.json found, skipping conversation history import");
     }
@@ -280,6 +412,7 @@ fn sanitize_letta_tag(raw: &str) -> Option<String> {
 
 fn import_core_memory(
     store: &SqliteMemory,
+    provenance: &Provenance,
     memory: &LettaMemory,
     stats: &mut MigrationStats,
 ) -> Result<()> {
@@ -287,14 +420,30 @@ fn import_core_memory(
         let label = block.label.as_deref().unwrap_or("unknown");
 
         if label == "persona" {
-            // Persona block → overwrite core.md
+            // Persona block → overwrite core.md. This is idempotent by nature
+            // (it overwrites a single file), so it is NOT gated on provenance:
+            // a re-run simply re-applies the latest persona text.
             store
                 .update_note("core", &block.value)
                 .context("failed to update core.md with persona block")?;
             stats.persona_updated = true;
+            stats.core_blocks_imported += 1;
             info!(label, "persona block → core.md");
         } else {
-            // Other blocks (human, custom) → note rows
+            // Other blocks (human, custom) → note rows.
+            //
+            // Dedup on the Letta block id when present. Blocks with no id
+            // (`id: None`) are imported unconditionally and NOT recorded — we
+            // cannot dedup without a stable key. In practice Letta blocks carry
+            // ids, so a re-run only re-imports id-less blocks (rare).
+            if let Some(id) = block.id.as_deref() {
+                if provenance.is_imported(id)? {
+                    stats.core_blocks_skipped += 1;
+                    info!(label, id, "core block already imported → skipping");
+                    continue;
+                }
+            }
+
             let title = format!("Letta core: {label}");
             let mut tags: Vec<String> = ["letta-core", label]
                 .iter()
@@ -311,9 +460,12 @@ fn import_core_memory(
             store
                 .create_note(&title, &block.value, &tags)
                 .with_context(|| format!("failed to create note for block '{label}'"))?;
+            if let Some(id) = block.id.as_deref() {
+                provenance.record_imported(id, "core_block")?;
+            }
             info!(label, "core block → note row");
+            stats.core_blocks_imported += 1;
         }
-        stats.core_blocks_imported += 1;
     }
     Ok(())
 }
@@ -324,10 +476,22 @@ fn import_core_memory(
 
 fn import_archival_memory(
     store: &SqliteMemory,
+    provenance: &Provenance,
     passages: &[LettaPassage],
     stats: &mut MigrationStats,
 ) -> Result<()> {
     for (i, passage) in passages.iter().enumerate() {
+        // Dedup on the Letta passage id when present. Passages with no id
+        // (`id: None`) are imported unconditionally and NOT recorded — we
+        // cannot dedup without a stable key, so a re-run would re-import such
+        // rows. In practice Letta passages always carry ids.
+        if let Some(id) = passage.id.as_deref() {
+            if provenance.is_imported(id)? {
+                stats.archival_notes_skipped += 1;
+                continue;
+            }
+        }
+
         let title = format!(
             "Letta archival #{}",
             passage.id.as_deref().unwrap_or(&format!("{}", i + 1))
@@ -348,9 +512,16 @@ fn import_archival_memory(
             }
         }
 
+        // Preserve the original Letta timestamp; fall back to now() if absent
+        // or unparseable.
+        let created_at = resolve_letta_timestamp(passage.created_at.as_deref(), "archival passage");
+
         store
-            .create_note(&title, &passage.text, &tags)
+            .create_note_at(&title, &passage.text, &tags, &created_at)
             .with_context(|| format!("failed to create note for passage {}", i + 1))?;
+        if let Some(id) = passage.id.as_deref() {
+            provenance.record_imported(id, "passage")?;
+        }
         stats.archival_notes_imported += 1;
     }
 
@@ -387,6 +558,7 @@ fn fxhash(data: &[u8]) -> u32 {
 
 fn import_messages(
     history_store: &HistoryStore,
+    provenance: &Provenance,
     messages: &[LettaMessageRaw],
     stats: &mut MigrationStats,
 ) -> Result<()> {
@@ -410,6 +582,21 @@ fn import_messages(
     let mut current_step: Option<String> = None;
 
     for msg in messages {
+        // Dedup on the Letta message id when present. Messages with no id
+        // (`id: None`) are imported unconditionally and NOT recorded — we
+        // cannot dedup without a stable key, so a re-run would re-import such
+        // rows. In practice Letta messages always carry ids.
+        //
+        // The skip happens BEFORE conversion and BEFORE the turn-tracking
+        // update, so an already-imported message neither re-inserts nor
+        // disturbs the step→turn grouping of the messages that follow it.
+        if let Some(id) = msg.id.as_deref() {
+            if provenance.is_imported(id)? {
+                stats.messages_skipped_existing += 1;
+                continue;
+            }
+        }
+
         let chat_msg = match convert_letta_message(msg) {
             Some(m) => m,
             None => {
@@ -428,9 +615,17 @@ fn import_messages(
             None
         };
 
+        // Preserve the original Letta timestamp; fall back to now() if absent
+        // or unparseable.
+        let created_at = resolve_letta_timestamp(msg.date.as_deref(), "message");
+
         let used_turn = history_store
-            .append_message(&conv_id, &chat_msg, turn_id)
+            .append_message_at(&conv_id, &chat_msg, turn_id, &created_at)
             .context("failed to append migrated message")?;
+
+        if let Some(id) = msg.id.as_deref() {
+            provenance.record_imported(id, "message")?;
+        }
 
         current_turn_id = Some(used_turn);
         current_step = msg.step_id.clone();
@@ -440,6 +635,7 @@ fn import_messages(
     info!(
         imported = stats.messages_imported,
         skipped = stats.messages_skipped,
+        skipped_existing = stats.messages_skipped_existing,
         "conversation history import complete"
     );
     Ok(())
@@ -540,6 +736,7 @@ fn extract_content_string(content: &Option<Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
     use tempfile::TempDir;
 
     fn setup_test_env() -> (TempDir, TempDir) {
@@ -925,5 +1122,300 @@ mod tests {
 
         let h3 = fxhash(b"different");
         assert_ne!(h1, h3);
+    }
+
+    // --- MIG-1: original Letta timestamps are preserved ---
+
+    #[test]
+    fn migrate_archival_preserves_letta_created_at() {
+        let (source_dir, data_dir) = setup_test_env();
+        let archival_json = serde_json::json!([
+            {
+                "id": "passage-ts",
+                "text": "A passage with a known created_at.",
+                "created_at": "2024-03-04T05:06:07Z"
+            }
+        ]);
+        std::fs::write(
+            source_dir.path().join("archival_memory.json"),
+            serde_json::to_string(&archival_json).unwrap(),
+        )
+        .unwrap();
+
+        let db_path = data_dir.path().join("test.db");
+        let core_md = data_dir.path().join("core.md");
+
+        let stats = run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+        assert_eq!(stats.archival_notes_imported, 1);
+
+        // The stored note's created_at must equal the Letta value (normalized to
+        // canonical millis RFC3339), NOT "now".
+        let conn = Connection::open(&db_path).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let store = SqliteMemory::new(conn, core_md).unwrap();
+        let page = store
+            .list_notes_paginated(Some("letta-archival"), false, 10, 0)
+            .unwrap();
+        assert_eq!(page.notes.len(), 1);
+        assert_eq!(page.notes[0].created_at, "2024-03-04T05:06:07.000Z");
+    }
+
+    #[test]
+    fn migrate_archival_without_created_at_falls_back_to_now() {
+        let (source_dir, data_dir) = setup_test_env();
+        // No created_at field at all.
+        let archival_json = serde_json::json!([
+            { "id": "passage-no-ts", "text": "No timestamp here." }
+        ]);
+        std::fs::write(
+            source_dir.path().join("archival_memory.json"),
+            serde_json::to_string(&archival_json).unwrap(),
+        )
+        .unwrap();
+
+        let db_path = data_dir.path().join("test.db");
+        let core_md = data_dir.path().join("core.md");
+
+        run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let store = SqliteMemory::new(conn, core_md).unwrap();
+        let page = store
+            .list_notes_paginated(Some("letta-archival"), false, 10, 0)
+            .unwrap();
+        assert_eq!(page.notes.len(), 1);
+        // Fallback should produce a recent timestamp (this decade), not 2024.
+        assert!(
+            page.notes[0].created_at.starts_with("202"),
+            "expected an RFC3339 fallback timestamp, got {}",
+            page.notes[0].created_at
+        );
+        assert!(page.notes[0].created_at.as_str() >= "2026-");
+    }
+
+    #[test]
+    fn migrate_messages_preserve_letta_date() {
+        let (source_dir, data_dir) = setup_test_env();
+        let messages_json = serde_json::json!([
+            {
+                "id": "message-ts-1",
+                "date": "2023-07-08T09:10:11Z",
+                "message_type": "user_message",
+                "content": "Message with a known date.",
+                "step_id": "step-x"
+            }
+        ]);
+        std::fs::write(
+            source_dir.path().join("messages.json"),
+            serde_json::to_string(&messages_json).unwrap(),
+        )
+        .unwrap();
+
+        let db_path = data_dir.path().join("test.db");
+        let core_md = data_dir.path().join("core.md");
+
+        let stats = run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+        assert_eq!(stats.messages_imported, 1);
+
+        // Query the message's created_at directly from the DB.
+        let conn = Connection::open(&db_path).unwrap();
+        let created_at: String = conn
+            .query_row(
+                "SELECT created_at FROM messages WHERE content = ?1",
+                params!["Message with a known date."],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The Letta `date` is stored verbatim by append_message_at.
+        assert_eq!(created_at, "2023-07-08T09:10:11Z");
+    }
+
+    // --- MIG-2: idempotent re-import ---
+
+    fn count_rows(db_path: &Path, table: &str) -> i64 {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn migrate_is_idempotent_on_rerun() {
+        let (source_dir, data_dir) = setup_test_env();
+        let archival_json = serde_json::json!([
+            { "id": "passage-1", "text": "First passage.", "created_at": "2025-01-01T00:00:00Z" },
+            { "id": "passage-2", "text": "Second passage.", "created_at": "2025-01-02T00:00:00Z" }
+        ]);
+        std::fs::write(
+            source_dir.path().join("archival_memory.json"),
+            serde_json::to_string(&archival_json).unwrap(),
+        )
+        .unwrap();
+        let messages_json = serde_json::json!([
+            {
+                "id": "message-1",
+                "date": "2025-01-01T00:00:00Z",
+                "message_type": "user_message",
+                "content": "Hello",
+                "step_id": "s1"
+            },
+            {
+                "id": "message-2",
+                "date": "2025-01-01T00:00:05Z",
+                "message_type": "user_message",
+                "content": "Again",
+                "step_id": "s2"
+            }
+        ]);
+        std::fs::write(
+            source_dir.path().join("messages.json"),
+            serde_json::to_string(&messages_json).unwrap(),
+        )
+        .unwrap();
+
+        let db_path = data_dir.path().join("test.db");
+        let core_md = data_dir.path().join("core.md");
+
+        // First run imports everything.
+        let s1 = run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+        assert_eq!(s1.archival_notes_imported, 2);
+        assert_eq!(s1.messages_imported, 2);
+        assert_eq!(s1.archival_notes_skipped, 0);
+        assert_eq!(s1.messages_skipped_existing, 0);
+
+        let notes_after_1 = count_rows(&db_path, "notes");
+        let msgs_after_1 = count_rows(&db_path, "messages");
+        assert_eq!(notes_after_1, 2);
+        assert_eq!(msgs_after_1, 2);
+
+        // Second run imports NOTHING new — everything is skipped as already imported.
+        let s2 = run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+        assert_eq!(s2.archival_notes_imported, 0);
+        assert_eq!(s2.messages_imported, 0);
+        assert_eq!(s2.archival_notes_skipped, 2);
+        assert_eq!(s2.messages_skipped_existing, 2);
+
+        // Row counts must NOT have doubled.
+        assert_eq!(count_rows(&db_path, "notes"), notes_after_1);
+        assert_eq!(count_rows(&db_path, "messages"), msgs_after_1);
+    }
+
+    #[test]
+    fn migrate_third_run_imports_only_new_rows() {
+        let (source_dir, data_dir) = setup_test_env();
+        let archival_json = serde_json::json!([
+            { "id": "passage-1", "text": "First passage.", "created_at": "2025-01-01T00:00:00Z" }
+        ]);
+        std::fs::write(
+            source_dir.path().join("archival_memory.json"),
+            serde_json::to_string(&archival_json).unwrap(),
+        )
+        .unwrap();
+        let messages_json = serde_json::json!([
+            {
+                "id": "message-1",
+                "date": "2025-01-01T00:00:00Z",
+                "message_type": "user_message",
+                "content": "Hello",
+                "step_id": "s1"
+            }
+        ]);
+        std::fs::write(
+            source_dir.path().join("messages.json"),
+            serde_json::to_string(&messages_json).unwrap(),
+        )
+        .unwrap();
+
+        let db_path = data_dir.path().join("test.db");
+        let core_md = data_dir.path().join("core.md");
+
+        // Run 1 and 2: same source.
+        run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+        run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+        assert_eq!(count_rows(&db_path, "notes"), 1);
+        assert_eq!(count_rows(&db_path, "messages"), 1);
+
+        // Add ONE new passage and ONE new message to the source.
+        let archival_json = serde_json::json!([
+            { "id": "passage-1", "text": "First passage.", "created_at": "2025-01-01T00:00:00Z" },
+            { "id": "passage-2", "text": "Brand new passage.", "created_at": "2025-06-01T00:00:00Z" }
+        ]);
+        std::fs::write(
+            source_dir.path().join("archival_memory.json"),
+            serde_json::to_string(&archival_json).unwrap(),
+        )
+        .unwrap();
+        let messages_json = serde_json::json!([
+            {
+                "id": "message-1",
+                "date": "2025-01-01T00:00:00Z",
+                "message_type": "user_message",
+                "content": "Hello",
+                "step_id": "s1"
+            },
+            {
+                "id": "message-2",
+                "date": "2025-06-01T00:00:00Z",
+                "message_type": "user_message",
+                "content": "New message",
+                "step_id": "s2"
+            }
+        ]);
+        std::fs::write(
+            source_dir.path().join("messages.json"),
+            serde_json::to_string(&messages_json).unwrap(),
+        )
+        .unwrap();
+
+        // Run 3: only the new rows should import.
+        let s3 = run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+        assert_eq!(s3.archival_notes_imported, 1);
+        assert_eq!(s3.messages_imported, 1);
+        assert_eq!(s3.archival_notes_skipped, 1);
+        assert_eq!(s3.messages_skipped_existing, 1);
+
+        assert_eq!(count_rows(&db_path, "notes"), 2);
+        assert_eq!(count_rows(&db_path, "messages"), 2);
+    }
+
+    #[test]
+    fn migrate_core_blocks_are_idempotent_on_rerun() {
+        let (source_dir, data_dir) = setup_test_env();
+        let core_json = serde_json::json!({
+            "blocks": [
+                { "id": "block-persona", "value": "I am Aurora.", "label": "persona" },
+                { "id": "block-human", "value": "The human is Tyto.", "label": "human" }
+            ]
+        });
+        std::fs::write(
+            source_dir.path().join("core_memory.json"),
+            serde_json::to_string(&core_json).unwrap(),
+        )
+        .unwrap();
+
+        let db_path = data_dir.path().join("test.db");
+        let core_md = data_dir.path().join("core.md");
+
+        let s1 = run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+        // persona overwrites core.md; human becomes a note.
+        assert_eq!(s1.core_blocks_imported, 2);
+        assert!(s1.persona_updated);
+        let notes_after_1 = count_rows(&db_path, "notes");
+        assert_eq!(notes_after_1, 1, "only the human block becomes a note row");
+
+        // Re-run: the human note must not duplicate; persona is still overwritten.
+        let s2 = run_migration(source_dir.path(), &db_path, &core_md).unwrap();
+        assert!(s2.persona_updated, "persona overwrite is idempotent by nature");
+        assert_eq!(
+            s2.core_blocks_skipped, 1,
+            "the human core block should be skipped as already imported"
+        );
+        assert_eq!(
+            count_rows(&db_path, "notes"),
+            notes_after_1,
+            "re-running must not duplicate the human core note"
+        );
     }
 }

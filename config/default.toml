@@ -17,6 +17,10 @@
 name = "Aurora"                                # Display name for the bot
 system_prompt_path = "config/system_prompt.md" # Path to system prompt (loaded at startup)
 core_persona_path = "memory/core.md"           # Aurora's self-knowledge file (editable by Aurora)
+max_response_tokens = 1024                     # Max tokens per LLM response; replies that hit this
+                                               # limit are visibly marked as truncated
+# default_provider = "anthropic"               # which configured provider to use; if unset, falls back
+                                               # to anthropic, then openai, then any other (alphabetical)
 
 [bot.compaction]
 enabled = true                                 # Automatically summarize old conversation history
@@ -27,8 +31,11 @@ summary_prompt_path = "config/compaction_prompt.md"
 # ---------------------------------------------------------------------------
 # LLM Providers
 # ---------------------------------------------------------------------------
-# At least one provider must be configured. Borealis tries providers in order:
-# Anthropic first, then OpenAI-compatible.
+# At least one provider must be configured. Provider sections are keyed by
+# name ([providers.anthropic], [providers.openai], or any custom name like
+# [providers.gemini] backed by a downstream ProviderRegistration). The primary
+# provider is chosen by bot.default_provider; if unset, Borealis falls back to
+# anthropic, then openai, then any other configured provider (alphabetical).
 #
 # API keys use env var indirection: api_key_env names the env var that holds
 # the actual secret (never put secrets in config files).
@@ -42,6 +49,7 @@ summary_prompt_path = "config/compaction_prompt.md"
 # timeout_secs = 60
 # max_retries = 3
 # max_history_tokens = 8192
+# temperature = 0.7                            # sampling temperature (defaults to 0.7 if omitted)
 
 # OpenAI-compatible — works with Ollama, OpenAI, OpenRouter, etc.
 # This default config points at a local Ollama instance (no API key needed).
@@ -52,6 +60,7 @@ model = "llama3"
 timeout_secs = 60
 max_retries = 3
 max_history_tokens = 4096
+temperature = 0.7                              # sampling temperature (defaults to 0.7 if omitted)
 
 # ---------------------------------------------------------------------------
 # Channel adapters
@@ -116,15 +125,22 @@ refill_secs = 2                                # 1 token per 2s = 30 msg/min sus
 # Tools — Computer Use
 # ---------------------------------------------------------------------------
 # Give Aurora access to the filesystem and shell.
-# The sandbox restricts where file tools can read/write.
+# The sandbox restricts where the file_* tools can read/write.
 # Memory is managed separately via memory_* tools — the sandbox doesn't need
 # to know about the memory directory.
+#
+# SECURITY: bash_exec is NOT confined by sandbox_root. The sandbox root is
+# only the working directory of spawned commands — absolute paths (or `cd`)
+# escape it entirely, and the allowlist checks only the base command name.
+# The real boundary is the authorization layer: bash_exec and file_write are
+# restricted tools, callable only by users in rate_limit.allowed_users.
 
 [tools.computer_use]
 enabled = true
-sandbox_root = "."                             # file tools are restricted to this directory
-command_allowlist = []                         # empty = all commands allowed; e.g. ["ls", "cat", "grep"]
+sandbox_root = "."                             # file_* tools are restricted to this directory (bash_exec is NOT — see note above)
+command_allowlist = []                         # empty = all commands allowed; e.g. ["ls", "cat", "grep"] — checks the base command only, not file paths
 command_timeout_secs = 30                      # kill commands that run longer than this
+max_output_bytes = 65536                       # cap captured output (bash stdout/stderr, file_read) — truncated with a marker
 # excluded_paths = ["secrets/", ".env"]        # (future) additional paths to block
 
 # ---------------------------------------------------------------------------
@@ -136,8 +152,18 @@ command_timeout_secs = 30                      # kill commands that run longer t
 
 [tools.web]
 enabled = true
-jina_api_key_env = "JINA_API_KEY"              # env var holding Jina API key
+jina_api_key_env = "JINA_API_KEY"              # OPTIONAL env var holding Jina API key; if unset/empty, fetches are IP-rate-limited (does not block boot)
 max_fetch_bytes = 51200                        # 50 KiB max response size (prevents context blowup)
+
+# ---------------------------------------------------------------------------
+# Tools — Channel
+# ---------------------------------------------------------------------------
+# Discord interaction tools: react, send_message, send_file.
+# These are restricted tools — only users in rate_limit.allowed_users can
+# trigger them. Disable entirely if Aurora shouldn't proactively send.
+
+[tools.channel]
+enabled = true
 
 # ---------------------------------------------------------------------------
 # Scheduler

@@ -262,6 +262,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
             },
+            stop_reason: crate::providers::StopReason::EndTurn,
         }
     }
 

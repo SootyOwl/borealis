@@ -32,8 +32,6 @@ pub enum MemoryError {
     Database(#[from] rusqlite::Error),
     #[error("core.md I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("lock poisoned")]
-    LockPoisoned,
 }
 
 pub type MemoryResult<T> = Result<T, MemoryError>;
@@ -201,12 +199,20 @@ impl SqliteMemory {
     }
 
     /// Acquire the database connection, recovering from mutex poisoning.
-    fn lock_conn(&self) -> MemoryResult<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|_| MemoryError::LockPoisoned)
+    ///
+    /// A panic while holding the lock poisons the mutex, but the SQLite
+    /// connection state itself is sound across a Rust panic (statement-level
+    /// rollback applies), so we recover the guard rather than permanently
+    /// bricking every store that shares this connection.
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("memory store connection mutex was poisoned by a panic; recovering");
+            poisoned.into_inner()
+        })
     }
 
     fn init_schema(&self) -> MemoryResult<()> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
 
         // Step 1: create base tables and index.
         conn.execute_batch(
@@ -335,7 +341,7 @@ impl SqliteMemory {
     /// Generate a note ID like `note_a1b2c3d4` using a random u32.
     /// Checks for collisions and regenerates if needed.
     fn generate_id(&self) -> MemoryResult<String> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         loop {
             let id = format!("note_{:08x}", rand::random::<u32>());
             let exists: bool = conn.query_row(
@@ -359,6 +365,23 @@ impl SqliteMemory {
     /// gives correct ordering without any custom collation.
     fn now_iso() -> String {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// Normalize an arbitrary RFC 3339 timestamp string into the store's
+    /// canonical UTC millisecond format (`...:SS.mmmZ`).
+    ///
+    /// This keeps externally-supplied timestamps (e.g. migrated from Letta)
+    /// lex-sortable and format-consistent with [`now_iso`](Self::now_iso),
+    /// matching what the schema backfill in `init_schema` would otherwise
+    /// normalize them to. Any RFC 3339 / ISO 8601 input with an offset is
+    /// converted to UTC. Returns `None` if the input is not parseable.
+    fn normalize_rfc3339(input: &str) -> Option<String> {
+        chrono::DateTime::parse_from_rfc3339(input)
+            .ok()
+            .map(|dt| {
+                dt.with_timezone(&chrono::Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            })
     }
 
     fn read_core(&self) -> MemoryResult<Note> {
@@ -572,17 +595,38 @@ impl SqliteMemory {
     }
 }
 
-impl Memory for SqliteMemory {
-    fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
+impl SqliteMemory {
+    /// Create a note stamped with a caller-supplied `created_at` (used as both
+    /// `created_at` and `updated_at`), instead of the current time.
+    ///
+    /// This exists for the Letta migration, which must preserve the original
+    /// `passage.created_at` rather than stamping `Utc::now()`. The supplied
+    /// timestamp is normalized to the store's canonical millisecond RFC 3339
+    /// format when it parses as RFC 3339; otherwise it is stored verbatim
+    /// (the `init_schema` second-precision backfill still normalizes the common
+    /// `...:SSZ` shape on the next open, so non-canonical-but-RFC3339 input
+    /// stays lex-sortable either way).
+    ///
+    /// The regular trait [`create_note`](Memory::create_note) delegates here
+    /// with `now_iso()`, so the two share one code path.
+    pub fn create_note_at(
+        &self,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        created_at: &str,
+    ) -> MemoryResult<Note> {
         let normalized = normalize_tags(tags)?;
         let id = self.generate_id()?;
-        let now = Self::now_iso();
-        let conn = self.lock_conn()?;
+        // Normalize the incoming timestamp to canonical millis RFC3339 when we
+        // can; fall back to the raw string for anything unparseable.
+        let ts = Self::normalize_rfc3339(created_at).unwrap_or_else(|| created_at.to_string());
+        let conn = self.lock_conn();
 
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO notes (id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, title, content, now, now],
+            params![id, title, content, ts, ts],
         )?;
 
         for tag in &normalized {
@@ -599,9 +643,15 @@ impl Memory for SqliteMemory {
             content: content.to_string(),
             tags: normalized,
             links: Vec::new(),
-            created_at: now.clone(),
-            updated_at: now,
+            created_at: ts.clone(),
+            updated_at: ts,
         })
+    }
+}
+
+impl Memory for SqliteMemory {
+    fn create_note(&self, title: &str, content: &str, tags: &[String]) -> MemoryResult<Note> {
+        self.create_note_at(title, content, tags, &Self::now_iso())
     }
 
     fn read_note(&self, id: &str) -> MemoryResult<Note> {
@@ -609,7 +659,7 @@ impl Memory for SqliteMemory {
             return self.read_core();
         }
 
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         let note = conn
             .query_row(
                 "SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ?1 AND deleted_at IS NULL",
@@ -646,7 +696,7 @@ impl Memory for SqliteMemory {
         }
 
         let now = Self::now_iso();
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
 
         let rows = conn.execute(
             "UPDATE notes SET content = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
@@ -667,7 +717,7 @@ impl Memory for SqliteMemory {
         }
 
         let now = Self::now_iso();
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
 
         let rows = conn.execute(
             "UPDATE notes SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
@@ -706,7 +756,7 @@ impl Memory for SqliteMemory {
             return Ok(Vec::new());
         }
 
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
 
         // Run the FTS5 query, falling back to a phrase-wrapped query on parse error.
         let notes = self.run_fts_query(&conn, query, &normalized_tag, tag_exact, limit)?;
@@ -723,7 +773,7 @@ impl Memory for SqliteMemory {
     }
 
     fn list_notes(&self, tag_filter: Option<&str>) -> MemoryResult<Vec<Note>> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
 
         let notes = if let Some(tag) = tag_filter {
             let normalized = normalize_tag(tag)?;
@@ -793,7 +843,7 @@ impl Memory for SqliteMemory {
             return Err(MemoryError::ReservedId);
         }
 
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
 
         // Verify both notes exist and are not deleted
         self.assert_note_exists_locked(&conn, from_id)?;
@@ -814,7 +864,7 @@ impl Memory for SqliteMemory {
     }
 
     fn get_links_for_note(&self, id: &str) -> MemoryResult<Vec<Link>> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT from_id, to_id, relation, 'outgoing' AS direction FROM links WHERE from_id = ?1
              UNION ALL
@@ -839,7 +889,7 @@ impl Memory for SqliteMemory {
         }
 
         let normalized = normalize_tags(tags)?;
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
         self.assert_note_exists_locked(&conn, id)?;
 
         // Replace all tags atomically
@@ -874,7 +924,7 @@ impl Memory for SqliteMemory {
         limit: usize,
         offset: usize,
     ) -> MemoryResult<PaginatedNotes> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
 
         // Normalize the tag filter if provided.
         let normalized = match tag_filter {
@@ -1000,7 +1050,7 @@ impl Memory for SqliteMemory {
     }
 
     fn list_tags(&self, prefix: Option<&str>) -> MemoryResult<Vec<TagCount>> {
-        let conn = self.lock_conn()?;
+        let conn = self.lock_conn();
 
         let normalized: Option<String> = match prefix {
             Some(p) => Some(normalize_tag(p)?),
@@ -1042,6 +1092,30 @@ mod tests {
         std::fs::write(&tmp_path, "# Test Core\nI am a test persona.").unwrap();
         let store = SqliteMemory::new(conn, tmp_path).unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn memory_store_recovers_from_poisoned_mutex() {
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "# Test Core").unwrap();
+        let store = SqliteMemory::new(Arc::clone(&conn), tmp.path().to_path_buf()).unwrap();
+
+        // Poison the shared mutex by panicking while holding the lock.
+        let poisoner = Arc::clone(&conn);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the shared connection mutex");
+        })
+        .join();
+        assert!(conn.is_poisoned(), "mutex should be poisoned");
+
+        // The store must keep working after the poisoning panic.
+        let note = store
+            .create_note("After poison", "still alive", &[])
+            .expect("memory store should recover from a poisoned mutex");
+        let read = store.read_note(&note.id).unwrap();
+        assert_eq!(read.content, "still alive");
     }
 
     #[test]
@@ -1963,7 +2037,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = store.lock_conn().unwrap();
+        let conn = store.lock_conn();
         let (created, updated, deleted): (String, String, Option<String>) = conn
             .query_row(
                 "SELECT created_at, updated_at, deleted_at FROM notes WHERE id = 'legacy_2'",
@@ -2001,7 +2075,7 @@ mod tests {
                 .unwrap();
         }
         {
-            let conn = store.lock_conn().unwrap();
+            let conn = store.lock_conn();
             conn.execute(
                 "UPDATE notes SET updated_at = '2026-04-07T12:00:00Z' WHERE deleted_at IS NULL",
                 [],
@@ -2710,7 +2784,7 @@ mod tests {
         );
 
         // Verify directly: the FTS row must be gone.
-        let conn = store.lock_conn().unwrap();
+        let conn = store.lock_conn();
         let fts_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?1)",

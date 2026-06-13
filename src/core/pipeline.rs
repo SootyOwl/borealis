@@ -16,13 +16,18 @@ use crate::history::compaction::{CompactionService, CompactionState};
 use crate::history::store::HistoryStore;
 use crate::memory::Memory;
 use crate::providers::retry::RetryError;
-use crate::providers::{Provider, RequestConfig};
+use crate::providers::{Provider, RequestConfig, StopReason};
 use crate::security::{AuthorizationResult, Security};
 use crate::tools::{ToolContext, ToolRegistry, ToolResult};
 use crate::types::{ChatMessage, ConversationId, ConversationMode, estimate_tokens};
 
 /// Maximum number of tool-call → LLM round-trips before we stop looping.
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Marker appended to responses that hit the max output token limit, so
+/// neither the user nor the persisted history mistakes a truncated response
+/// for a complete turn.
+const TRUNCATION_MARKER: &str = "[response truncated: hit max output tokens]";
 
 /// Object-safe trait for processing inbound events.
 /// This wraps the generic `Pipeline<P>` so we can use `dyn PipelineRunner` in main.
@@ -217,7 +222,8 @@ impl<P: Provider + 'static> Pipeline<P> {
         };
 
         // Load conversation history (with compaction summary support).
-        let (turns, summary_token_overhead) = self.load_history_turns(&conv_id).await?;
+        let (turns, summary_text, summary_token_overhead) =
+            self.load_history_turns(&conv_id).await?;
 
         // Retrieve relevant memories based on user message.
         let retrieved_memories = self.retrieve_memories(&event.message.text).await;
@@ -243,14 +249,17 @@ impl<P: Provider + 'static> Pipeline<P> {
             self.tool_registry.definitions()
         };
         let tool_defs_json = serde_json::to_string(&tool_defs).unwrap_or_default();
-        let tool_def_tokens = estimate_tokens(&tool_defs_json) + summary_token_overhead;
+        // Fixed, non-evictable context cost: tool-definition tokens plus the
+        // pinned compaction-summary tokens (the summary is counted once here,
+        // never as an evictable turn).
+        let fixed_overhead = estimate_tokens(&tool_defs_json) + summary_token_overhead;
 
         let budget = ContextBudget::new(
             self.pipeline_config.model_max_tokens,
             self.pipeline_config.response_reserve,
             system_tokens,
             persona_tokens,
-            tool_def_tokens,
+            fixed_overhead,
         );
 
         let selection = budget.select_turns(&turns);
@@ -261,13 +270,15 @@ impl<P: Provider + 'static> Pipeline<P> {
             );
         }
 
-        // Assemble the full message array.
+        // Assemble the full message array. The compaction summary (if any) is
+        // pinned as fixed context via `summary_text`, never as an evictable turn.
         let included_turns: Vec<Turn> = selection.included.iter().map(|t| (*t).clone()).collect();
         let assembled = budget.assemble(
             &self.system_prompt,
             &core_persona,
             &included_turns,
             &retrieved_memories,
+            summary_text.as_deref(),
         );
 
         // Add channel context to system prompt.
@@ -282,6 +293,16 @@ impl<P: Provider + 'static> Pipeline<P> {
             first.content.push_str(&channel_context);
         }
 
+        // In-flight buffer: messages appended during THIS turn's tool loop
+        // (assistant-with-tool-calls and tool_results). On 400-recovery the
+        // base prompt is rebuilt from scratch from `included_turns`, which would
+        // otherwise drop these in-flight messages and make the model re-issue
+        // already-executed, side-effectful tool calls. We replay this buffer
+        // onto every rebuilt prompt. Using an explicit buffer (not a slice index
+        // into provider_messages) keeps it correct across multiple recoveries,
+        // where the rebuilt base length differs from the original.
+        let mut inflight: Vec<ChatMessage> = Vec::new();
+
         let config = RequestConfig {
             temperature: self.pipeline_config.temperature,
             max_tokens: self.pipeline_config.max_response_tokens.map(|n| n as u32),
@@ -293,7 +314,7 @@ impl<P: Provider + 'static> Pipeline<P> {
 
         // Tool execution loop.
         let mut iterations = 0;
-        let response = loop {
+        let mut response = loop {
             debug!(
                 message_count = provider_messages.len(),
                 iteration = iterations,
@@ -313,6 +334,8 @@ impl<P: Provider + 'static> Pipeline<P> {
                     &retrieved_memories,
                     &channel_context,
                     &core_persona,
+                    summary_text.as_deref(),
+                    &inflight,
                 )
                 .await?;
 
@@ -358,8 +381,10 @@ impl<P: Provider + 'static> Pipeline<P> {
                 .map_err(|e| anyhow::anyhow!("task join error: {e}"))??;
             }
 
-            // Add assistant message to provider messages (same type now).
-            provider_messages.push(assistant_msg);
+            // Add assistant message to provider messages (same type now), and to
+            // the in-flight buffer so it survives a 400-recovery rebuild.
+            provider_messages.push(assistant_msg.clone());
+            inflight.push(assistant_msg);
 
             // Execute each tool call and collect results.
             for tc in &response.tool_calls {
@@ -414,7 +439,8 @@ impl<P: Provider + 'static> Pipeline<P> {
                             .map_err(|e| anyhow::anyhow!("task join error: {e}"))??;
                         }
 
-                        provider_messages.push(tool_msg);
+                        provider_messages.push(tool_msg.clone());
+                        inflight.push(tool_msg);
                         continue;
                     }
                 }
@@ -443,19 +469,52 @@ impl<P: Provider + 'static> Pipeline<P> {
                     .map_err(|e| anyhow::anyhow!("task join error: {e}"))??;
                 }
 
-                // Add to provider messages.
-                provider_messages.push(tool_msg);
+                // Add to provider messages, and to the in-flight buffer so it
+                // survives a 400-recovery rebuild.
+                provider_messages.push(tool_msg.clone());
+                inflight.push(tool_msg);
             }
 
             iterations += 1;
         };
 
+        // The response was cut off mid-generation by the output token limit.
+        // Mark it visibly so neither the user nor the persisted history
+        // mistakes it for a complete turn.
+        if response.stop_reason == StopReason::MaxTokens {
+            warn!(
+                max_response_tokens = ?self.pipeline_config.max_response_tokens,
+                "LLM response hit max output tokens; appending truncation marker"
+            );
+            match response.text.as_mut() {
+                Some(text) => {
+                    text.push_str("\n\n");
+                    text.push_str(TRUNCATION_MARKER);
+                }
+                None => response.text = Some(TRUNCATION_MARKER.to_string()),
+            }
+        }
+
         // Persist the final assistant response to history.
-        // Only persist if the loop exited because tool_calls was empty (normal exit).
-        // If it exited due to max iterations, the assistant message was already persisted
-        // inside the loop, so persisting again would create a duplicate.
+        //
+        // The loop only persists assistant messages for iterations that CONTINUE
+        // (it appends the assistant-with-tool-calls message before executing the
+        // tools and looping again). The response that BREAKS the loop is never
+        // persisted inside the loop — this is true for BOTH exit paths:
+        //   - normal exit: `response.tool_calls` is empty;
+        //   - max-iterations exit: `response.tool_calls` is still non-empty, yet
+        //     the text was already delivered to the user via `build_out_event`,
+        //     so it must be persisted here or history diverges from what the user
+        //     saw.
+        //
+        // We persist a PLAIN assistant message (`ChatMessage::assistant`), dropping
+        // any unexecuted tool_calls: persisting tool_calls without matching
+        // tool_results would orphan the tool_use and make the provider reject the
+        // next turn with HTTP 400. `response_text` is captured AFTER the MaxTokens
+        // truncation marker is appended above, and `build_out_event` reads the same
+        // `response.text`, so persisted text == delivered text.
         let response_text = response.text.clone().unwrap_or_default();
-        if !response_text.is_empty() && response.tool_calls.is_empty() {
+        if !response_text.is_empty() {
             let final_msg = ChatMessage::assistant(&response_text);
             let store = Arc::clone(&self.history_store);
             let cid = conv_id.clone();
@@ -497,6 +556,8 @@ impl<P: Provider + 'static> Pipeline<P> {
         retrieved_memories: &[String],
         channel_context: &str,
         core_persona: &str,
+        summary: Option<&str>,
+        inflight: &[ChatMessage],
     ) -> Result<(crate::providers::LlmResponse, std::time::Duration)> {
         let _permit = self
             .llm_semaphore
@@ -538,10 +599,15 @@ impl<P: Provider + 'static> Pipeline<P> {
             core_persona,
             reduced_turns,
             retrieved_memories,
+            summary,
         );
         if let Some(first) = retry_messages.first_mut() {
             first.content.push_str(channel_context);
         }
+        // Replay in-flight tool-loop messages so the recovery request still
+        // carries the assistant-with-tool-calls / tool_result pairs appended
+        // during this turn; otherwise the model re-issues executed tool calls.
+        retry_messages.extend_from_slice(inflight);
 
         let _permit = self
             .llm_semaphore
@@ -584,10 +650,13 @@ impl<P: Provider + 'static> Pipeline<P> {
             core_persona,
             minimal_turns,
             &[], // no memories
+            summary,
         );
         if let Some(first) = minimal_messages.first_mut() {
             first.content.push_str(channel_context);
         }
+        // Replay in-flight tool-loop messages (see the first-retry rebuild).
+        minimal_messages.extend_from_slice(inflight);
 
         let _permit = self
             .llm_semaphore
@@ -625,35 +694,36 @@ impl<P: Provider + 'static> Pipeline<P> {
 
     /// Load conversation history as turns, incorporating any compaction summary.
     ///
+    /// Returns `(turns, summary_text, summary_token_overhead)`:
+    /// - `turns`: the real conversation turns (no synthetic summary turn).
+    /// - `summary_text`: the compaction summary text to render as fixed,
+    ///   non-evictable context (`None` if no summary).
+    /// - `summary_token_overhead`: the summary's token estimate, counted ONCE as
+    ///   fixed overhead (0 if no summary). The summary is deliberately NOT a Turn
+    ///   so `select_turns` neither double-counts it nor evicts it.
+    ///
+    /// The summary and the messages-after-boundary are read under a single lock
+    /// via `load_summary_and_messages`, so a concurrent compaction commit can
+    /// never be observed half-applied.
+    ///
     /// All SQLite I/O runs on the blocking thread pool via `spawn_blocking`.
-    async fn load_history_turns(&self, conv_id: &ConversationId) -> Result<(Vec<Turn>, usize)> {
+    async fn load_history_turns(
+        &self,
+        conv_id: &ConversationId,
+    ) -> Result<(Vec<Turn>, Option<String>, usize)> {
         let store = Arc::clone(&self.history_store);
         let cid = conv_id.clone();
 
         tokio::task::spawn_blocking(move || {
-            let summary = store.load_summary(&cid)?;
+            let (summary, messages) = store.load_summary_and_messages(&cid)?;
 
-            let messages = match &summary {
-                Some(s) => store.load_messages_after(&cid, s.compacted_up_to)?,
-                None => store.load_messages(&cid)?,
-            };
+            let summary_text = summary.as_ref().map(|s| s.summary_text.clone());
+            let summary_overhead = summary.as_ref().map_or(0, |s| s.token_estimate);
 
-            // Build turns from stored messages (group by turn_id).
+            // Build turns from stored messages (group by turn_id). The summary
+            // is NOT represented as a turn — it is pinned separately as fixed
+            // context so it is counted once and never evicted.
             let mut turns: Vec<Turn> = Vec::new();
-            let mut summary_overhead = 0usize;
-
-            // If we have a summary, create a synthetic turn for it.
-            if let Some(ref s) = summary {
-                turns.push(Turn {
-                    turn_id: "__summary__".to_string(),
-                    messages: vec![ChatMessage::system(format!(
-                        "## Conversation Summary\n\n{}",
-                        s.summary_text
-                    ))],
-                    total_tokens: s.token_estimate,
-                });
-                summary_overhead = s.token_estimate;
-            }
 
             // Group messages by turn_id.
             let mut current_turn_id: Option<String> = None;
@@ -686,7 +756,7 @@ impl<P: Provider + 'static> Pipeline<P> {
                 });
             }
 
-            Ok((turns, summary_overhead))
+            Ok((turns, summary_text, summary_overhead))
         })
         .await
         .map_err(|e| anyhow::anyhow!("task join error: {e}"))?
@@ -771,7 +841,7 @@ mod tests {
         Author, ChannelSource, ConversationId, InEvent, Message, MessageContext, MessageId,
     };
     use crate::core::observer::ObserverRegistry;
-    use crate::providers::{LlmResponse, TokenUsage};
+    use crate::providers::{LlmResponse, StopReason, TokenUsage};
     use crate::tools::{ToolCall, ToolDef};
     use crate::security::Security;
     use std::sync::Mutex;
@@ -814,6 +884,7 @@ mod tests {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: TokenUsage::default(),
+                    stop_reason: StopReason::EndTurn,
                 })
             } else {
                 Ok(responses.remove(0))
@@ -845,6 +916,7 @@ mod tests {
                 },
                 channel_id: "test-chan".into(),
                 reply_to: None,
+                guild_id: None,
             },
             tool_groups: None,
             completion_flag: None,
@@ -921,6 +993,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                 },
+                stop_reason: StopReason::ToolUse,
             },
             LlmResponse {
                 text: Some("I was denied.".into()),
@@ -929,6 +1002,7 @@ mod tests {
                     input_tokens: 20,
                     output_tokens: 10,
                 },
+                stop_reason: StopReason::EndTurn,
             },
         ];
 
@@ -958,6 +1032,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                 },
+                stop_reason: StopReason::ToolUse,
             },
             LlmResponse {
                 text: Some("Done.".into()),
@@ -966,6 +1041,7 @@ mod tests {
                     input_tokens: 20,
                     output_tokens: 10,
                 },
+                stop_reason: StopReason::EndTurn,
             },
         ];
 
@@ -993,6 +1069,7 @@ mod tests {
                     input_tokens: 10,
                     output_tokens: 5,
                 },
+                stop_reason: StopReason::ToolUse,
             },
             LlmResponse {
                 text: Some("System done.".into()),
@@ -1001,6 +1078,7 @@ mod tests {
                     input_tokens: 20,
                     output_tokens: 10,
                 },
+                stop_reason: StopReason::EndTurn,
             },
         ];
 
@@ -1056,6 +1134,7 @@ mod tests {
                 text: Some("ok".into()),
                 tool_calls: vec![],
                 usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
             })
         }
 
@@ -1138,6 +1217,7 @@ mod tests {
                         },
                         channel_id: format!("chan-{i}"),
                         reply_to: None,
+                        guild_id: None,
                     },
                     tool_groups: None,
                     completion_flag: None,
@@ -1205,6 +1285,7 @@ mod tests {
                 text: Some("recovered".into()),
                 tool_calls: vec![],
                 usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
             })
         }
 
@@ -1345,6 +1426,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_tokens_response_is_marked_truncated_and_persisted_with_marker() {
+        // Build a pipeline keeping a handle on the history store so we can
+        // verify what gets persisted.
+        let truncated = LlmResponse {
+            text: Some("This reply was cut off mid-sen".into()),
+            tool_calls: vec![],
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 1024,
+            },
+            stop_reason: StopReason::MaxTokens,
+        };
+        let provider = Arc::new(MockProvider::new(vec![truncated]));
+
+        let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
+                .unwrap();
+        }
+        crate::history::schema::initialize(&db.lock().unwrap()).unwrap();
+        let history_store = Arc::new(crate::history::store::HistoryStore::new(Arc::clone(&db)));
+
+        let tmp_persona = std::env::temp_dir().join("borealis_test_trunc_core.md");
+        std::fs::write(&tmp_persona, "test persona").unwrap();
+        let memory_store: Arc<dyn crate::memory::Memory> = Arc::new(
+            crate::memory::SqliteMemory::new(Arc::clone(&db), tmp_persona.clone()).unwrap(),
+        );
+
+        let deps = PipelineDeps {
+            history_store: Arc::clone(&history_store),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            memory_store,
+            security: make_test_security(),
+            observers: Arc::new(ObserverRegistry::new()),
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction_state: Arc::new(crate::history::compaction::CompactionState::new()),
+            pipeline_config: PipelineConfig::default(),
+            llm_semaphore: Arc::new(Semaphore::new(4)),
+        };
+
+        let sys_path = std::path::Path::new("/nonexistent/system_prompt.md");
+        let pipeline = Pipeline::new(provider, sys_path, &tmp_persona, deps).unwrap();
+
+        let event = make_test_event(ChannelSource::Cli, "trunc_user");
+        let result = pipeline.process_impl(&event).await.unwrap();
+
+        // The delivered text carries the visible truncation marker.
+        let text = result.text.expect("response text");
+        assert!(text.starts_with("This reply was cut off mid-sen"));
+        assert!(
+            text.contains("[response truncated: hit max output tokens]"),
+            "delivered text should carry the truncation marker: {text}"
+        );
+
+        // The persisted assistant turn also carries the marker, so history
+        // doesn't record the truncated reply as a clean turn.
+        let conv_id = crate::core::event::ConversationId::Dm {
+            channel_type: ChannelSource::Cli,
+            user_id: "trunc_user".into(),
+        };
+        let messages = history_store.load_messages(&conv_id).unwrap();
+        let assistant = messages
+            .iter()
+            .find(|m| m.role == crate::types::Role::Assistant)
+            .expect("assistant message persisted");
+        assert!(
+            assistant
+                .content
+                .contains("[response truncated: hit max output tokens]"),
+            "persisted assistant message should carry the marker: {}",
+            assistant.content
+        );
+
+        let _ = std::fs::remove_file(&tmp_persona);
+    }
+
+    #[tokio::test]
     async fn http_400_recovery_falls_back_to_minimal() {
         // Provider fails twice with 400, then succeeds on minimal fallback.
         let provider = Arc::new(Http400MockProvider::new(2));
@@ -1362,6 +1521,480 @@ mod tests {
             "minimal should have <= messages than retry: retry={}, minimal={}",
             counts[1],
             counts[2]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUD-1 / CORE-2 / CORE-3 — scripted mock that mixes success responses and
+    // HTTP 400 errors, capturing the full message array on every call.
+    // -----------------------------------------------------------------------
+
+    /// A scripted outcome for `ScriptedMockProvider`.
+    enum Scripted {
+        /// Return this response.
+        Ok(LlmResponse),
+        /// Return an HTTP 400 error.
+        Http400,
+    }
+
+    /// A mock provider that plays a scripted sequence of outcomes and records
+    /// the full message array it was called with on every call. Once the script
+    /// is exhausted it returns a plain "done" response.
+    struct ScriptedMockProvider {
+        script: Mutex<Vec<Scripted>>,
+        captured: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    impl ScriptedMockProvider {
+        fn new(script: Vec<Scripted>) -> Self {
+            Self {
+                script: Mutex::new(script),
+                captured: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn captured(&self) -> Vec<Vec<ChatMessage>> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::providers::Provider for ScriptedMockProvider {
+        fn name(&self) -> &str {
+            "scripted-mock"
+        }
+
+        async fn chat(
+            &self,
+            messages: Vec<ChatMessage>,
+            _tools: &[ToolDef],
+            _config: &crate::providers::RequestConfig,
+        ) -> anyhow::Result<LlmResponse> {
+            self.captured.lock().unwrap().push(messages);
+            let next = {
+                let mut script = self.script.lock().unwrap();
+                if script.is_empty() {
+                    None
+                } else {
+                    Some(script.remove(0))
+                }
+            };
+            match next {
+                Some(Scripted::Ok(r)) => Ok(r),
+                Some(Scripted::Http400) => Err(crate::providers::retry::RetryError::HttpStatus {
+                    status: 400,
+                    body: "context too large".into(),
+                }
+                .into()),
+                None => Ok(LlmResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                    stop_reason: StopReason::EndTurn,
+                }),
+            }
+        }
+
+        fn estimate_tokens(&self, text: &str) -> usize {
+            text.len() / 4
+        }
+    }
+
+    /// Build a pipeline around a `ScriptedMockProvider`, returning both the
+    /// pipeline and a handle on the history store for persistence assertions.
+    fn make_scripted_pipeline(
+        provider: Arc<ScriptedMockProvider>,
+        persona_tag: &str,
+    ) -> (Pipeline<ScriptedMockProvider>, Arc<crate::history::store::HistoryStore>) {
+        let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
+                .unwrap();
+        }
+        crate::history::schema::initialize(&db.lock().unwrap()).unwrap();
+        let history_store = Arc::new(crate::history::store::HistoryStore::new(Arc::clone(&db)));
+
+        let tmp_persona = std::env::temp_dir().join(format!("borealis_test_{persona_tag}_core.md"));
+        std::fs::write(&tmp_persona, "test persona").unwrap();
+        let memory_store: Arc<dyn crate::memory::Memory> = Arc::new(
+            crate::memory::SqliteMemory::new(Arc::clone(&db), tmp_persona.clone()).unwrap(),
+        );
+
+        let deps = PipelineDeps {
+            history_store: Arc::clone(&history_store),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            memory_store,
+            security: make_test_security(),
+            observers: Arc::new(ObserverRegistry::new()),
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction_state: Arc::new(crate::history::compaction::CompactionState::new()),
+            pipeline_config: PipelineConfig::default(),
+            llm_semaphore: Arc::new(Semaphore::new(4)),
+        };
+
+        let sys_path = std::path::Path::new("/nonexistent/system_prompt.md");
+        let pipeline = Pipeline::new(provider, sys_path, &tmp_persona, deps).unwrap();
+        (pipeline, history_store)
+    }
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "bash_exec".into(),
+            arguments: serde_json::json!({"command": "echo hi"}),
+        }
+    }
+
+    // --- BUD-1: compaction summary is pinned, counted once, never evicted ---
+
+    #[tokio::test]
+    async fn compaction_summary_is_pinned_in_prompt_after_persona() {
+        // Seed a conversation with a compaction summary and one real turn, then
+        // process a message. The assembled prompt must carry the summary as a
+        // single system message placed right after the persona and before the
+        // surviving history — i.e. it is pinned, not a turn.
+        let provider = Arc::new(ScriptedMockProvider::new(vec![]));
+        let (pipeline, store) = make_scripted_pipeline(Arc::clone(&provider), "budsummary");
+
+        let conv_id = ConversationId::Dm {
+            channel_type: ChannelSource::Cli,
+            user_id: "summary_user".into(),
+        };
+        store
+            .ensure_conversation(&conv_id, crate::types::ConversationMode::Shared)
+            .unwrap();
+        // A pre-existing real turn that survives compaction (seq after boundary).
+        let turn = store
+            .append_message(&conv_id, &ChatMessage::user("earlier message"), None)
+            .unwrap();
+        store
+            .append_message(&conv_id, &ChatMessage::assistant("earlier reply"), Some(&turn))
+            .unwrap();
+        // Save a summary whose boundary is BEFORE the surviving turn (seq 0), so
+        // the surviving turn is still loaded as history.
+        store
+            .save_summary(&conv_id, "SUMMARY_MARKER_TEXT", 0, 7)
+            .unwrap();
+
+        let event = make_test_event(ChannelSource::Cli, "summary_user");
+        pipeline.process_impl(&event).await.unwrap();
+
+        let captured = provider.captured();
+        let prompt = captured.last().expect("at least one LLM call");
+
+        // The summary appears exactly once, as a system message.
+        let summary_indices: Vec<usize> = prompt
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.content.contains("## Conversation Summary")
+                && m.content.contains("SUMMARY_MARKER_TEXT"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            summary_indices.len(),
+            1,
+            "summary must appear exactly once (not double-counted/duplicated)"
+        );
+        let summary_idx = summary_indices[0];
+
+        // It sits right after the persona/system message (index 0).
+        assert_eq!(prompt[0].role, crate::types::Role::System);
+        assert_eq!(summary_idx, 1, "summary must be pinned right after persona");
+        assert_eq!(prompt[summary_idx].role, crate::types::Role::System);
+
+        // The surviving real history follows the summary.
+        assert!(
+            prompt[summary_idx + 1..]
+                .iter()
+                .any(|m| m.content.contains("earlier message")),
+            "surviving history must follow the pinned summary"
+        );
+    }
+
+    /// Like `make_scripted_pipeline` but with a caller-supplied `PipelineConfig`,
+    /// so a test can tune the token budget.
+    fn make_scripted_pipeline_with_config(
+        provider: Arc<ScriptedMockProvider>,
+        persona_tag: &str,
+        pipeline_config: PipelineConfig,
+    ) -> (Pipeline<ScriptedMockProvider>, Arc<crate::history::store::HistoryStore>) {
+        let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
+                .unwrap();
+        }
+        crate::history::schema::initialize(&db.lock().unwrap()).unwrap();
+        let history_store = Arc::new(crate::history::store::HistoryStore::new(Arc::clone(&db)));
+
+        let tmp_persona = std::env::temp_dir().join(format!("borealis_test_{persona_tag}_core.md"));
+        std::fs::write(&tmp_persona, "test persona").unwrap();
+        let memory_store: Arc<dyn crate::memory::Memory> = Arc::new(
+            crate::memory::SqliteMemory::new(Arc::clone(&db), tmp_persona.clone()).unwrap(),
+        );
+
+        let deps = PipelineDeps {
+            history_store: Arc::clone(&history_store),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            memory_store,
+            security: make_test_security(),
+            observers: Arc::new(ObserverRegistry::new()),
+            compaction_config: crate::config::CompactionConfig::default(),
+            compaction_state: Arc::new(crate::history::compaction::CompactionState::new()),
+            pipeline_config,
+            llm_semaphore: Arc::new(Semaphore::new(4)),
+        };
+
+        let sys_path = std::path::Path::new("/nonexistent/system_prompt.md");
+        let pipeline = Pipeline::new(provider, sys_path, &tmp_persona, deps).unwrap();
+        (pipeline, history_store)
+    }
+
+    #[tokio::test]
+    async fn budget_summary_overhead_evicts_older_turn() {
+        // BUD-1 (budget half): the pinned summary's token estimate must be
+        // subtracted from `available_for_history`. We tune the budget so an older
+        // turn fits ONLY when the summary overhead is NOT counted; with the
+        // overhead, the older turn is pushed out of the window and evicted.
+        //
+        // The summary's `compacted_up_to` is 0 so the seeded turn (seq > 0)
+        // still loads as evictable history, and the new incoming message becomes
+        // the (never-evicted) last turn.
+        let provider = Arc::new(ScriptedMockProvider::new(vec![]));
+
+        // Empty tool registry → tool_defs serialize to "[]" (0 tokens). Replicate
+        // the production fixed-overhead formula so the boundary is exact.
+        let tool_defs_json = "[]";
+        let fixed = estimate_tokens(&default_system_prompt())
+            + estimate_tokens("test persona")
+            + estimate_tokens(tool_defs_json);
+
+        let summary_overhead = 100usize;
+        // The new incoming user message persisted by process_impl is
+        // "Tester: hello" (see make_test_event) → its own turn.
+        let new_turn_tokens = estimate_tokens("Tester: hello");
+
+        // Choose a budget and turn sizes so that:
+        //   available_without_summary       = old + new + 50   (older turn fits)
+        //   available_with_summary (= -100) = old + new - 50   (older turn evicted)
+        let response_reserve = 0usize;
+        // Make the older turn comfortably large so its eviction is unambiguous.
+        let old_turn_tokens = 400usize;
+        // model_max chosen so available_without_summary = old + new + 50.
+        let model_max_tokens =
+            response_reserve + fixed + old_turn_tokens + new_turn_tokens + 50;
+
+        let pipeline_config = PipelineConfig {
+            model_max_tokens,
+            response_reserve,
+            ..PipelineConfig::default()
+        };
+        let (pipeline, store) = make_scripted_pipeline_with_config(
+            Arc::clone(&provider),
+            "budevict",
+            pipeline_config,
+        );
+
+        let conv_id = ConversationId::Dm {
+            channel_type: ChannelSource::Cli,
+            user_id: "evict_user".into(),
+        };
+        store
+            .ensure_conversation(&conv_id, crate::types::ConversationMode::Shared)
+            .unwrap();
+
+        // Seed an older turn sized to exactly `old_turn_tokens`. A single user
+        // message of 4*N chars yields token_estimate == N (estimate = len/4).
+        let old_content = "a".repeat(old_turn_tokens * 4);
+        let unique_marker = "OLDER_TURN_MARKER_xyzzy";
+        let old_content = format!("{unique_marker}{}", &old_content[unique_marker.len()..]);
+        assert_eq!(
+            estimate_tokens(&old_content),
+            old_turn_tokens,
+            "test setup: older turn must be exactly old_turn_tokens"
+        );
+        store
+            .append_message(&conv_id, &ChatMessage::user(&old_content), None)
+            .unwrap();
+
+        // Pin a summary with a large token estimate.
+        store
+            .save_summary(&conv_id, "EVICT_SUMMARY_TEXT", 0, summary_overhead)
+            .unwrap();
+
+        let event = make_test_event(ChannelSource::Cli, "evict_user");
+        pipeline.process_impl(&event).await.unwrap();
+
+        let captured = provider.captured();
+        let prompt = captured.last().expect("at least one LLM call");
+
+        // The summary IS present (pinned).
+        assert!(
+            prompt
+                .iter()
+                .any(|m| m.content.contains("## Conversation Summary")
+                    && m.content.contains("EVICT_SUMMARY_TEXT")),
+            "pinned summary must be present in the assembled prompt"
+        );
+        // The older turn was EVICTED because the summary overhead shrank the
+        // history budget below old + new.
+        assert!(
+            !prompt.iter().any(|m| m.content.contains(unique_marker)),
+            "older turn must be evicted once the summary overhead is counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_survives_400_recovery() {
+        // CORE-2/BUD-1 interaction: even when 400-recovery rebuilds the prompt
+        // from scratch, the pinned summary must still be present.
+        let provider = Arc::new(ScriptedMockProvider::new(vec![
+            Scripted::Http400,
+            Scripted::Ok(LlmResponse {
+                text: Some("recovered".into()),
+                tool_calls: vec![],
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
+            }),
+        ]));
+        let (pipeline, store) = make_scripted_pipeline(Arc::clone(&provider), "budrecover");
+
+        let conv_id = ConversationId::Dm {
+            channel_type: ChannelSource::Cli,
+            user_id: "recover_user".into(),
+        };
+        store
+            .ensure_conversation(&conv_id, crate::types::ConversationMode::Shared)
+            .unwrap();
+        store
+            .save_summary(&conv_id, "PINNED_SUMMARY", 0, 5)
+            .unwrap();
+
+        let event = make_test_event(ChannelSource::Cli, "recover_user");
+        let result = pipeline.process_impl(&event).await.unwrap();
+        assert_eq!(result.text, Some("recovered".into()));
+
+        let captured = provider.captured();
+        assert_eq!(captured.len(), 2, "expected original + recovery call");
+        // The recovery (2nd) call's rebuilt prompt must still carry the summary.
+        assert!(
+            captured[1]
+                .iter()
+                .any(|m| m.content.contains("## Conversation Summary")
+                    && m.content.contains("PINNED_SUMMARY")),
+            "pinned summary must survive the 400-recovery rebuild"
+        );
+    }
+
+    // --- CORE-2: in-flight tool-loop messages survive 400-recovery ---
+
+    #[tokio::test]
+    async fn inflight_tool_messages_preserved_across_400_recovery() {
+        // Call 1: assistant issues a tool call (loop executes it, appends the
+        //         assistant-with-tool-calls + tool_result to provider_messages).
+        // Call 2: HTTP 400 (mid tool loop).
+        // Call 3 (recovery): succeeds.
+        // The recovery request must still contain the in-flight tool_use /
+        // tool_result pair, not just the reduced base history.
+        let provider = Arc::new(ScriptedMockProvider::new(vec![
+            Scripted::Ok(LlmResponse {
+                text: Some("calling a tool".into()),
+                tool_calls: vec![tool_call("tc_inflight")],
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::ToolUse,
+            }),
+            Scripted::Http400,
+            Scripted::Ok(LlmResponse {
+                text: Some("after recovery".into()),
+                tool_calls: vec![],
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
+            }),
+        ]));
+        let (pipeline, _store) = make_scripted_pipeline(Arc::clone(&provider), "inflight");
+
+        let event = make_test_event(ChannelSource::Cli, "inflight_user");
+        let result = pipeline.process_impl(&event).await.unwrap();
+        assert_eq!(result.text, Some("after recovery".into()));
+
+        let captured = provider.captured();
+        assert_eq!(
+            captured.len(),
+            3,
+            "expected 3 calls: tool-call, 400, recovery"
+        );
+        let recovery = &captured[2];
+
+        // The recovery request retains the in-flight assistant-with-tool-calls.
+        assert!(
+            recovery.iter().any(|m| m.role == crate::types::Role::Assistant
+                && m.tool_calls.iter().any(|tc| tc.id == "tc_inflight")),
+            "recovery request must retain the in-flight assistant tool_call message"
+        );
+        // ...and the matching tool_result (so tool_use is not orphaned).
+        assert!(
+            recovery
+                .iter()
+                .any(|m| m.role == crate::types::Role::Tool
+                    && m.tool_call_id.as_deref() == Some("tc_inflight")),
+            "recovery request must retain the matching tool_result message"
+        );
+    }
+
+    // --- CORE-3: final text persisted once on max-iterations break ---
+
+    #[tokio::test]
+    async fn max_iterations_break_persists_final_text_as_plain_assistant() {
+        // Script the provider to ALWAYS return a tool call (text + tool_calls),
+        // forcing the loop to hit MAX_TOOL_ITERATIONS and break with a final
+        // response that still has non-empty tool_calls.
+        let mut script = Vec::new();
+        for i in 0..(MAX_TOOL_ITERATIONS + 2) {
+            script.push(Scripted::Ok(LlmResponse {
+                text: Some(format!("iteration {i} text")),
+                tool_calls: vec![tool_call(&format!("tc_{i}"))],
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::ToolUse,
+            }));
+        }
+        let provider = Arc::new(ScriptedMockProvider::new(script));
+        let (pipeline, store) = make_scripted_pipeline(Arc::clone(&provider), "maxiter");
+
+        let event = make_test_event(ChannelSource::Cli, "maxiter_user");
+        let result = pipeline.process_impl(&event).await.unwrap();
+
+        // The breaking response is the one returned at iteration MAX_TOOL_ITERATIONS.
+        let breaking_text = format!("iteration {MAX_TOOL_ITERATIONS} text");
+        // Delivered text matches the breaking response.
+        assert_eq!(result.text, Some(breaking_text.clone()));
+
+        let conv_id = ConversationId::Dm {
+            channel_type: ChannelSource::Cli,
+            user_id: "maxiter_user".into(),
+        };
+        let messages = store.load_messages(&conv_id).unwrap();
+
+        // The breaking text must be persisted exactly once, as a PLAIN assistant
+        // message (no tool_calls), matching the delivered out-event text.
+        let plain_matches: Vec<_> = messages
+            .iter()
+            .filter(|m| m.role == crate::types::Role::Assistant
+                && m.content == breaking_text
+                && m.tool_calls.is_empty())
+            .collect();
+        assert_eq!(
+            plain_matches.len(),
+            1,
+            "breaking response text must be persisted exactly once as a plain assistant message"
+        );
+
+        // And it must NOT also be persisted as an assistant-with-tool-calls
+        // message (that would orphan the tool_use on the next turn).
+        assert!(
+            !messages.iter().any(|m| m.role == crate::types::Role::Assistant
+                && m.content == breaking_text
+                && !m.tool_calls.is_empty()),
+            "breaking response must not be persisted with its unexecuted tool_calls"
         );
     }
 }

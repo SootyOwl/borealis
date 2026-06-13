@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::core::event::InEvent;
 
@@ -184,7 +184,17 @@ impl ModeFactory for ConfigModeFactory {
         match self.mode_name.as_str() {
             "mention-only" => Arc::new(MentionOnlyMode),
             "digest" => Arc::new(DigestMode::new(self.digest_interval, self.digest_debounce)),
-            _ => Arc::new(AlwaysMode),
+            "always" => Arc::new(AlwaysMode),
+            // Defense in depth: validation (config::validate) should reject
+            // unknown modes before we get here, but if one slips through, fall
+            // back to the SAFE (quiet) mode rather than the spammy AlwaysMode.
+            _ => {
+                warn!(
+                    mode = %self.mode_name,
+                    "unknown response_mode, defaulting to mention-only"
+                );
+                Arc::new(MentionOnlyMode)
+            }
         }
     }
 }
@@ -294,6 +304,7 @@ mod tests {
                 },
                 channel_id: group_id.into(),
                 reply_to: None,
+                guild_id: None,
             },
             tool_groups: None,
             completion_flag: None,
@@ -459,6 +470,36 @@ mod tests {
         let events = router
             .on_message("chan-other", "guild1", make_event(false, "chan-other"))
             .await;
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_factory_always_dispatches_non_mentions() {
+        // "always" should yield AlwaysMode: a non-mention event is dispatched.
+        let mode = ConfigModeFactory::new("always", None, None).create();
+        let events = mode.on_message(make_event(false, "general")).await;
+        assert_eq!(events.len(), 1, "always mode should dispatch non-mentions");
+    }
+
+    #[tokio::test]
+    async fn config_factory_unknown_falls_back_to_mention_only() {
+        // An unknown/typo mode must fall back to the SAFE (quiet) mention-only
+        // mode, NOT the spammy AlwaysMode — a non-mention event is dropped.
+        let mode = ConfigModeFactory::new("always_on", None, None).create();
+        let events = mode.on_message(make_event(false, "general")).await;
+        assert!(
+            events.is_empty(),
+            "unknown mode should fall back to mention-only and drop non-mentions"
+        );
+        // And it should still dispatch genuine mentions.
+        let events = mode.on_message(make_event(true, "general")).await;
+        assert_eq!(events.len(), 1, "fallback mode should still dispatch mentions");
+    }
+
+    #[tokio::test]
+    async fn config_factory_mention_only_drops_non_mentions() {
+        let mode = ConfigModeFactory::new("mention-only", None, None).create();
+        let events = mode.on_message(make_event(false, "general")).await;
         assert!(events.is_empty());
     }
 

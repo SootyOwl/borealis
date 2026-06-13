@@ -148,25 +148,28 @@ impl<P: Provider + 'static> CompactionService<P> {
 
 /// Execute a single compaction pass for a conversation.
 ///
-/// 1. Load existing summary (if any) + all messages
-/// 2. Select messages to compact (up to midpoint of current history)
+/// 1. Load existing summary (if any) + messages after it (one lock, consistent pair)
+/// 2. Select messages to compact (up to midpoint, snapped to a turn boundary)
 /// 3. Build summarization prompt: prior summary + selected messages
 /// 4. Call the provider to produce a summary
-/// 5. Store the summary and delete compacted messages
+/// 5. Atomically store the summary and delete compacted messages
+///
+/// All SQLite I/O runs on the blocking thread pool via `spawn_blocking`,
+/// per the codebase convention (see `core::pipeline`).
 async fn run_compaction<P: Provider>(
-    store: &HistoryStore,
+    store: &Arc<HistoryStore>,
     conversation_id: &ConversationId,
     compaction_prompt: &str,
     provider: &P,
 ) -> anyhow::Result<()> {
-    // Load existing summary
-    let existing_summary = store.load_summary(conversation_id)?;
-
-    // Load messages — if we have a prior summary, only load messages after
-    // the compaction point; otherwise load all.
-    let messages = match &existing_summary {
-        Some(summary) => store.load_messages_after(conversation_id, summary.compacted_up_to)?,
-        None => store.load_messages(conversation_id)?,
+    // Load existing summary + the messages after its boundary in a single
+    // lock acquisition so the pair is mutually consistent.
+    let (existing_summary, messages) = {
+        let store = Arc::clone(store);
+        let conv_id = conversation_id.clone();
+        tokio::task::spawn_blocking(move || store.load_summary_and_messages(&conv_id))
+            .await
+            .map_err(|e| anyhow::anyhow!("task join error: {e}"))??
     };
 
     if messages.len() < 2 {
@@ -177,14 +180,18 @@ async fn run_compaction<P: Provider>(
         return Ok(());
     }
 
-    // Select messages to compact: everything up to the midpoint.
-    // This preserves recent context while compacting older messages.
+    // Select messages to compact: everything up to the midpoint, snapped to a
+    // turn boundary so a turn (user msg + assistant tool_calls + tool results
+    // + final assistant msg) is never split. Splitting a turn would leave
+    // orphaned `role=tool` messages behind, which providers reject with a 400.
     let midpoint = messages.len() / 2;
-    let to_compact = &messages[..midpoint];
+    let end = snap_to_turn_boundary(&messages, midpoint);
+    let to_compact = &messages[..end];
 
-    if to_compact.is_empty() {
-        return Ok(());
-    }
+    debug_assert!(
+        !to_compact.is_empty(),
+        "snap_to_turn_boundary must not yield an empty compaction window"
+    );
 
     let compaction_boundary_seq = to_compact.last().expect("non-empty slice").seq;
 
@@ -215,16 +222,19 @@ async fn run_compaction<P: Provider>(
 
     let token_estimate = provider.estimate_tokens(&summary_text);
 
-    // Store the new summary (replaces any existing one — accumulation)
-    store.save_summary(
-        conversation_id,
-        &summary_text,
-        compaction_boundary_seq,
-        token_estimate,
-    )?;
-
-    // Delete the compacted messages
-    let deleted = store.delete_messages_up_to(conversation_id, compaction_boundary_seq)?;
+    // Store the new summary (replaces any existing one — accumulation) and
+    // delete the compacted messages in ONE transaction, so concurrent
+    // prompt-assembly reads never observe one without the other.
+    let deleted = {
+        let store = Arc::clone(store);
+        let conv_id = conversation_id.clone();
+        let text = summary_text.clone();
+        tokio::task::spawn_blocking(move || {
+            store.commit_compaction(&conv_id, &text, compaction_boundary_seq, token_estimate)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("task join error: {e}"))??
+    };
     info!(
         conversation = %conversation_id,
         deleted_messages = deleted,
@@ -234,6 +244,44 @@ async fn run_compaction<P: Provider>(
     );
 
     Ok(())
+}
+
+/// Snap a tentative compaction end index (exclusive) to a turn boundary.
+///
+/// If `midpoint` already sits on a turn boundary it is returned unchanged.
+/// Otherwise the boundary is shrunk to exclude the partially-covered turn
+/// (preserving recent context); if that turn starts the window — so shrinking
+/// would compact zero messages — the boundary is extended to the end of the
+/// turn instead. The result never splits a turn and is never 0 while
+/// `messages` is non-empty.
+///
+/// Assumes messages of a turn are contiguous in seq order, which is how the
+/// pipeline appends them.
+fn snap_to_turn_boundary(messages: &[StoredMessage], midpoint: usize) -> usize {
+    debug_assert!(midpoint >= 1 && midpoint <= messages.len());
+    let mut end = midpoint;
+    let turn_id = messages[end - 1].turn_id.clone();
+
+    // Already at a turn boundary?
+    if messages.get(end).is_none_or(|m| m.turn_id != turn_id) {
+        return end;
+    }
+
+    // Shrink: drop the partially-covered turn entirely.
+    let turn_start = messages[..end]
+        .iter()
+        .rposition(|m| m.turn_id != turn_id)
+        .map_or(0, |i| i + 1);
+    if turn_start > 0 {
+        return turn_start;
+    }
+
+    // The partial turn opens the window — shrinking would compact nothing,
+    // so extend to the end of that turn instead.
+    while end < messages.len() && messages[end].turn_id == turn_id {
+        end += 1;
+    }
+    end
 }
 
 /// Format the conversation messages (and optional prior summary) into text
@@ -314,6 +362,7 @@ mod tests {
                 text: Some(self.response_text.clone()),
                 tool_calls: vec![],
                 usage: TokenUsage::default(),
+                stop_reason: crate::providers::StopReason::EndTurn,
             })
         }
 
@@ -391,17 +440,17 @@ mod tests {
         assert!(summary.is_none());
     }
 
-    // --- delete_messages_up_to ---
+    // --- commit_compaction (COMP-3, write side) ---
 
     #[test]
-    fn delete_messages_up_to_removes_correct_messages() {
+    fn commit_compaction_saves_summary_and_deletes_in_one_call() {
         let store = make_store();
         let conv_id = test_conv_id();
         store
             .ensure_conversation(&conv_id, ConversationMode::Shared)
             .unwrap();
 
-        // Insert 4 messages (seq 1, 2, 3, 4)
+        // Insert 4 messages (seq 1..=4).
         let t1 = store
             .append_message(&conv_id, &ChatMessage::user("msg1"), None)
             .unwrap();
@@ -415,45 +464,96 @@ mod tests {
             .append_message(&conv_id, &ChatMessage::assistant("msg4"), Some(&t2))
             .unwrap();
 
-        // Delete messages with seq <= 2
-        let deleted = store.delete_messages_up_to(&conv_id, 2).unwrap();
+        let deleted = store
+            .commit_compaction(&conv_id, "Committed summary.", 2, 9)
+            .unwrap();
         assert_eq!(deleted, 2);
+
+        let summary = store.load_summary(&conv_id).unwrap().expect("summary");
+        assert_eq!(summary.summary_text, "Committed summary.");
+        assert_eq!(summary.compacted_up_to, 2);
+        assert_eq!(summary.token_estimate, 9);
 
         let remaining = store.load_messages(&conv_id).unwrap();
         assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[0].content, "msg3");
-        assert_eq!(remaining[1].content, "msg4");
+        assert_eq!(remaining[0].seq, 3);
     }
 
-    // --- load_messages_after ---
-
     #[test]
-    fn load_messages_after_returns_only_newer() {
+    fn commit_compaction_replaces_previous_summary() {
         let store = make_store();
         let conv_id = test_conv_id();
         store
             .ensure_conversation(&conv_id, ConversationMode::Shared)
             .unwrap();
 
-        let t1 = store
-            .append_message(&conv_id, &ChatMessage::user("old"), None)
+        store
+            .append_message(&conv_id, &ChatMessage::user("msg1"), None)
             .unwrap();
         store
-            .append_message(&conv_id, &ChatMessage::assistant("old reply"), Some(&t1))
-            .unwrap();
-        let t2 = store
-            .append_message(&conv_id, &ChatMessage::user("new"), None)
-            .unwrap();
-        store
-            .append_message(&conv_id, &ChatMessage::assistant("new reply"), Some(&t2))
+            .append_message(&conv_id, &ChatMessage::user("msg2"), None)
             .unwrap();
 
-        // Load only messages after seq 2
-        let messages = store.load_messages_after(&conv_id, 2).unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].content, "new");
-        assert_eq!(messages[1].content, "new reply");
+        store
+            .commit_compaction(&conv_id, "First.", 1, 3)
+            .unwrap();
+        store
+            .commit_compaction(&conv_id, "Second.", 2, 5)
+            .unwrap();
+
+        let summary = store.load_summary(&conv_id).unwrap().expect("summary");
+        assert_eq!(summary.summary_text, "Second.");
+        assert_eq!(summary.compacted_up_to, 2);
+        assert!(store.load_messages(&conv_id).unwrap().is_empty());
     }
+
+    // --- load_summary_and_messages (COMP-3, read side) ---
+
+    #[test]
+    fn load_summary_and_messages_returns_consistent_pair() {
+        let store = make_store();
+        let conv_id = test_conv_id();
+        store
+            .ensure_conversation(&conv_id, ConversationMode::Shared)
+            .unwrap();
+
+        for i in 1..=4 {
+            store
+                .append_message(&conv_id, &ChatMessage::user(format!("msg{i}")), None)
+                .unwrap();
+        }
+        store
+            .commit_compaction(&conv_id, "Summary covers 1-2.", 2, 5)
+            .unwrap();
+
+        let (summary, messages) = store.load_summary_and_messages(&conv_id).unwrap();
+        let summary = summary.expect("summary should exist");
+        assert_eq!(summary.compacted_up_to, 2);
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages.iter().all(|m| m.seq > summary.compacted_up_to),
+            "every returned message must lie after the summary boundary"
+        );
+    }
+
+    #[test]
+    fn load_summary_and_messages_without_summary_returns_all() {
+        let store = make_store();
+        let conv_id = test_conv_id();
+        store
+            .ensure_conversation(&conv_id, ConversationMode::Shared)
+            .unwrap();
+
+        store
+            .append_message(&conv_id, &ChatMessage::user("only msg"), None)
+            .unwrap();
+
+        let (summary, messages) = store.load_summary_and_messages(&conv_id).unwrap();
+        assert!(summary.is_none());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "only msg");
+    }
+
 
     // --- max_seq ---
 
@@ -476,6 +576,54 @@ mod tests {
             .append_message(&conv_id, &ChatMessage::user("second"), None)
             .unwrap();
         assert_eq!(store.max_seq(&conv_id).unwrap(), Some(2));
+    }
+
+    // --- snap_to_turn_boundary ---
+
+    /// Build a `StoredMessage` carrying only the fields `snap_to_turn_boundary`
+    /// inspects (`turn_id`); the rest are filler.
+    fn msg(turn_id: &str, seq: i64) -> StoredMessage {
+        StoredMessage {
+            id: format!("m{seq}"),
+            conversation_id: "test".into(),
+            turn_id: turn_id.into(),
+            seq,
+            role: crate::types::Role::User,
+            content: "x".into(),
+            tool_call_id: None,
+            tool_calls: vec![],
+            token_estimate: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn snap_midpoint_on_turn_boundary_returned_unchanged() {
+        // [t1, t1 | t2, t2] — midpoint 2 already sits between two turns.
+        let messages = vec![msg("t1", 1), msg("t1", 2), msg("t2", 3), msg("t2", 4)];
+        assert_eq!(snap_to_turn_boundary(&messages, 2), 2);
+    }
+
+    #[test]
+    fn snap_midturn_with_prior_turn_shrinks_to_turn_start() {
+        // [t1, t1, t2, t2, t3] — midpoint 3 lands inside the t2 turn; a complete
+        // t1 turn precedes it, so the window shrinks to the start of t2 (index 2).
+        let messages = vec![
+            msg("t1", 1),
+            msg("t1", 2),
+            msg("t2", 3),
+            msg("t2", 4),
+            msg("t3", 5),
+        ];
+        assert_eq!(snap_to_turn_boundary(&messages, 3), 2);
+    }
+
+    #[test]
+    fn snap_midturn_opening_window_extends_to_turn_end() {
+        // [t1, t1, t1, t2] — midpoint 2 lands inside t1, which opens the window;
+        // shrinking would compact nothing, so it extends to the end of t1 (index 3).
+        let messages = vec![msg("t1", 1), msg("t1", 2), msg("t1", 3), msg("t2", 4)];
+        assert_eq!(snap_to_turn_boundary(&messages, 2), 3);
     }
 
     // --- build_summarization_input ---
@@ -581,17 +729,142 @@ mod tests {
             .unwrap()
             .expect("summary should be stored");
         assert_eq!(summary.summary_text, "Summary: users discussed topics 1-3.");
-        // Midpoint of 6 messages = 3, so compacted_up_to = seq 3
-        assert_eq!(summary.compacted_up_to, 3);
+        // Midpoint of 6 messages = 3, which would split turn 2 — the boundary
+        // snaps back to the end of turn 1 (seq 2).
+        assert_eq!(summary.compacted_up_to, 2);
 
         // Only messages after the compaction point should remain
         let remaining = store.load_messages(&conv_id).unwrap();
         assert_eq!(
             remaining.len(),
-            3,
-            "3 messages should remain after compaction"
+            4,
+            "4 messages should remain after turn-snapped compaction"
         );
-        assert_eq!(remaining[0].seq, 4);
+        assert_eq!(remaining[0].seq, 3);
+    }
+
+    /// Append a 4-message tool-loop turn (user → assistant+tool_calls →
+    /// tool result → final assistant) and return its turn_id.
+    fn append_tool_loop_turn(store: &HistoryStore, conv_id: &ConversationId, label: &str) -> String {
+        let t = store
+            .append_message(conv_id, &ChatMessage::user(format!("{label} question")), None)
+            .unwrap();
+        let tc = crate::types::ToolCall {
+            id: format!("call_{label}"),
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q": label}),
+        };
+        store
+            .append_message(
+                conv_id,
+                &ChatMessage::assistant_with_tool_calls(format!("{label} searching"), vec![tc]),
+                Some(&t),
+            )
+            .unwrap();
+        store
+            .append_message(
+                conv_id,
+                &ChatMessage::tool_result(format!("call_{label}"), format!("{label} result")),
+                Some(&t),
+            )
+            .unwrap();
+        store
+            .append_message(
+                conv_id,
+                &ChatMessage::assistant(format!("{label} answer")),
+                Some(&t),
+            )
+            .unwrap();
+        t
+    }
+
+    #[tokio::test]
+    async fn compaction_boundary_never_splits_a_turn() {
+        let store = make_store();
+        let conv_id = test_conv_id();
+        store
+            .ensure_conversation(&conv_id, ConversationMode::Shared)
+            .unwrap();
+
+        // turn1: 2 messages (seq 1-2), turn2: 4-message tool loop (seq 3-6),
+        // turn3: 2 messages (seq 7-8). Naive midpoint of 8 messages = 4, which
+        // lands inside turn2 — right between the assistant tool_calls and the
+        // tool result.
+        let t1 = store
+            .append_message(&conv_id, &ChatMessage::user("hi"), None)
+            .unwrap();
+        store
+            .append_message(&conv_id, &ChatMessage::assistant("hello"), Some(&t1))
+            .unwrap();
+        let t2 = append_tool_loop_turn(&store, &conv_id, "loop");
+        let t3 = store
+            .append_message(&conv_id, &ChatMessage::user("bye"), None)
+            .unwrap();
+        store
+            .append_message(&conv_id, &ChatMessage::assistant("bye!"), Some(&t3))
+            .unwrap();
+
+        let provider = MockProvider::new("Snapped summary.");
+        run_compaction(&store, &conv_id, "Summarize.", &provider)
+            .await
+            .expect("compaction should succeed");
+
+        let remaining = store.load_messages(&conv_id).unwrap();
+        assert!(!remaining.is_empty(), "must not compact everything here");
+
+        // The remaining messages must start at a turn boundary: the first
+        // message is the user message that opens turn2 — never an orphaned
+        // tool result or assistant continuation.
+        assert_eq!(remaining[0].role, crate::types::Role::User);
+        assert!(remaining[0].tool_call_id.is_none());
+        assert_eq!(remaining[0].turn_id, t2);
+        assert_eq!(remaining[0].seq, 3, "boundary snapped back to end of turn1");
+
+        // Every remaining turn is fully intact (no partially-deleted turn).
+        let loop_msgs: Vec<_> = remaining.iter().filter(|m| m.turn_id == t2).collect();
+        assert_eq!(loop_msgs.len(), 4, "tool-loop turn must be intact");
+
+        let summary = store.load_summary(&conv_id).unwrap().expect("summary");
+        assert_eq!(summary.compacted_up_to, 2);
+    }
+
+    #[tokio::test]
+    async fn compaction_extends_boundary_when_history_starts_mid_turn() {
+        let store = make_store();
+        let conv_id = test_conv_id();
+        store
+            .ensure_conversation(&conv_id, ConversationMode::Shared)
+            .unwrap();
+
+        // turn1: 4-message tool loop (seq 1-4), turn2: 2 messages (seq 5-6).
+        // Naive midpoint of 6 messages = 3, inside turn1 — and turn1 starts
+        // the window, so shrinking would compact zero messages. The boundary
+        // must extend to the end of turn1 instead.
+        let t1 = append_tool_loop_turn(&store, &conv_id, "first");
+        let t2 = store
+            .append_message(&conv_id, &ChatMessage::user("follow-up"), None)
+            .unwrap();
+        store
+            .append_message(&conv_id, &ChatMessage::assistant("sure"), Some(&t2))
+            .unwrap();
+        let _ = t1;
+
+        let provider = MockProvider::new("Extended summary.");
+        run_compaction(&store, &conv_id, "Summarize.", &provider)
+            .await
+            .expect("compaction should succeed");
+
+        let summary = store.load_summary(&conv_id).unwrap().expect("summary");
+        assert_eq!(
+            summary.compacted_up_to, 4,
+            "boundary extended to the end of the tool-loop turn"
+        );
+
+        let remaining = store.load_messages(&conv_id).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].seq, 5);
+        assert_eq!(remaining[0].turn_id, t2);
+        assert_eq!(remaining[0].role, crate::types::Role::User);
     }
 
     #[tokio::test]

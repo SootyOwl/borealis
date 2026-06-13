@@ -128,6 +128,13 @@ impl ChannelRegistry {
                     result = Channel::run_inbound(ch, in_tx) => {
                         if let Err(e) = result {
                             error!(channel = %name, "inbound error: {e}");
+                            // A fatal inbound error (bad token, fatal gateway error)
+                            // is unrecoverable — serenity already auto-reconnects
+                            // transient drops, so anything that propagates here is
+                            // terminal. Fail fast: cancel the whole process so a
+                            // supervisor/systemd restarts it, rather than running
+                            // deaf with the outbound task busy-polling forever.
+                            cancel.cancel();
                         }
                     }
                     _ = cancel.cancelled() => {

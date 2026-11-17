@@ -966,7 +966,9 @@ impl Memory for SqliteMemory {
         };
 
         // --- PAGE query ---
-        let summaries: Vec<NoteSummary> = if limit == 0 {
+        // An offset beyond the result set is empty, including values too large
+        // for SQLite's signed OFFSET parameter. Do not let that cast wrap.
+        let summaries: Vec<NoteSummary> = if limit == 0 || offset >= total {
             Vec::new()
         } else {
             match &normalized {

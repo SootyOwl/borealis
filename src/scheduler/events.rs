@@ -35,8 +35,13 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
         .map_err(|_| anyhow!("invalid duration: {s}"))?;
     match last_char {
         's' => Ok(Duration::from_secs(value)),
-        'm' => Ok(Duration::from_secs(value * 60)),
-        'h' => Ok(Duration::from_secs(value * 3600)),
+        'm' | 'h' => {
+            let multiplier = if last_char == 'm' { 60 } else { 3600 };
+            let seconds = value
+                .checked_mul(multiplier)
+                .ok_or_else(|| anyhow!("duration exceeds supported range: {s}"))?;
+            Ok(Duration::from_secs(seconds))
+        }
         _ => Err(anyhow!("unknown duration suffix in '{s}', expected s/m/h")),
     }
 }

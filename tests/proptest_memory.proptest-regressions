@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b1cc06e209a28ed6fca6dd1abfc07c4178b47b5ce42d207b8bf935f9aa446b46 # shrinks to offset = 18446744073709551615, limit = 1, exact = false, filtered = false
+# Calibration seed: intentional FTS update-trigger mutation, not a production finding.
+cc ac63cc53c86ac42deb10b6b5daea7e167f57f8e6612b9cefb74bf9ed641e7eb4 # shrinks to history = [Create(1, []), Update(0, 0), Link(0, 0, 0)]

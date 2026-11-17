@@ -1,0 +1,23 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling borealis v0.1.0 (/tmp/borealis-fix-duration-20261117)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.90s
+     Running tests/duration_overflow_regression.rs (/tmp/borealis-proptest-target/debug/deps/duration_overflow_regression-7424c1ce0de1adab)
+
+running 1 test
+test duration_unit_conversion_rejects_overflow ... FAILED
+
+failures:
+
+---- duration_unit_conversion_rejects_overflow stdout ----
+
+thread 'duration_unit_conversion_rejects_overflow' (109) panicked at src/scheduler/events.rs:38:39:
+attempt to multiply with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    duration_unit_conversion_rejects_overflow
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test duration_overflow_regression`

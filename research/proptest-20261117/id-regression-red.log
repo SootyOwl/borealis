@@ -1,0 +1,25 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling borealis v0.1.0 (/tmp/borealis-fix-conversation-id-20261117)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.30s
+     Running tests/conversation_id_regression.rs (/tmp/borealis-proptest-target/debug/deps/conversation_id_regression-84a8b8ce3620e1d3)
+
+running 1 test
+test system_conversation_names_preserve_colons ... FAILED
+
+failures:
+
+---- system_conversation_names_preserve_colons stdout ----
+
+thread 'system_conversation_names_preserve_colons' (108) panicked at tests/conversation_id_regression.rs:7:9:
+assertion `left == right` failed
+  left: Err(InvalidFormat("system:reminder:daily"))
+ right: Ok(System { event_name: "reminder:daily" })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    system_conversation_names_preserve_colons
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test conversation_id_regression`

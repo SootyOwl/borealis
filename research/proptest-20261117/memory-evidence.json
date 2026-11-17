@@ -1,0 +1,60 @@
+{
+  "base_revision": "17f2a970",
+  "fix_revision": "ebf25da0",
+  "finding": {
+    "contract": "Public Memory::list_notes_paginated offsets beyond total return an empty page",
+    "witness": {
+      "notes": 1,
+      "offset": "usize::MAX",
+      "limit": 1,
+      "filtered": false
+    },
+    "mechanism": "usize to i64 cast wraps OFFSET negative; SQLite treats negative OFFSET as zero",
+    "fix": "Skip PAGE query when offset >= total, retaining total, offset and limit envelope",
+    "scope": "Direct public storage API; memory_list tool already clamps offsets, so no tool-level impact demonstrated"
+  },
+  "tests": {
+    "command": "CARGO_TARGET_DIR=/tmp/borealis-memory-verified CARGO_PROFILE_DEV_DEBUG=0 PROPTEST_CASES=512 /tmp/borealis-build-tools/cargo-test --test memory_offset_regression --test proptest_memory -- --nocapture",
+    "random_cases_per_property": 512,
+    "history_cases_including_persisted": 514,
+    "events": {
+      "create": 3880,
+      "successful_update": 2107,
+      "successful_retag": 2135,
+      "successful_delete": 662,
+      "successful_link": 1811,
+      "reopen": 1001,
+      "invalid_tag": 853,
+      "link_overwrite": 273
+    },
+    "deterministic_regression": "fails before fix, passes after",
+    "memory_unit_tests": 74,
+    "serial_integration_tests": 18,
+    "integration_parallel_failure": "ac9_core_persona raced shared process-ID core file in existing setup(); serial retry passed",
+    "target_isolation": "Fresh dedicated target, not shared across workspaces. Explicit guard removal fails regression; restoration passes. FTS mutation repeated in dedicated target and restored."
+  },
+  "mutation_calibration": {
+    "mutation": "Disable FTS UPDATE trigger WHEN condition",
+    "result": "killed",
+    "shrunk_trace": [
+      "Create(zebra)",
+      "Update(0,quartz)",
+      "Link(0,0,0)"
+    ],
+    "restored": true
+  },
+  "limits": [
+    "In-memory SQLite; no filesystem fault injection or multi-threaded mutation",
+    "Fixed three single-token content values; no complete FTS grammar/ranking oracle",
+    "Soft-delete link retention contract ambiguous; modeled current persistence, no defect asserted",
+    "Core persona filesystem operations not in model",
+    "SQL page ordering not independently modeled; checks membership/count/multiplicity and large-offset boundaries"
+  ],
+  "logs": [
+    "/tmp/borealis-memory-clean-red.log",
+    "/tmp/borealis-memory-clean-green.log",
+    "/tmp/borealis-memory-clean-final.log",
+    "/tmp/borealis-memory-clean-mutation.log",
+    "/tmp/borealis-memory-clean-unit.log"
+  ]
+}

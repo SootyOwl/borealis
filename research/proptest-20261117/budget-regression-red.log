@@ -1,0 +1,23 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling borealis v0.1.0 (/tmp/borealis-fix-budget-20261117)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.71s
+     Running tests/budget_overflow_regression.rs (/tmp/borealis-proptest-target/debug/deps/budget_overflow_regression-6e933d64ef134118)
+
+running 1 test
+test history_selection_handles_totals_larger_than_usize ... FAILED
+
+failures:
+
+---- history_selection_handles_totals_larger_than_usize stdout ----
+
+thread 'history_selection_handles_totals_larger_than_usize' (121) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    history_selection_handles_totals_larger_than_usize
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test budget_overflow_regression`

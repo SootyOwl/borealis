@@ -1,0 +1,450 @@
+    Blocking waiting for file lock on artifact directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.19s
+     Running tests/proptest_boundaries.rs (/tmp/borealis-proptest-target/debug/deps/proptest_boundaries-15246f7ec2cc3e68)
+
+running 4 tests
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at src/scheduler/events.rs:39:39:
+attempt to multiply with overflow
+
+thread 'duration_matches_wide_arithmetic' (71) panicked at tests/proptest_boundaries.rs:8:1:
+Test failed: attempt to multiply with overflow.
+minimal failing input: value = 5124095576030432, unit = 2
+	successes: 0
+	local rejects: 0
+	global rejects: 0
+
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+test duration_matches_wide_arithmetic ... FAILED
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'conversation_ids_roundtrip' (70) panicked at tests/proptest_boundaries.rs:8:1:
+Test failed: assertion failed: `(left == right)` 
+  left: `Err(InvalidFormat("system::"))`,
+ right: `Ok(System { event_name: ":" })` at tests/proptest_boundaries.rs:16.
+minimal failing input: tail = ":", variant = 0
+	successes: 0
+	local rejects: 0
+	global rejects: 0
+
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+test conversation_ids_roundtrip ... FAILED
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at /home/tyto/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/iter/traits/accum.rs:204:1:
+attempt to add with overflow
+
+thread 'budget_selects_longest_fitting_suffix' (69) panicked at tests/proptest_boundaries.rs:8:1:
+Test failed: attempt to add with overflow.
+minimal failing input: costs = [
+    1,
+    18446744073709551615,
+], budget = 0
+	successes: 0
+	local rejects: 0
+	global rejects: 0
+
+test budget_selects_longest_fitting_suffix ... FAILED
+test active_hours_match_enumerated_minutes ... ok
+
+failures:
+
+failures:
+    budget_selects_longest_fitting_suffix
+    conversation_ids_roundtrip
+    duration_matches_wide_arithmetic
+
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test proptest_boundaries`

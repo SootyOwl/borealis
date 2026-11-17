@@ -76,31 +76,20 @@ impl ContextBudget {
         }
 
         let budget = self.available_for_history();
-        let total: usize = turns.iter().map(|t| t.total_tokens).sum();
-
-        if total <= budget {
-            return SelectionResult {
-                included: turns.iter().collect(),
-                evicted: vec![],
-            };
-        }
-
-        // Evict oldest turns until the remaining sum fits within budget.
-        // Always keep the last turn regardless.
+        // Build the longest fitting suffix without summing all history, which
+        // can overflow. Always keep the last turn, even when it exceeds budget.
         let last_idx = turns.len() - 1;
-        let mut evict_up_to = 0usize; // exclusive index of first kept turn
-
-        let mut running: usize = turns.iter().map(|t| t.total_tokens).sum();
-        for (i, turn) in turns.iter().enumerate() {
-            if i == last_idx {
-                // Never evict the most recent turn.
+        let mut evict_up_to = last_idx;
+        let mut running = turns[last_idx].total_tokens;
+        for i in (0..last_idx).rev() {
+            let Some(total) = running.checked_add(turns[i].total_tokens) else {
+                break;
+            };
+            if total > budget {
                 break;
             }
-            if running <= budget {
-                break;
-            }
-            running = running.saturating_sub(turn.total_tokens);
-            evict_up_to = i + 1;
+            running = total;
+            evict_up_to = i;
         }
 
         let evicted = turns[..evict_up_to]

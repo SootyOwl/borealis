@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 03c2521c4fc09fda6297c6b367c27781a3c12f9d0a77054c3c938fdc9a92a47a # shrinks to prefix = [], conversation = 0, turn = 0
+cc 00c91c5ce73a54d7f98a7a64cdafb512312ba9b39f51e51b31efe4f8ce1999c4 # shrinks to ops = [Append { conversation: 0, turn: 0 }, Compact { conversation: 0, count: 0 }, Append { conversation: 0, turn: 0 }]

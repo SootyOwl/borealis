@@ -1,0 +1,28 @@
+   Compiling borealis v0.1.0 (/tmp/borealis-proptest-history-20261117)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+     Running tests/history_compaction_regression.rs (/tmp/borealis-proptest-target/debug/deps/history_compaction_regression-9f63474a0031a5b9)
+
+running 2 tests
+
+thread 'appended_message_remains_visible_after_compacting_all_history' (130) panicked at tests/history_compaction_regression.rs:29:5:
+assertion `left == right` failed
+  left: []
+ right: ["new"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'appended_message_remains_visible_after_deleting_uncompacted_tail' (131) panicked at tests/history_compaction_regression.rs:65:5:
+assertion `left == right` failed
+  left: []
+ right: ["new"]
+test appended_message_remains_visible_after_compacting_all_history ... FAILED
+test appended_message_remains_visible_after_deleting_uncompacted_tail ... FAILED
+
+failures:
+
+failures:
+    appended_message_remains_visible_after_compacting_all_history
+    appended_message_remains_visible_after_deleting_uncompacted_tail
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test history_compaction_regression`

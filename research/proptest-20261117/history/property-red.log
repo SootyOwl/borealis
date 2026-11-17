@@ -1,0 +1,60 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests/proptest_history.rs (/tmp/borealis-proptest-target/debug/deps/proptest_history-9b764ac4ee6d996f)
+
+running 2 tests
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: Saving this and future failures in /tmp/borealis-proptest-history-20261117/tests/proptest_history.proptest-regressions
+proptest: If this test was run on a CI system, you may wish to add the following line to your copy of the file. (You may need to create it.)
+cc 03c2521c4fc09fda6297c6b367c27781a3c12f9d0a77054c3c938fdc9a92a47a
+
+thread 'append_after_full_compaction' (68) panicked at tests/proptest_history.rs:113:1:
+Test failed: assertion failed: `(left == right)` 
+  left: `[]`, 
+ right: `["message-6"]`: visible rows at step 6: Append { conversation: 0, turn: 0 }; summary=Some(CompactionSummary { conversation_id: "dm:cli:model-0", summary_text: "summary", compacted_up_to: 1, token_estimate: 1, created_at: "2026-11-17T13:04:14.095264916+00:00" }) at tests/proptest_history.rs:97.
+minimal failing input: prefix = [], conversation = 0, turn = 0
+	successes: 0
+	local rejects: 0
+	global rejects: 0
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test append_after_full_compaction ... FAILED
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: Saving this and future failures in /tmp/borealis-proptest-history-20261117/tests/proptest_history.proptest-regressions
+proptest: If this test was run on a CI system, you may wish to add the following line to your copy of the file.
+cc 00c91c5ce73a54d7f98a7a64cdafb512312ba9b39f51e51b31efe4f8ce1999c4
+
+thread 'history_matches_logical_contents' (69) panicked at tests/proptest_history.rs:113:1:
+Test failed: assertion failed: `(left == right)` 
+  left: `[]`, 
+ right: `["message-2"]`: visible rows at step 2: Append { conversation: 0, turn: 0 }; summary=Some(CompactionSummary { conversation_id: "dm:cli:model-0", summary_text: "summary", compacted_up_to: 1, token_estimate: 1, created_at: "2026-11-17T13:04:14.148451975+00:00" }) at tests/proptest_history.rs:97.
+minimal failing input: ops = [
+    Append {
+        conversation: 0,
+        turn: 0,
+    },
+    Compact {
+        conversation: 0,
+        count: 0,
+    },
+    Append {
+        conversation: 0,
+        turn: 0,
+    },
+]
+	successes: 0
+	local rejects: 0
+	global rejects: 0
+
+test history_matches_logical_contents ... FAILED
+
+failures:
+
+failures:
+    append_after_full_compaction
+    history_matches_logical_contents
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `--test proptest_history`

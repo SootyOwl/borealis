@@ -162,9 +162,14 @@ impl HistoryStore {
 
         let conn = self.lock_conn();
 
-        // Monotonic sequence number per conversation for stable ordering.
+        // Keep new messages beyond both the live history and the durable
+        // compaction boundary, even when compaction or eviction emptied it.
         let next_seq: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?1",
+            "SELECT MAX(
+                COALESCE((SELECT MAX(seq) FROM messages WHERE conversation_id = ?1), 0),
+                COALESCE((SELECT compacted_up_to FROM conversation_summaries
+                          WHERE conversation_id = ?1), 0)
+             ) + 1",
             params![conv_id_str],
             |row| row.get(0),
         )?;

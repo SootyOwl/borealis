@@ -85,6 +85,11 @@ impl ConversationId {
     /// - `group:<channel_source>:<group_id>`
     /// - `system:<event_name>`
     pub fn parse(s: &str) -> Result<Self, ConversationIdError> {
+        if let Some(event_name) = s.strip_prefix("system:") {
+            return Ok(ConversationId::System {
+                event_name: event_name.to_string(),
+            });
+        }
         let parts: Vec<&str> = s.splitn(3, ':').collect();
         match parts.as_slice() {
             ["dm", channel_type, user_id] => Ok(ConversationId::Dm {
@@ -94,9 +99,6 @@ impl ConversationId {
             ["group", channel_type, group_id] => Ok(ConversationId::Group {
                 channel_type: ChannelSource::from_str(channel_type)?,
                 group_id: group_id.to_string(),
-            }),
-            ["system", event_name] => Ok(ConversationId::System {
-                event_name: event_name.to_string(),
             }),
             _ => Err(ConversationIdError::InvalidFormat(s.to_string())),
         }
